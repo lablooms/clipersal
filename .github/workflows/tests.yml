@@ -1,0 +1,42 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install ffmpeg + Qt runtime libs (Linux)
+        if: runner.os == 'Linux'
+        # libegl1/libgl1/libxkbcommon(-x11)/libdbus/libfontconfig are what
+        # PySide6's "offscreen" QT_QPA_PLATFORM plugin needs on a bare,
+        # display-less runner -- every Qt-based test file sets that env var
+        # itself, but the platform plugin still needs these system libs
+        # loadable even though nothing is actually rendered to a screen.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 libdbus-1-3 libfontconfig1
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y
+
+      - name: Install package + test dependencies
+        run: pip install -e ".[test]"
+
+      - name: Run tests
+        run: pytest -v

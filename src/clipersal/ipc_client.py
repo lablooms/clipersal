@@ -1,0 +1,43 @@
+"""Client side of the local IPC command server (see ipc.py).
+
+Used by the hotkey listener's callback and by the `clipersal-trigger`
+CLI script -- both just send a command line and print/act on the response,
+with no knowledge of capture/concat internals.
+"""
+
+from __future__ import annotations
+
+import socket
+
+from clipersal.ipc import DEFAULT_HOST, DEFAULT_PORT
+
+
+class IpcClientError(RuntimeError):
+    pass
+
+
+def send_command(
+    command: str,
+    arg: str | None = None,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    timeout: float = 5.0,
+) -> str:
+    """Send a single command (optionally with one argument, e.g. command="SAVE",
+    arg="30" for a trimmed save) to a running clipersal's IPC server and
+    return its response line (without the trailing newline).
+    """
+    line = f"{command} {arg}" if arg is not None else command
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.sendall(f"{line}\n".encode("utf-8"))
+            response = sock.makefile("r", encoding="utf-8").readline()
+    except OSError as exc:
+        raise IpcClientError(
+            f"Could not reach clipersal's IPC server at {host}:{port}: {exc}. Is clipersal running?"
+        ) from exc
+
+    response = response.strip()
+    if not response:
+        raise IpcClientError("Empty response from clipersal's IPC server")
+    return response

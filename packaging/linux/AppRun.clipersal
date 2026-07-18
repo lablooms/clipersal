@@ -1,0 +1,7 @@
+#!/bin/sh
+# AppImage entry point for the main app. AppImage always execs this file
+# (found by convention at the AppDir root) rather than reading the .desktop
+# file's Exec= line -- that line is only used by desktop-integration tools
+# (e.g. appimaged) if the user has one installed.
+HERE="$(dirname "$(readlink -f "${0}")")"
+exec "${HERE}/usr/bin/Clipersal" "$@"

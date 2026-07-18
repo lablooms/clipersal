@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Clipersal Trigger
+Comment=Send a save/pause/resume/settings command to a running Clipersal instance
+Exec=Clipersal-Trigger save
+Icon=clipersal
+Categories=Utility;
+Terminal=true
+X-AppImage-Version=0.1.0-beta

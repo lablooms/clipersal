@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Build artifacts (PyInstaller output, AppImage staging)
+/build/
+/dist/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local dev-tooling state (worktrees, scheduler locks) -- not project source
+.claude/
+
+# Local-only project notes (not published)
+CLAUDE.md

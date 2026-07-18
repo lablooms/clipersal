@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Clipersal
+Comment=Continuous background screen capture with instant clip saving
+Exec=Clipersal
+Icon=clipersal
+Categories=Utility;AudioVideo;Recorder;
+Terminal=false
+X-AppImage-Version=0.1.0-beta
