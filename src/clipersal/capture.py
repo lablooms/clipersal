@@ -134,6 +134,22 @@ class SegmentedCapture:
 
         self._gave_up = False
         self._restart_timestamps = []
+        # A previous session can end with its cleanup thread still alive --
+        # the give-up path in _check_process_health leaves it sweeping a dead
+        # process -- so a fresh start (e.g. IPC RESUME after CRASHED) must
+        # wind it down first. Two loops on the same session could both pass
+        # the poll() check before either reassigns _process, orphaning an
+        # untracked ffmpeg.
+        if self._cleanup_thread is not None and self._cleanup_thread.is_alive():
+            self._stop_event.set()
+            self._cleanup_thread.join(timeout=_PROCESS_STOP_TIMEOUT)
+        # Likewise the old log handle can still be open if stop() never ran,
+        # and on Windows unlinking a file this process still holds open
+        # raises PermissionError [WinError 32] -- which is what used to make
+        # RESUME-after-CRASHED always fail. Mirror what stop() does.
+        if self._ffmpeg_log_file is not None:
+            self._ffmpeg_log_file.close()
+            self._ffmpeg_log_file = None
         # A fresh start clears any crash log from a previous run; restarts
         # (below) append instead, so the log that explains *why* ffmpeg died
         # is still there right after the auto-restart replaces the process.
@@ -156,13 +172,21 @@ class SegmentedCapture:
         log_path = self.config.buffer_dir / "ffmpeg.log"
         self._ffmpeg_log_file = open(log_path, "a", encoding="utf-8")
 
-        self._process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=self._ffmpeg_log_file,
-            stderr=subprocess.STDOUT,
-            **NO_WINDOW_KWARGS,
-        )
+        try:
+            self._process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=self._ffmpeg_log_file,
+                stderr=subprocess.STDOUT,
+                **NO_WINDOW_KWARGS,
+            )
+        except Exception:
+            # Popen can fail after the log file was opened (ffmpeg binary
+            # removed or blocked mid-session); don't leak the handle. The
+            # caller (_cleanup_loop) logs the failure and keeps sweeping.
+            self._ffmpeg_log_file.close()
+            self._ffmpeg_log_file = None
+            raise
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -271,8 +295,15 @@ class SegmentedCapture:
 
     def _cleanup_loop(self) -> None:
         while not self._stop_event.wait(self.config.cleanup_interval_seconds):
-            delete_stale_segments(self.config.buffer_dir, self.config.buffer_seconds)
-            self._check_process_health()
+            try:
+                delete_stale_segments(self.config.buffer_dir, self.config.buffer_seconds)
+                self._check_process_health()
+            except Exception:
+                # A dead loop means stale segments stop aging out (the disk
+                # slowly fills) and crash-restarts silently stop, while
+                # STATUS still reports the stale _process state -- so log and
+                # keep going, same best-effort style as the app's probes.
+                log.exception("Cleanup iteration failed; retrying on the next interval")
 
     def _check_process_health(self) -> None:
         """Detect ffmpeg dying unexpectedly (driver hiccup, etc.) and restart
@@ -303,8 +334,21 @@ class SegmentedCapture:
                 _RESTART_WINDOW_SECONDS,
                 self.config.buffer_dir / "ffmpeg.log",
             )
+            # Close the log handle on this path too (only the restart branch
+            # below used to): start() unlinks ffmpeg.log on a fresh start,
+            # and on Windows unlinking a file this process still holds open
+            # raises PermissionError -- so leaving it open here broke the
+            # documented RESUME-after-CRASHED recovery.
+            if self._ffmpeg_log_file is not None:
+                self._ffmpeg_log_file.close()
+                self._ffmpeg_log_file = None
             return
         self._restart_timestamps.append(now)
+
+        if self._stop_event.is_set():
+            # stop() ran while this health check was in flight (its join
+            # timed out); restarting now would orphan an ffmpeg nobody owns.
+            return
 
         if self._ffmpeg_log_file is not None:
             self._ffmpeg_log_file.close()

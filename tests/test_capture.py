@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -164,6 +165,129 @@ def test_check_process_health_gives_up_after_max_restarts(tmp_path: Path, monkey
     assert session.gave_up_restarting()
     assert len(session._restart_timestamps) == _MAX_RESTARTS_PER_WINDOW
     assert not session.is_running()
+
+
+def test_check_process_health_give_up_closes_the_log_handle(tmp_path: Path, monkeypatch) -> None:
+    session = _make_session(tmp_path)
+    session.config.buffer_dir.mkdir(parents=True, exist_ok=True)
+    session._process = _FakeProcess(returncode=1)
+    log_handle = open(session.config.buffer_dir / "ffmpeg.log", "w", encoding="utf-8")
+    session._ffmpeg_log_file = log_handle
+
+    monkeypatch.setattr("clipersal.capture.subprocess.Popen", lambda *a, **k: _FakeProcess(returncode=1))
+
+    for _ in range(_MAX_RESTARTS_PER_WINDOW + 3):
+        session._check_process_health()
+
+    assert session.gave_up_restarting()
+    # The give-up branch must release ffmpeg.log -- start() unlinks it on a
+    # fresh start, which is a PermissionError on Windows while held open.
+    assert log_handle.closed
+    assert session._ffmpeg_log_file is None
+
+
+def test_start_after_give_up_closes_stale_log_handle_before_unlinking(tmp_path: Path, monkeypatch) -> None:
+    session = _make_session(tmp_path)
+    session.config.buffer_dir.mkdir(parents=True, exist_ok=True)
+    # Simulate the post-give-up state: dead process, stop() never called, so
+    # the old log handle is still open when RESUME triggers a fresh start().
+    session._process = _FakeProcess(returncode=1)
+    session._gave_up = True
+    stale_handle = open(session.config.buffer_dir / "ffmpeg.log", "w", encoding="utf-8")
+    session._ffmpeg_log_file = stale_handle
+
+    monkeypatch.setattr("clipersal.capture.subprocess.Popen", lambda *a, **k: _FakeProcess(returncode=None))
+
+    session.start()  # would raise PermissionError here on Windows if unclosed
+    try:
+        assert stale_handle.closed
+        assert session._ffmpeg_log_file is not None
+        assert not session._ffmpeg_log_file.closed
+        assert session.is_running()
+    finally:
+        session.stop()
+
+
+def test_start_with_live_cleanup_thread_winds_it_down_first(tmp_path: Path, monkeypatch) -> None:
+    session = _make_session(tmp_path)
+    session.config.buffer_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("clipersal.capture.subprocess.Popen", lambda *a, **k: _FakeProcess(returncode=None))
+
+    session.start()
+    first_thread = session._cleanup_thread
+    assert first_thread.is_alive()
+
+    # Process dies while the cleanup thread keeps sweeping (the post-give-up
+    # state); a fresh start() must stop that loop, not stack a second one.
+    session._process.returncode = 1
+    session._gave_up = True
+
+    session.start()
+    try:
+        assert not first_thread.is_alive()
+        assert session._cleanup_thread is not first_thread
+        assert session._cleanup_thread.is_alive()
+    finally:
+        session.stop()
+
+
+def test_cleanup_loop_survives_failing_restart_and_keeps_sweeping(tmp_path: Path, monkeypatch) -> None:
+    session = _make_session(tmp_path)
+    session.config.buffer_dir.mkdir(parents=True, exist_ok=True)
+    session.config.cleanup_interval_seconds = 0.05
+    session._process = _FakeProcess(returncode=1)  # crashed; every restart attempt will fail
+
+    def boom(*args, **kwargs):
+        raise OSError("ffmpeg binary vanished mid-session")
+
+    monkeypatch.setattr("clipersal.capture.subprocess.Popen", boom)
+
+    thread = threading.Thread(target=session._cleanup_loop, daemon=True)
+    thread.start()
+    try:
+        now = time.time()
+        first = session.config.buffer_dir / "seg-20260101-000100.ts"
+        _touch(first, mtime=now - 120)  # older than the 60s default buffer
+
+        deadline = time.time() + 5
+        while time.time() < deadline and first.exists():
+            time.sleep(0.01)
+        assert not first.exists()  # first sweep ran (then the OSError hit)
+
+        # Only a still-living loop can delete this one: it is planted after
+        # the first OSError, which used to kill the thread silently.
+        second = session.config.buffer_dir / "seg-20260101-000200.ts"
+        _touch(second, mtime=time.time() - 120)
+
+        deadline = time.time() + 5
+        while time.time() < deadline and second.exists():
+            time.sleep(0.01)
+
+        assert not second.exists()
+        assert thread.is_alive()
+    finally:
+        session._stop_event.set()
+        thread.join(timeout=5)
+    # The handle opened just before each failed Popen must not leak. Checked
+    # after the join so no in-flight iteration can be holding it transiently.
+    assert session._ffmpeg_log_file is None
+
+
+def test_check_process_health_skips_restart_once_stop_event_set(tmp_path: Path, monkeypatch) -> None:
+    session = _make_session(tmp_path)
+    session.config.buffer_dir.mkdir(parents=True, exist_ok=True)
+    session._process = _FakeProcess(returncode=1)
+    # stop()'s join timed out while this health check was in flight.
+    session._stop_event.set()
+
+    def boom(*args, **kwargs):
+        raise AssertionError("must not restart once stop() has been requested")
+
+    monkeypatch.setattr("clipersal.capture.subprocess.Popen", boom)
+
+    session._check_process_health()
+
+    assert session._process.returncode == 1  # left alone, no orphan ffmpeg
 
 
 def test_build_command_no_audio_sources_is_video_only(tmp_path: Path) -> None:
