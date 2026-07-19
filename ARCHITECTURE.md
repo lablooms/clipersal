@@ -417,18 +417,29 @@ per field, because not everything can change without touching the running ffmpeg
   and `concat.save_clip`/`concat.enforce_clip_retention` read `config.clips_dir`,
   `config.filename_template`, and `config.clip_retention_days` fresh on every save, so just
   mutating the shared `Config` object's attributes takes effect immediately with no restart.
-- **Hotkey combo** requires unbinding and rebinding `HotkeyListener` (`rebind_hotkey()`) --
-  a bind failure (e.g. the combo is already grabbed by another app) is logged as a warning
-  but doesn't block saving the new value.
+  The GUI follows the same rule: the main window, gallery, and tray receive a
+  `clips_dir_provider` lambda instead of a frozen `Path`, so the Clips tab and "Open clips
+  folder" also follow a folder change without a restart.
+- **Hotkey combo** is validated with pynput's own parser before anything is touched -- an
+  unparseable combo (including the recorder's "Press keys..." placeholder, which the
+  Settings/wizard Save paths cancel out of first) is rejected with an inline error and
+  never persisted, because a broken combo would otherwise silently leave the hotkey dead
+  on every launch. A valid change rebinds `HotkeyListener` (`rebind_hotkey()`),
+  constructing the new binding before tearing down the old one; a bind failure (e.g. the
+  combo is already grabbed by another app) leaves the old listener in place.
 - **Video bitrate**, **quality preset**, **encoder override**, and **capture
   mode/monitor index/window title/mic device** are all baked into the ffmpeg command line
-  at capture-start time, so applying any of them means fully restarting capture: stop the
-  running `SegmentedCapture`, call `capture.resolve_setup(config)` again (re-running the
-  two-step encoder detection against the *new* `encoder_override`), and swap in a fresh
-  `SegmentedCapture` built from the new setup (`restart_capture()`). If the forced encoder
-  turns out not to work, `resolve_setup` raises `NoWorkingEncoderError`, which
-  `apply_settings` turns into an error message shown inline in the Settings tab instead
-  of quietly leaving capture broken. The restart preserves whichever paused/running state
+  at capture-start time, so applying any of them means fully restarting capture
+  (`restart_capture()`). The order is resolve-first: `capture.resolve_setup()` runs
+  against the *new* values (re-running the two-step encoder detection against the new
+  `encoder_override`) BEFORE anything is torn down, and only once the new setup is
+  known-good is the running `SegmentedCapture` stopped and swapped for a fresh one; the
+  config fields are only mutated on success. If the forced encoder turns out not to
+  work, `resolve_setup` raises `NoWorkingEncoderError` up front, which `apply_settings`
+  turns into an error message shown inline in the Settings tab -- with the old capture
+  still running and the old config values intact (an earlier stop-first ordering left
+  capture silently down while STATUS kept reporting RECORDING). A successful restart
+  preserves whichever paused/running state
   was already in effect and reuses the same `buffer_dir` (segment filenames are
   timestamped, so there's no collision with segments from before the restart).
 
@@ -508,8 +519,13 @@ of the slow startup work (encoder detection, starting ffmpeg), `main()` sends a 
 the configured IPC port with a short timeout. If something answers, that's another
 running instance -- `_show_already_running_message` shows a friendly dialog naming the
 port and pointing at the tray/hotkey/`clipersal-trigger`, and `main()` returns `0`
-immediately. Otherwise a second launch would fully spin up its own encoder detection and
-ffmpeg process, only to fail later when `IpcServer` couldn't bind the already-taken port.
+immediately. The PING is only the best-effort fast path, though: the real backstop is
+that the IPC socket is bound *before* `resolve_setup`/`session.start()`, so a lost race
+exits cleanly instead of spinning up a duplicate ffmpeg. Making the bind a real backstop
+took a platform split in `ipc.py`: on Windows `SO_REUSEADDR` permits a second socket to
+bind+listen on an actively-listened port (the POSIX semantics -- TIME_WAIT rebinding
+only -- do not apply there), so Windows binds with `SO_EXCLUSIVEADDRUSE` instead, while
+POSIX keeps `allow_reuse_address`.
 
 **Launch on startup** (`autostart.py`): Windows registers a value under the per-user Run
 key (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`), which the OS runs silently at
