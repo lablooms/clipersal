@@ -555,11 +555,12 @@ is a beta pre-release, so the banner would never fire during beta; the list is
 newest-first and the newest non-draft entry wins. GitHub 403s any request missing a
 `User-Agent` header. The fetch returns `None` on any failure whatsoever --
 offline, GitHub down, malformed JSON, missing fields. `is_newer(candidate, current)`
-strips a leading `v` and a `-suffix`/`+build`, then compares dotted-integer tuples;
-returns `False` (never raises, never true-by-default) for anything unparseable. One
-documented, accepted simplification: stripping the suffix means `"0.1.0"` compares equal
-to (not newer than) running `"0.1.0-beta"`, so a beta-to-stable promotion of the same
-numeric version won't trigger a banner.
+strips a leading `v`, compares dotted-integer tuples (the `-suffix`/`+build` doesn't
+factor into the tuple), and returns `False` (never raises, never true-by-default) for
+anything unparseable. One semver rule is kept on equal tuples: a stable release
+outranks the same numeric pre-release (`"0.1.0"` > `"0.1.0-beta"`), so a beta install
+does hear about its stable promotion; two pre-releases of the same numeric version
+compare equal.
 
 **Cache, separate from config.json**: `default_cache_path()` returns
 `config_store.default_config_path().parent / "update_check_cache.json"` -- a sibling of

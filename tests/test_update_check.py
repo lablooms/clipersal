@@ -28,11 +28,19 @@ def test_is_newer_strips_prerelease_suffix() -> None:
     assert update_check.is_newer("0.2.0-beta", "0.1.0") is True
 
 
-def test_is_newer_treats_suffix_stripped_version_as_equal_not_newer() -> None:
-    # Documented simplification: "0.1.0" vs running "0.1.0-beta" compares
-    # equal (not newer) -- a beta-to-stable promotion of the same numeric
-    # version intentionally doesn't trigger a banner.
-    assert update_check.is_newer("0.1.0", "0.1.0-beta") is False
+def test_is_newer_stable_outranks_same_numeric_prerelease() -> None:
+    # Semver precedence: a stable release is newer than the same numeric
+    # pre-release -- this is what lets a 0.1.0-beta install hear about the
+    # 0.1.0 stable promotion.
+    assert update_check.is_newer("0.1.0", "0.1.0-beta") is True
+
+
+def test_is_newer_prerelease_not_newer_than_same_numeric_stable() -> None:
+    assert update_check.is_newer("0.1.0-beta", "0.1.0") is False
+
+
+def test_is_newer_two_prereleases_same_numeric_compare_equal() -> None:
+    assert update_check.is_newer("0.1.0-beta", "0.1.0-beta") is False
 
 
 def test_is_newer_pads_shorter_tuple() -> None:

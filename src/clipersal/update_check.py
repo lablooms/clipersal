@@ -96,12 +96,24 @@ def _parse_version(text: str) -> tuple[int, ...] | None:
     return tuple(int(part) for part in parts)
 
 
+def _is_prerelease(text: str) -> bool:
+    """True for a version carrying a "-suffix" pre-release marker ("0.1.0-beta").
+    A "+build" suffix alone doesn't count -- semver: build metadata plays no
+    role in precedence.
+    """
+    text = text.strip()
+    if text[:1] in ("v", "V"):
+        text = text[1:]
+    return "-" in text.split("+", maxsplit=1)[0]
+
+
 def is_newer(candidate: str, current: str) -> bool:
     """False (never True, never raises) if either string is unparseable --
     "cannot determine" must never be treated as "yes, show the banner".
-    Note: stripping the "-suffix" means "0.1.0" compares equal to (not newer
-    than) "0.1.0-beta" -- a beta-to-stable promotion of the same numeric
-    version intentionally won't trigger a banner.
+    Numeric tuples compare first; when they're equal, one semver rule is kept:
+    a stable release outranks the same numeric pre-release ("0.1.0" >
+    "0.1.0-beta"), so a beta install does hear about its own stable promotion.
+    Two pre-releases of the same numeric version still compare equal.
     """
     candidate_parts = _parse_version(candidate)
     current_parts = _parse_version(current)
@@ -110,7 +122,9 @@ def is_newer(candidate: str, current: str) -> bool:
     width = max(len(candidate_parts), len(current_parts))
     candidate_padded = candidate_parts + (0,) * (width - len(candidate_parts))
     current_padded = current_parts + (0,) * (width - len(current_parts))
-    return candidate_padded > current_padded
+    if candidate_padded != current_padded:
+        return candidate_padded > current_padded
+    return not _is_prerelease(candidate) and _is_prerelease(current)
 
 
 def default_cache_path() -> Path:
