@@ -27,7 +27,13 @@ log = logging.getLogger(__name__)
 
 GITHUB_REPO = "lablooms/clipersal"
 
-_API_URL_TEMPLATE = "https://api.github.com/repos/{repo}/releases/latest"
+# The list endpoint, not /releases/latest: GitHub's /latest excludes
+# pre-releases, and every release this project has published so far is
+# marked pre-release, so /latest 404s and the check would stay a no-op
+# until the first stable release. The list is newest-first; draft entries
+# are skipped in fetch_latest_release (unauthenticated callers never see
+# them anyway).
+_API_URL_TEMPLATE = "https://api.github.com/repos/{repo}/releases"
 _CACHE_FILENAME = "update_check_cache.json"
 _CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 _REQUEST_TIMEOUT_SECONDS = 5.0
@@ -52,8 +58,10 @@ def _default_fetch(url: str) -> bytes:
 
 
 def fetch_latest_release(repo: str, fetch: FetchFn = _default_fetch) -> ReleaseInfo | None:
-    """None on literally any failure -- unreachable network, non-200, bad
-    JSON, missing fields. `fetch` is injectable so tests never touch a real
+    """The newest non-draft release (pre-releases included -- see the
+    _API_URL_TEMPLATE comment), or None on literally any failure:
+    unreachable network, non-200, bad JSON, a non-list payload, no
+    releases at all. `fetch` is injectable so tests never touch a real
     socket, the same "inject the boundary function" convention toast_qt.py's
     _ThumbnailFetcher already uses for its ffmpeg call.
     """
@@ -62,7 +70,13 @@ def fetch_latest_release(repo: str, fetch: FetchFn = _default_fetch) -> ReleaseI
     try:
         raw = fetch(_API_URL_TEMPLATE.format(repo=repo))
         data = json.loads(raw)
-        return ReleaseInfo(version=str(data["tag_name"]), url=str(data["html_url"]))
+        if not isinstance(data, list):
+            return None
+        for item in data:
+            if not isinstance(item, dict) or item.get("draft"):
+                continue
+            return ReleaseInfo(version=str(item["tag_name"]), url=str(item["html_url"]))
+        return None
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
 

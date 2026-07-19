@@ -533,8 +533,11 @@ shows a dismissible banner on the Home tab -- never downloads or installs anythi
 
 **`update_check.py`** (stdlib-only -- `urllib.request`/`json`/`re`/`time`, no new
 dependency): `GITHUB_REPO` is set to `"lablooms/clipersal"`. `fetch_latest_release(repo,
-fetch=...)` hits `https://api.github.com/repos/{repo}/releases/latest` (GitHub 403s any
-request missing a `User-Agent` header) and returns `None` on any failure whatsoever --
+fetch=...)` hits `https://api.github.com/repos/{repo}/releases` -- the list endpoint, not
+`/releases/latest`: /latest excludes pre-releases and 404s while every published release
+is a beta pre-release, so the banner would never fire during beta; the list is
+newest-first and the newest non-draft entry wins. GitHub 403s any request missing a
+`User-Agent` header. The fetch returns `None` on any failure whatsoever --
 offline, GitHub down, malformed JSON, missing fields. `is_newer(candidate, current)`
 strips a leading `v` and a `-suffix`/`+build`, then compares dotted-integer tuples;
 returns `False` (never raises, never true-by-default) for anything unparseable. One

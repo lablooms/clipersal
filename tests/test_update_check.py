@@ -56,7 +56,7 @@ def test_fetch_latest_release_returns_none_for_empty_repo() -> None:
 
     def fetch(url: str) -> bytes:
         calls.append(url)
-        return b"{}"
+        return b"[]"
 
     assert update_check.fetch_latest_release("", fetch=fetch) is None
     assert calls == []
@@ -64,11 +64,33 @@ def test_fetch_latest_release_returns_none_for_empty_repo() -> None:
 
 def test_fetch_latest_release_parses_valid_payload() -> None:
     def fetch(url: str) -> bytes:
-        assert url == "https://api.github.com/repos/lablooms/clipersal/releases/latest"
-        return b'{"tag_name": "v0.2.0", "html_url": "https://example.invalid/releases/tag/v0.2.0"}'
+        assert url == "https://api.github.com/repos/lablooms/clipersal/releases"
+        return b'[{"tag_name": "v0.2.0", "html_url": "https://example.invalid/releases/tag/v0.2.0"}]'
 
     result = update_check.fetch_latest_release("lablooms/clipersal", fetch=fetch)
     assert result == update_check.ReleaseInfo(version="v0.2.0", url="https://example.invalid/releases/tag/v0.2.0")
+
+
+def test_fetch_latest_release_accepts_prerelease_only_list() -> None:
+    # The whole reason for the list endpoint: /releases/latest excludes
+    # pre-releases, but this project's published releases are all
+    # pre-releases during beta -- they must still count.
+    def fetch(url: str) -> bytes:
+        return b'[{"tag_name": "v0.2.0-beta", "html_url": "https://example.invalid/v0.2.0-beta", "prerelease": true}]'
+
+    result = update_check.fetch_latest_release("lablooms/clipersal", fetch=fetch)
+    assert result == update_check.ReleaseInfo(version="v0.2.0-beta", url="https://example.invalid/v0.2.0-beta")
+
+
+def test_fetch_latest_release_skips_draft_releases() -> None:
+    def fetch(url: str) -> bytes:
+        return (
+            b'[{"tag_name": "v9.9.9", "html_url": "https://example.invalid/draft", "draft": true},'
+            b' {"tag_name": "v0.2.0", "html_url": "https://example.invalid/v0.2.0"}]'
+        )
+
+    result = update_check.fetch_latest_release("lablooms/clipersal", fetch=fetch)
+    assert result == update_check.ReleaseInfo(version="v0.2.0", url="https://example.invalid/v0.2.0")
 
 
 def test_fetch_latest_release_returns_none_when_fetch_raises() -> None:
@@ -85,9 +107,25 @@ def test_fetch_latest_release_returns_none_for_malformed_json() -> None:
     assert update_check.fetch_latest_release("lablooms/clipersal", fetch=fetch) is None
 
 
+def test_fetch_latest_release_returns_none_for_non_list_payload() -> None:
+    # A dict payload is what the old /releases/latest endpoint returned --
+    # must be rejected, not mistaken for a release.
+    def fetch(url: str) -> bytes:
+        return b'{"tag_name": "v0.2.0", "html_url": "https://example.invalid"}'
+
+    assert update_check.fetch_latest_release("lablooms/clipersal", fetch=fetch) is None
+
+
+def test_fetch_latest_release_returns_none_for_empty_list() -> None:
+    def fetch(url: str) -> bytes:
+        return b"[]"
+
+    assert update_check.fetch_latest_release("lablooms/clipersal", fetch=fetch) is None
+
+
 def test_fetch_latest_release_returns_none_for_missing_keys() -> None:
     def fetch(url: str) -> bytes:
-        return b"{}"
+        return b"[{}]"
 
     assert update_check.fetch_latest_release("lablooms/clipersal", fetch=fetch) is None
 
@@ -139,7 +177,7 @@ def test_check_for_update_once_returns_none_for_unset_repo(tmp_path: Path) -> No
 
     def fetch(url: str) -> bytes:
         calls.append(url)
-        return b'{"tag_name": "v9.9.9", "html_url": "https://example.invalid"}'
+        return b'[{"tag_name": "v9.9.9", "html_url": "https://example.invalid"}]'
 
     result = update_check.check_for_update_once(
         repo="", current_version="0.1.0", cache_path=tmp_path / "cache.json", fetch=fetch
@@ -151,7 +189,7 @@ def test_check_for_update_once_returns_none_for_unset_repo(tmp_path: Path) -> No
 
 def test_check_for_update_once_returns_newer_release(tmp_path: Path) -> None:
     def fetch(url: str) -> bytes:
-        return b'{"tag_name": "v0.2.0", "html_url": "https://example.invalid/v0.2.0"}'
+        return b'[{"tag_name": "v0.2.0", "html_url": "https://example.invalid/v0.2.0"}]'
 
     result = update_check.check_for_update_once(
         repo="lablooms/clipersal", current_version="0.1.0", cache_path=tmp_path / "cache.json", fetch=fetch
@@ -161,7 +199,7 @@ def test_check_for_update_once_returns_newer_release(tmp_path: Path) -> None:
 
 def test_check_for_update_once_returns_none_when_not_newer(tmp_path: Path) -> None:
     def fetch(url: str) -> bytes:
-        return b'{"tag_name": "v0.1.0", "html_url": "https://example.invalid/v0.1.0"}'
+        return b'[{"tag_name": "v0.1.0", "html_url": "https://example.invalid/v0.1.0"}]'
 
     result = update_check.check_for_update_once(
         repo="lablooms/clipersal", current_version="0.1.0", cache_path=tmp_path / "cache.json", fetch=fetch
@@ -174,7 +212,7 @@ def test_check_for_update_once_returns_none_when_dismissed(tmp_path: Path) -> No
     update_check.save_cache({"dismissed_version": "v0.2.0"}, cache_path)
 
     def fetch(url: str) -> bytes:
-        return b'{"tag_name": "v0.2.0", "html_url": "https://example.invalid/v0.2.0"}'
+        return b'[{"tag_name": "v0.2.0", "html_url": "https://example.invalid/v0.2.0"}]'
 
     result = update_check.check_for_update_once(
         repo="lablooms/clipersal", current_version="0.1.0", cache_path=cache_path, fetch=fetch
@@ -186,7 +224,7 @@ def test_check_for_update_once_records_last_checked(tmp_path: Path) -> None:
     cache_path = tmp_path / "cache.json"
 
     def fetch(url: str) -> bytes:
-        return b'{"tag_name": "v0.1.0", "html_url": "https://example.invalid"}'
+        return b'[{"tag_name": "v0.1.0", "html_url": "https://example.invalid"}]'
 
     update_check.check_for_update_once(
         repo="lablooms/clipersal", current_version="0.1.0", now=1000.0, cache_path=cache_path, fetch=fetch
@@ -202,7 +240,7 @@ def test_check_for_update_once_throttled_skips_network_call(tmp_path: Path) -> N
 
     def fetch(url: str) -> bytes:
         calls.append(url)
-        return b'{"tag_name": "v9.9.9", "html_url": "https://example.invalid"}'
+        return b'[{"tag_name": "v9.9.9", "html_url": "https://example.invalid"}]'
 
     result = update_check.check_for_update_once(
         repo="lablooms/clipersal", current_version="0.1.0", now=1000.0 + 60, cache_path=cache_path, fetch=fetch
@@ -225,7 +263,7 @@ def test_check_for_update_once_throttled_still_returns_cached_undismissed_update
 
     def fetch(url: str) -> bytes:
         calls.append(url)
-        return b'{"tag_name": "v9.9.9", "html_url": "https://example.invalid"}'
+        return b'[{"tag_name": "v9.9.9", "html_url": "https://example.invalid"}]'
 
     result = update_check.check_for_update_once(
         repo="lablooms/clipersal", current_version="0.1.0", now=1000.0 + 60, cache_path=cache_path, fetch=fetch
@@ -286,7 +324,7 @@ def test_check_for_update_once_past_throttle_calls_fetch_again(tmp_path: Path) -
 
     def fetch(url: str) -> bytes:
         calls.append(url)
-        return b'{"tag_name": "v0.2.0", "html_url": "https://example.invalid/v0.2.0"}'
+        return b'[{"tag_name": "v0.2.0", "html_url": "https://example.invalid/v0.2.0"}]'
 
     result = update_check.check_for_update_once(
         repo="lablooms/clipersal",
@@ -317,7 +355,7 @@ def test_check_for_update_once_never_raises_when_cache_path_unwritable(tmp_path:
     bad_path.mkdir()
 
     def fetch(url: str) -> bytes:
-        return b'{"tag_name": "v0.2.0", "html_url": "https://example.invalid"}'
+        return b'[{"tag_name": "v0.2.0", "html_url": "https://example.invalid"}]'
 
     result = update_check.check_for_update_once(
         repo="lablooms/clipersal", current_version="0.1.0", cache_path=bad_path, fetch=fetch
