@@ -91,4 +91,8 @@ jobs:
           case "$TAG" in
             *-*) ARGS+=(--prerelease) ;;
           esac
-          gh release create "$TAG" release-files/* --title "Clipersal $VERSION" "${ARGS[@]}"
+          # upload-artifact preserves directory structure below the common
+          # ancestor (dist_installer/, dist/), so pass FILES, not a bare glob --
+          # gh release create errors on directories.
+          mapfile -t FILES < <(find release-files -type f)
+          gh release create "$TAG" "${FILES[@]}" --title "Clipersal $VERSION" "${ARGS[@]}"
