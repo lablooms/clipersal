@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 from clipersal import first_run_qt
 from clipersal.config import Config
 from clipersal.first_run_qt import _FirstRunDialog
+from clipersal.hotkey import DEFAULT_COMBO
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -122,3 +123,62 @@ def test_close_event_behaves_like_skip(tmp_path: Path) -> None:
 
     saved = config_store.load_overrides()
     assert saved["clips_dir"] == str(config.clips_dir)
+
+
+# ---- hotkey combo validation + the mid-record hazard -------------------------
+
+
+class _FakeListener:
+    """Stands in for pynput.keyboard.Listener -- tests never hook real global
+    keyboard input (same rule as test_hotkey_widget_qt.py).
+    """
+
+    def __init__(self, on_press=None, on_release=None):
+        self.on_press = on_press
+        self.on_release = on_release
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def test_get_started_rejects_invalid_hotkey_combo(tmp_path: Path) -> None:
+    config = _make_config(tmp_path)
+    dialog = _FirstRunDialog(config)
+    dialog._hotkey_field.entry.setText("garbage combo")
+
+    dialog._get_started()
+
+    assert "Invalid hotkey combo" in dialog._error_label.text()
+    assert dialog.result() != _FirstRunDialog.DialogCode.Accepted
+    # The bad combo must not have been mutated in / persisted.
+    assert config.hotkey_combo == DEFAULT_COMBO
+
+
+def test_get_started_while_recording_cancels_recorder_instead_of_persisting_placeholder(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import pynput.keyboard
+
+    monkeypatch.setattr(pynput.keyboard, "Listener", _FakeListener)
+    config = _make_config(tmp_path)
+    dialog = _FirstRunDialog(config)
+
+    dialog._hotkey_field.record_button.click()  # entry now shows "Press keys..."
+    assert dialog._hotkey_field.is_recording() is True
+
+    dialog._get_started()
+
+    # The recording was cancelled and the pre-record combo persisted --
+    # previously the placeholder text itself became the saved hotkey.
+    assert dialog._hotkey_field.is_recording() is False
+    assert config.hotkey_combo == DEFAULT_COMBO
+    assert dialog.result() == _FirstRunDialog.DialogCode.Accepted
+    from clipersal import config_store
+
+    saved = config_store.load_overrides()
+    assert saved["hotkey_combo"] == DEFAULT_COMBO

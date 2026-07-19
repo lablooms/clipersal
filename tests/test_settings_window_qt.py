@@ -375,3 +375,45 @@ def test_save_payload_check_for_updates_reflects_switch(tmp_path: Path) -> None:
     frame.check_for_updates_switch.click()
     frame._on_save()
     assert captured["check_for_updates"] is True
+
+
+# ---- saving while the hotkey recorder is mid-capture ------------------------
+
+
+class _FakeListener:
+    """Stands in for pynput.keyboard.Listener -- tests never hook real global
+    keyboard input (same rule as test_hotkey_widget_qt.py).
+    """
+
+    def __init__(self, on_press=None, on_release=None):
+        self.on_press = on_press
+        self.on_release = on_release
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def test_save_while_hotkey_recording_cancels_recorder_instead_of_persisting_placeholder(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import pynput.keyboard
+
+    monkeypatch.setattr(pynput.keyboard, "Listener", _FakeListener)
+    captured = {}
+    frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None)
+
+    frame.hotkey_field.record_button.click()  # entry now shows "Press keys..."
+    assert frame.hotkey_field.is_recording() is True
+
+    frame._on_save()
+
+    # The recording was cancelled and the PRE-RECORD combo is what got
+    # applied -- not the placeholder text.
+    assert frame.hotkey_field.is_recording() is False
+    assert captured["hotkey_combo"] == "<ctrl>+<alt>+r"
+    assert frame.status_label.text() == "Settings saved."

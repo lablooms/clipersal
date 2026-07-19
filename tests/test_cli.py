@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import clipersal.cli as cli
 from clipersal import ipc
 from clipersal.cli import _another_instance_running
+from clipersal.config import Config
 from clipersal.ipc import IpcServer
 
 
@@ -221,3 +222,369 @@ def test_concurrent_saves_are_serialized_and_get_distinct_names(monkeypatch, tmp
     # ...so the second one saw the first's file and got a suffixed name.
     assert len(results) == 2
     assert sorted(Path(r).name for r in results) == ["clip-test-1.mp4", "clip-test.mp4"]
+
+
+# ---- apply_settings / rebind_hotkey / shutdown -------------------------------
+#
+# apply_settings only exists as a closure inside main(), handed to the main
+# window as on_apply -- so these tests drive it through a fully faked main()
+# run: stand-in QApplication/AppSignals/MainWindow, fake capture session, fake
+# IPC server. No real Qt, ffmpeg, sockets, or config files.
+
+
+def _settings_values(config, **overrides):
+    """A full Settings-Save payload (same keys settings_window_qt sends),
+    seeded from the config's current values so tests can flip one field."""
+    values = {
+        "buffer_seconds": config.buffer_seconds,
+        "clips_dir": str(config.clips_dir),
+        "hotkey_combo": config.hotkey_combo,
+        "video_bitrate": config.video_bitrate,
+        "quality_preset": config.quality_preset,
+        "capture_mode": config.capture_mode,
+        "monitor_index": config.monitor_index,
+        "window_title": config.window_title,
+        "mic_device": config.mic_device,
+        "encoder_override": config.encoder_override,
+        "filename_template": config.filename_template,
+        "clip_retention_days": config.clip_retention_days,
+        "launch_on_startup": config.launch_on_startup,
+        "check_for_updates": config.check_for_updates,
+    }
+    values.update(overrides)
+    return values
+
+
+def _install_apply_settings_fakes(monkeypatch, tmp_path, hotkey_enabled=False):
+    calls = []
+    fakes = SimpleNamespace(
+        server=None, calls=calls, on_apply=None, saved_overrides=[], hotkey_events=[], config=None
+    )
+    quit_event = threading.Event()
+
+    class FakeSignal:
+        def __init__(self):
+            self._slots = []
+
+        def connect(self, slot):
+            self._slots.append(slot)
+
+        # Synchronous delivery -- the real AppSignals queues across threads,
+        # but these tests only need the QUIT -> app.quit edge to fire.
+        def emit(self, *args):
+            for slot in self._slots:
+                slot(*args)
+
+    class FakeAppSignals:
+        def __init__(self):
+            self.quit_requested = FakeSignal()
+            self.show_requested = FakeSignal()
+            self.save_completed = FakeSignal()
+            self.save_failed = FakeSignal()
+            self.toast_requested = FakeSignal()
+            self.update_available = FakeSignal()
+
+    class FakeApp:
+        def quit(self):
+            quit_event.set()
+
+        def exec(self):
+            quit_event.wait(10)
+
+    class FakeMainWindow:
+        def __init__(self, **kwargs):
+            fakes.on_apply = kwargs["on_apply"]
+
+        def show(self):
+            pass
+
+        def select_tab(self, tab):
+            pass
+
+        def on_save_completed(self):
+            pass
+
+        def on_save_failed(self):
+            pass
+
+        def show_update_banner(self, *args):
+            pass
+
+        def deleteLater(self):
+            pass
+
+    class FakeIpcServer:
+        def __init__(self, host="127.0.0.1", port=51525):
+            self.port = port
+            self.handlers = {}
+            fakes.server = self
+
+        def register(self, command, handler):
+            self.handlers[command] = handler
+
+        def start(self):
+            calls.append("ipc_start")
+
+        def stop(self):
+            calls.append("ipc_stop")
+
+    class FakeSession:
+        def __init__(self, config, setup):
+            calls.append("session_construct")
+
+        def start(self):
+            calls.append("session_start")
+
+        def stop(self):
+            calls.append("session_stop")
+
+        def is_running(self):
+            return True
+
+        def gave_up_restarting(self):
+            return False
+
+    fake_setup = SimpleNamespace(
+        encoder="fake-encoder",
+        video_source=SimpleNamespace(kind="fake"),
+        audio_source=None,
+        ffmpeg_path="ffmpeg",
+    )
+
+    def fake_resolve_setup(cfg):
+        # Records the bitrate it was called with so tests can tell whether
+        # resolution ran against the NEW settings (a candidate config) or the
+        # stale ones -- and fails like a real forced-encoder smoke-encode.
+        calls.append(("resolve_setup", cfg.video_bitrate))
+        if cfg.encoder_override == "bogus-encoder":
+            raise cli.NoWorkingEncoderError("Forced encoder 'bogus-encoder' does not work (fake)")
+        return fake_setup
+
+    class FakeHotkeyListener:
+        def __init__(self, combo, callback):
+            self._combo = combo
+            fakes.hotkey_events.append(("construct", combo))
+
+        def start(self):
+            fakes.hotkey_events.append(("start", self._combo))
+
+        def stop(self):
+            fakes.hotkey_events.append(("stop", self._combo))
+
+    config = Config(
+        ipc_port=0,
+        hotkey_enabled=hotkey_enabled,
+        tray_enabled=False,
+        check_for_updates=False,
+        buffer_dir=tmp_path / "buffer",
+        clips_dir=tmp_path / "clips",
+    )
+    fakes.config = config
+
+    existing_config_file = tmp_path / "config.json"
+    existing_config_file.write_text("{}")  # so main() skips the first-run wizard
+
+    monkeypatch.setattr(cli, "_configure_logging", lambda: tmp_path / "clipersal.log")
+    monkeypatch.setattr(cli, "_ensure_qapplication", lambda: FakeApp())
+    monkeypatch.setattr(cli, "AppSignals", FakeAppSignals)
+    monkeypatch.setattr(cli, "_another_instance_running", lambda port: False)
+    monkeypatch.setattr(cli, "config_from_args", lambda args: config)
+    monkeypatch.setattr(cli, "_show_startup_error", lambda message: None)
+    monkeypatch.setattr(cli.capture, "resolve_setup", fake_resolve_setup)
+    monkeypatch.setattr(cli.capture, "SegmentedCapture", FakeSession)
+    monkeypatch.setattr(cli.ipc, "IpcServer", FakeIpcServer)
+    monkeypatch.setattr(cli.config_store, "save_overrides", lambda overrides: fakes.saved_overrides.append(overrides))
+    monkeypatch.setattr(cli.config_store, "default_config_path", lambda: existing_config_file)
+    monkeypatch.setattr(cli.concat, "enforce_clip_retention", lambda clips_dir, days: [])
+    monkeypatch.setattr(cli.autostart, "is_supported", lambda os_: False)
+    monkeypatch.setattr(cli.hotkey_module, "is_supported", lambda os_, session_type: True)
+    monkeypatch.setattr(cli.hotkey_module, "HotkeyListener", FakeHotkeyListener)
+
+    import clipersal.main_window_qt as main_window_qt
+
+    monkeypatch.setattr(main_window_qt, "MainWindow", FakeMainWindow)
+
+    return fakes
+
+
+def _start_main(fakes):
+    result = {}
+
+    def run() -> None:
+        result["rc"] = cli.main([])
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if fakes.server is not None and "QUIT" in fakes.server.handlers and fakes.on_apply is not None:
+            break
+        time.sleep(0.01)
+    assert fakes.server is not None and "QUIT" in fakes.server.handlers
+    assert fakes.on_apply is not None
+    return thread, result
+
+
+def _stop_main(fakes, thread, result) -> None:
+    fakes.server.handlers["QUIT"]()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert result["rc"] == 0
+
+
+def test_apply_settings_bogus_encoder_keeps_old_capture_running_and_untouched(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    thread, result = _start_main(fakes)
+
+    # A forced encoder that fails its smoke-encode -- plus an unrelated live
+    # field changed, to prove NOTHING gets mutated on the failure path.
+    values = _settings_values(fakes.config, encoder_override="bogus-encoder", buffer_seconds=90)
+    error = fakes.on_apply(values)
+
+    assert error is not None and "Could not apply" in error
+    # The old capture session was never stopped and no replacement built.
+    assert fakes.calls.count("session_stop") == 0
+    assert fakes.calls.count("session_construct") == 1
+    # STATUS must honestly reflect a still-running capture.
+    assert fakes.server.handlers["STATUS"]() == "RECORDING"
+    # Config was left untouched -- including the live-apply buffer_seconds.
+    assert fakes.config.encoder_override is None
+    assert fakes.config.video_bitrate == "8M"
+    assert fakes.config.buffer_seconds == 60
+    # ...and nothing was persisted.
+    assert fakes.saved_overrides == []
+
+    # A second Save with the same fields diffs against the REAL (unmutated)
+    # config, so it reports the same error instead of a hollow success.
+    assert fakes.on_apply(values) == error
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_valid_capture_change_restarts_and_persists(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, video_bitrate="12M"))
+
+    assert error is None
+    assert fakes.config.video_bitrate == "12M"
+    # Resolution ran against the NEW values on apply (startup used the old).
+    assert ("resolve_setup", "8M") in fakes.calls
+    assert ("resolve_setup", "12M") in fakes.calls
+    # The old session was stopped and its replacement constructed + started.
+    stop_idx = fakes.calls.index("session_stop")
+    assert stop_idx < fakes.calls.index("session_construct", stop_idx)
+    assert fakes.calls.count("session_start") == 2
+    assert fakes.saved_overrides[0]["video_bitrate"] == "12M"
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_invalid_hotkey_is_rejected_before_touching_anything(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path, hotkey_enabled=True)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, hotkey_combo="Press keys..."))
+
+    assert error is not None and "Invalid hotkey combo" in error
+    assert fakes.config.hotkey_combo == "<ctrl>+<alt>+r"
+    assert fakes.saved_overrides == []
+    # The old listener is still the only one that exists -- never stopped,
+    # no construction of the garbage combo attempted.
+    assert fakes.hotkey_events == [("construct", "<ctrl>+<alt>+r"), ("start", "<ctrl>+<alt>+r")]
+
+    _stop_main(fakes, thread, result)
+
+
+def test_rebind_hotkey_constructs_new_binding_before_stopping_old_listener(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path, hotkey_enabled=True)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, hotkey_combo="<ctrl>+<shift>+s"))
+
+    assert error is None
+    assert fakes.hotkey_events == [
+        ("construct", "<ctrl>+<alt>+r"),  # startup binding
+        ("start", "<ctrl>+<alt>+r"),
+        ("construct", "<ctrl>+<shift>+s"),  # new binding is built AND started ...
+        ("start", "<ctrl>+<shift>+s"),
+        ("stop", "<ctrl>+<alt>+r"),  # ... before the old one is dropped
+    ]
+    assert fakes.saved_overrides[0]["hotkey_combo"] == "<ctrl>+<shift>+s"
+
+    _stop_main(fakes, thread, result)
+
+
+def test_shutdown_stops_session_under_pause_lock(monkeypatch, tmp_path) -> None:
+    fakes = _install_headless_startup_fakes(monkeypatch, tmp_path)
+    calls = fakes.calls
+
+    # A functional Lock wrapper that records acquire/release into the same
+    # event stream as the session fakes, so the shutdown ordering can be
+    # asserted directly. main() creates pause_lock via threading.Lock, so it
+    # gets the fake too (threading.Event's internal lock likewise -- those
+    # events are balanced pairs that don't affect the backward scan below).
+    real_lock_cls = threading.Lock
+
+    class FakeLock:
+        _next_index = 0
+
+        def __init__(self):
+            self._index = FakeLock._next_index
+            FakeLock._next_index += 1
+            self._real = real_lock_cls()
+
+        def acquire(self, *args):
+            calls.append(("lock_acquire", self._index))
+            return self._real.acquire(*args)
+
+        def release(self):
+            calls.append(("lock_release", self._index))
+            self._real.release()
+
+        def locked(self):
+            return self._real.locked()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *exc_info):
+            self.release()
+            return False
+
+    monkeypatch.setattr(cli.threading, "Lock", FakeLock)
+
+    result = {}
+
+    def run() -> None:
+        result["rc"] = cli.main([])
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if fakes.server is not None and "QUIT" in fakes.server.handlers:
+            break
+        time.sleep(0.01)
+    assert fakes.server is not None and "QUIT" in fakes.server.handlers
+
+    fakes.server.handlers["QUIT"]()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert result["rc"] == 0
+
+    # The final session stop must be enclosed in an acquire/release pair of
+    # the SAME lock -- previously it ran bare, racing apply_settings' swap of
+    # state.session and potentially orphaning a freshly started ffmpeg.
+    stop_idx = len(calls) - 1 - calls[::-1].index("session_stop")
+    enclosing = None
+    for event in reversed(calls[:stop_idx]):
+        if isinstance(event, tuple) and event[0] == "lock_acquire":
+            enclosing = event[1]
+            break
+        if isinstance(event, tuple) and event[0] == "lock_release":
+            break
+    assert enclosing is not None
+    assert ("lock_release", enclosing) in calls[stop_idx + 1 :]

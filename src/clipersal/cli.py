@@ -16,6 +16,7 @@ integrates directly with QApplication's event loop.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import sys
 import threading
@@ -325,19 +326,27 @@ def main(argv: list[str] | None = None) -> int:
     server.register("QUIT", handle_quit)
 
     def rebind_hotkey() -> None:
-        if state.hotkey_listener is not None:
-            state.hotkey_listener.stop()
-            state.hotkey_listener = None
         if not config.hotkey_enabled or not hotkey_module.is_supported(os_, session_type):
+            if state.hotkey_listener is not None:
+                state.hotkey_listener.stop()
+                state.hotkey_listener = None
             return
+        # Construct AND start the new binding before dropping the old one:
+        # if the new combo can't be bound, the old listener stays alive
+        # instead of leaving no hotkey at all. (apply_settings validates the
+        # combo before it can get this far, so a start() failure here means
+        # something environmental, e.g. the X connection dropping.)
         listener = hotkey_module.HotkeyListener(
             config.hotkey_combo, callback=lambda: _trigger_save_via_ipc(config.ipc_port)
         )
         try:
             listener.start()
-            state.hotkey_listener = listener
         except hotkey_module.HotkeyUnsupportedError as exc:
             log.warning("Global hotkey unavailable (%s); use clipersal-trigger instead", exc)
+            return
+        if state.hotkey_listener is not None:
+            state.hotkey_listener.stop()
+        state.hotkey_listener = listener
 
     rebind_hotkey()
     if config.hotkey_enabled and state.hotkey_listener is None and not hotkey_module.is_supported(os_, session_type):
@@ -346,17 +355,22 @@ def main(argv: list[str] | None = None) -> int:
             "Bind `clipersal-trigger save` to a desktop keybinding instead -- see ARCHITECTURE.md."
         )
 
-    def restart_capture() -> None:
+    def restart_capture(new_setup: capture.ResolvedSetup) -> None:
         """Encoder/bitrate/capture-target/mic changes are baked into the
-        ffmpeg command line, so applying them means re-resolving the setup
-        and swapping in a fresh SegmentedCapture -- preserving whatever
-        paused/running state was already in effect. See ARCHITECTURE.md's
-        "Settings persistence" section.
+        ffmpeg command line, so applying them means swapping in a fresh
+        SegmentedCapture -- preserving whatever paused/running state was
+        already in effect. See ARCHITECTURE.md's "Settings persistence"
+        section.
+
+        `new_setup` must already be resolved (against the new settings) by
+        the caller: resolving is the failure-prone part (it smoke-encodes
+        candidate encoders), and doing it BEFORE anything is stopped means a
+        resolution failure leaves the old capture running untouched instead
+        of dead with nothing to replace it.
         """
         was_running = state.session.is_running()
         if was_running:
             state.session.stop()
-        new_setup = capture.resolve_setup(config)
         state.setup = new_setup
         state.session = capture.SegmentedCapture(config, new_setup)
         if was_running:
@@ -369,6 +383,16 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as exc:
             return f"Could not use clips folder: {exc}"
 
+        # The hotkey field is free-typed text, so validate the combo before
+        # touching anything -- persisting an unparseable combo would kill the
+        # hotkey on every future launch too, since the persisted value is
+        # rebound at startup.
+        if not hotkey_module.is_valid_combo(new_values["hotkey_combo"]):
+            return (
+                f"Invalid hotkey combo: {new_values['hotkey_combo']!r} -- "
+                "use pynput format, e.g. <ctrl>+<alt>+r"
+            )
+
         needs_capture_restart = (
             new_values["video_bitrate"] != config.video_bitrate
             or new_values["quality_preset"] != config.quality_preset
@@ -380,6 +404,30 @@ def main(argv: list[str] | None = None) -> int:
         )
         needs_hotkey_rebind = new_values["hotkey_combo"] != config.hotkey_combo
         needs_autostart_change = new_values["launch_on_startup"] != config.launch_on_startup
+
+        # Resolve the new capture setup BEFORE mutating config or stopping
+        # the running session. Resolution is where a bad capture setting
+        # fails (e.g. a forced encoder that doesn't actually work), and
+        # failing here leaves the old capture running and every stored value
+        # untouched -- so a second Save with the same fields diffs against
+        # the real config and reports the error again, instead of a hollow
+        # "saved" over a silently dead capture.
+        new_setup = None
+        if needs_capture_restart:
+            candidate = dataclasses.replace(
+                config,
+                video_bitrate=new_values["video_bitrate"],
+                quality_preset=new_values["quality_preset"],
+                encoder_override=new_values["encoder_override"],
+                monitor_index=new_values["monitor_index"],
+                mic_device=new_values["mic_device"],
+                capture_mode=new_values["capture_mode"],
+                window_title=new_values["window_title"],
+            )
+            try:
+                new_setup = capture.resolve_setup(candidate)
+            except (FfmpegNotFoundError, WaylandCaptureNotImplementedError, NoWorkingEncoderError) as exc:
+                return f"Could not apply encoder/bitrate change: {exc}"
 
         config.buffer_seconds = new_values["buffer_seconds"]
         config.clips_dir = new_clips_dir
@@ -406,11 +454,11 @@ def main(argv: list[str] | None = None) -> int:
                 log.warning("Could not update launch-on-startup registration: %s", exc)
 
         if needs_capture_restart:
-            try:
-                with pause_lock:
-                    restart_capture()
-            except (FfmpegNotFoundError, WaylandCaptureNotImplementedError, NoWorkingEncoderError) as exc:
-                return f"Could not apply encoder/bitrate change: {exc}"
+            # new_setup was resolved above, before config was mutated -- it
+            # can't fail here, so the old session is only stopped once its
+            # replacement is known-good.
+            with pause_lock:
+                restart_capture(new_setup)
 
         if needs_hotkey_rebind:
             rebind_hotkey()
@@ -566,7 +614,13 @@ def main(argv: list[str] | None = None) -> int:
         if state.hotkey_listener is not None:
             state.hotkey_listener.stop()
         server.stop()
-        state.session.stop()
+        # Under pause_lock for the same reason handle_pause/resume and
+        # restart_capture hold it: apply_settings swaps state.session under
+        # that lock, so stopping the session WITHOUT it could read the old
+        # handle while the GUI thread is mid-swap -- and the freshly started
+        # replacement ffmpeg would never be terminated.
+        with pause_lock:
+            state.session.stop()
         if main_window is not None:
             main_window.deleteLater()
         print("Stopped.")

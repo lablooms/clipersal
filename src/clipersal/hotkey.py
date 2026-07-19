@@ -39,6 +39,30 @@ def is_supported(os_: OS, session_type: LinuxSessionType | None) -> bool:
     return False
 
 
+def is_valid_combo(combo: str) -> bool:
+    """Whether `combo` parses as a pynput hotkey string -- the same format
+    HotkeyListener binds. The Settings field and first-run wizard accept
+    free-typed combos, so this is the gate that keeps an unparseable string
+    (the recorder's "Press keys..." placeholder, or plain garbage) from being
+    persisted: a bad combo that reaches GlobalHotKeys raises there instead,
+    leaving no hotkey bound -- not just now, but on every future launch, since
+    the persisted value is rebound at startup.
+    """
+    if not combo or not combo.strip():
+        return False
+    try:
+        from pynput import keyboard
+    except ImportError:
+        # Without pynput there's no parser to validate against -- and no
+        # hotkey to bind either, so the combo is inert either way. Don't
+        # block saving settings over it.
+        return True
+    try:
+        return bool(keyboard.HotKey.parse(combo))
+    except ValueError:
+        return False
+
+
 class HotkeyListener:
     def __init__(self, combo: str, callback: Callable[[], None]):
         self._combo = combo

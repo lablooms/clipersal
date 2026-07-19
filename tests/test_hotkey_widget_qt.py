@@ -174,3 +174,41 @@ def test_key_events_ignored_when_not_recording() -> None:
     field = HotkeyField("<ctrl>+<alt>+r")
     field._on_key_press("z")  # never clicked Record
     assert field.combo() == "<ctrl>+<alt>+r"  # unchanged
+
+
+def test_cancel_recording_aborts_and_restores_initial_combo() -> None:
+    field = HotkeyField("<ctrl>+<alt>+r")
+    field.record_button.click()  # start recording
+    assert field.is_recording() is True
+
+    field.cancel_recording()
+
+    # Same outcome as clicking Cancel: idle state, placeholder dropped, the
+    # pre-record combo is what .combo() returns.
+    assert field.is_recording() is False
+    assert field.combo() == "<ctrl>+<alt>+r"
+    assert field.entry.isEnabled() is True
+    assert field.record_button.text() == "Record"
+    assert _FakeListener.instances[0].stopped is True
+
+
+def test_cancel_recording_mid_capture_drops_partial_capture() -> None:
+    field = HotkeyField("<ctrl>+<alt>+r")
+    field.record_button.click()
+    # A lone modifier tap doesn't finalize -- the entry goes back to the
+    # "Press keys..." placeholder with the recorder still listening.
+    field._on_key_press("ctrl")
+    field._on_key_release("ctrl")
+
+    field.cancel_recording()
+
+    assert field.is_recording() is False
+    assert field.combo() == "<ctrl>+<alt>+r"
+
+
+def test_cancel_recording_is_a_noop_when_idle() -> None:
+    field = HotkeyField("<ctrl>+<alt>+r")
+    field.cancel_recording()
+    assert field.is_recording() is False
+    assert field.combo() == "<ctrl>+<alt>+r"
+    assert _FakeListener.instances == []

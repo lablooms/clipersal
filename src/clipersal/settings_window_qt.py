@@ -487,6 +487,12 @@ class SettingsFrame(QWidget):
     def _on_save(self) -> None:
         self._status_clear_timer.stop()
 
+        # Saving while the recorder is mid-capture would read (and persist)
+        # its "Press keys..." placeholder as the combo -- cancel the
+        # recording first so the pre-record text is what gets read below.
+        if self.hotkey_field.is_recording():
+            self.hotkey_field.cancel_recording()
+
         hotkey_text = self.hotkey_field.combo().strip()
         if not hotkey_text:
             self._set_status("Hotkey cannot be empty.", "error")

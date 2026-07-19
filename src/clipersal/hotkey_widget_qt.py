@@ -105,6 +105,15 @@ class HotkeyField(QWidget):
     def is_recording(self) -> bool:
         return self._recording
 
+    def cancel_recording(self) -> None:
+        """Aborts an in-progress recording from outside the widget -- same as
+        clicking the Cancel button. Settings/wizard Save paths call this when
+        they're invoked mid-record, so the "Press keys..." placeholder (or a
+        half-captured combo) is never read as the combo to persist.
+        """
+        if self._recording:
+            self._finish_recording(None)
+
     def _restyle_record_button(self, recording: bool) -> None:
         # setProperty() alone doesn't force Qt to re-evaluate QSS selectors
         # keyed on it (e.g. #recordButton[recording="true"]) -- unpolish()

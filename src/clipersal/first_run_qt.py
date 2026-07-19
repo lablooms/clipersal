@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 from clipersal import config_store
 from clipersal.brand import BrandMark, SprigAccent
 from clipersal.config import Config
+from clipersal.hotkey import is_valid_combo
 from clipersal.hotkey_widget_qt import HotkeyField
 
 
@@ -145,9 +146,19 @@ class _FirstRunDialog(QDialog):
         self.accept()
 
     def _get_started(self) -> None:
+        # Same mid-record hazard as Settings' Save: don't persist the
+        # recorder's "Press keys..." placeholder as the combo.
+        if self._hotkey_field.is_recording():
+            self._hotkey_field.cancel_recording()
         hotkey_text = self._hotkey_field.combo().strip()
         if not hotkey_text:
             self._set_error("Hotkey cannot be empty.")
+            return
+        # Unlike Settings, this path persists the combo directly (no
+        # apply_settings in between), so the parse check has to happen here
+        # -- a bad combo saved now means no hotkey on every future launch.
+        if not is_valid_combo(hotkey_text):
+            self._set_error(f"Invalid hotkey combo: {hotkey_text!r} -- use pynput format, e.g. <ctrl>+<alt>+r")
             return
         clips_text = self._clips_dir_edit.text().strip()
         if not clips_text:
