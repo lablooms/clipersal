@@ -16,8 +16,3 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Local dev-tooling state (worktrees, scheduler locks) -- not project source
-.claude/
-
-# Local-only project notes (not published)
-CLAUDE.md
