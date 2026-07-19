@@ -77,9 +77,11 @@ jobs:
           VERSION="${TAG#v}"
           # Release notes = this version's CHANGELOG section, minus the heading;
           # fall back to auto-generated notes if the section is missing/empty.
-          awk -v version="$VERSION" '
-            $0 ~ "^## \\[" version "\\]" { found=1; next }
-            found && /^## \[/ { exit }
+          # index()/substr(), not regex: gawk and mawk disagree on how "\["
+          # behaves in a dynamic regex -- this form is identical on both.
+          awk -v heading="## [$VERSION]" '
+            index($0, heading) == 1 { found=1; next }
+            found && substr($0, 1, 3) == "## " { exit }
             found { print }
           ' CHANGELOG.md | sed '/./,$!d' > notes.md
           ARGS=()
