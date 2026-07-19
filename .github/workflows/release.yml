@@ -34,7 +34,7 @@ jobs:
 
       - name: Compile the Inno Setup installer
         shell: pwsh
-        run: & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging/clipersal_installer.iss
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging/clipersal_installer.iss'
 
       - name: Build the portable zip
         shell: pwsh
