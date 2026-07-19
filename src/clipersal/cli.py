@@ -117,9 +117,12 @@ def _another_instance_running(port: int) -> bool:
     doing any of the slow/expensive startup work (encoder detection, starting
     ffmpeg). If something is already listening and answers, that's another
     running instance -- checked up front so a second launch gets a fast,
-    friendly message instead of first spinning up a whole duplicate capture
-    session and only then failing later when IpcServer can't bind the same
-    port (the previous behavior).
+    friendly message instead of a bare bind-failure error. Only best-effort,
+    though: under load, or when two launches race inside the startup window,
+    the other end may not be listening (or answering) yet. The real backstop
+    is the IpcServer bind itself right after this check, kept ahead of the
+    expensive work so a lost race exits before spawning a duplicate capture
+    session.
     """
     try:
         response = ipc_client.send_command("PING", port=port, timeout=0.5)
@@ -166,6 +169,24 @@ def main(argv: list[str] | None = None) -> int:
         _show_already_running_message(config.ipc_port)
         return 0
 
+    # The IPC server is bound up front, BEFORE the slow/expensive startup
+    # work below (resolve_setup's encoder smoke-encodes, session.start
+    # spawning ffmpeg). The PING check above is best-effort only -- it can
+    # miss an instance that is itself still starting and hasn't bound yet --
+    # so this bind is the real single-instance backstop, and the loser of
+    # that race must exit here, not after spinning up a duplicate capture
+    # session. PING is registered before start() for the same reason: a
+    # concurrent launch's _another_instance_running probe gets an answer the
+    # moment the socket exists and takes the friendly exit above instead of
+    # this bind failure.
+    server = ipc.IpcServer(port=config.ipc_port)
+    server.register("PING", lambda arg=None: "PONG")
+    try:
+        server.start()
+    except ipc.IpcServerBindError as exc:
+        _show_startup_error(str(exc))
+        return 1
+
     if app is not None and not config_store.default_config_path().exists():
         try:
             from clipersal import first_run_qt
@@ -177,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         setup = capture.resolve_setup(config)
     except (FfmpegNotFoundError, WaylandCaptureNotImplementedError, NoWorkingEncoderError) as exc:
+        server.stop()  # release the port before the error dialog blocks on the user
         _show_startup_error(str(exc))
         return 1
 
@@ -275,9 +297,13 @@ def main(argv: list[str] | None = None) -> int:
     def handle_logs(arg: str | None = None) -> str:
         return _handle_show_tab("logs")
 
-    server = ipc.IpcServer(port=config.ipc_port)
+    # The server itself was created and started up front, before
+    # resolve_setup -- see the comment there for why. Registering the rest
+    # of the handlers is deferred to here because they close over `state`,
+    # which only exists once the capture session does; registering after
+    # start() is fine since IpcServer shares its handler dict with the
+    # socketserver.
     server.register("SAVE", handle_save)
-    server.register("PING", lambda arg=None: "PONG")
     server.register("PAUSE", handle_pause)
     server.register("RESUME", handle_resume)
     server.register("STATUS", handle_status)
@@ -286,12 +312,6 @@ def main(argv: list[str] | None = None) -> int:
     server.register("GALLERY", handle_gallery)
     server.register("LOGS", handle_logs)
     server.register("QUIT", handle_quit)
-    try:
-        server.start()
-    except ipc.IpcServerBindError as exc:
-        _show_startup_error(str(exc))
-        session.stop()
-        return 1
 
     def rebind_hotkey() -> None:
         if state.hotkey_listener is not None:

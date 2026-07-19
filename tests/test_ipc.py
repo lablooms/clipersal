@@ -1,6 +1,9 @@
+import socket
+import sys
+
 import pytest
 
-from clipersal.ipc import IpcServer
+from clipersal.ipc import IpcServer, IpcServerBindError
 from clipersal.ipc_client import IpcClientError, send_command
 
 
@@ -96,3 +99,63 @@ def test_argument_with_extra_whitespace_is_preserved_after_first_split(running_s
     send_command("ECHO", arg="hello world", port=running_server.port)
 
     assert received == ["hello world"]
+
+
+def _recording_setsockopt(monkeypatch) -> list:
+    """Replace socket.socket.setsockopt with a recorder for the duration of a
+    test and return the list of (level, optname, value) calls. The real
+    setsockopt is skipped entirely -- a loopback test bind works fine with no
+    options set, and this keeps the Windows-only SO_EXCLUSIVEADDRUSE value
+    settable when these tests run on POSIX.
+    """
+    calls = []
+    monkeypatch.setattr(
+        socket.socket,
+        "setsockopt",
+        lambda self, level, optname, value: calls.append((level, optname, value)),
+    )
+    return calls
+
+
+def test_windows_bind_uses_exclusive_addr_use_not_reuseaddr(monkeypatch) -> None:
+    # sys.platform is pinned so the test exercises the Windows branch no
+    # matter which OS the suite runs on.
+    monkeypatch.setattr(sys, "platform", "win32")
+    sentinel = -5  # SO_EXCLUSIVEADDRUSE's real value; forced into existence for POSIX runs
+    monkeypatch.setattr(socket, "SO_EXCLUSIVEADDRUSE", sentinel, raising=False)
+    calls = _recording_setsockopt(monkeypatch)
+
+    server = IpcServer(port=0)
+    server.start()
+    try:
+        assert (socket.SOL_SOCKET, sentinel, 1) in calls
+        assert all(optname != socket.SO_REUSEADDR for _, optname, _ in calls)
+    finally:
+        server.stop()
+
+
+def test_posix_bind_keeps_reuseaddr(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    calls = _recording_setsockopt(monkeypatch)
+
+    server = IpcServer(port=0)
+    server.start()
+    try:
+        assert (socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) in calls
+    finally:
+        server.stop()
+
+
+def test_second_bind_on_same_port_is_refused() -> None:
+    # The single-instance backstop itself: while one server holds the port, a
+    # second IpcServer must not be able to take it over. On Windows this only
+    # holds because _Server sets SO_EXCLUSIVEADDRUSE -- plain SO_REUSEADDR
+    # there would happily let this second bind succeed.
+    first = IpcServer(port=0)
+    first.start()
+    try:
+        second = IpcServer(port=first.port)
+        with pytest.raises(IpcServerBindError):
+            second.start()
+    finally:
+        first.stop()

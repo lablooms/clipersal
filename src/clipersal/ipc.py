@@ -20,7 +20,9 @@ binding to 127.0.0.1 keeps it unreachable from outside the machine.
 from __future__ import annotations
 
 import logging
+import socket
 import socketserver
+import sys
 import threading
 from typing import Callable
 
@@ -62,6 +64,22 @@ class _Handler(socketserver.StreamRequestHandler):
 class _Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def server_bind(self) -> None:
+        if sys.platform == "win32":
+            # SO_REUSEADDR (what allow_reuse_address makes socketserver set in
+            # super().server_bind()) does not mean on Windows what it means on
+            # POSIX: there it lets a second socket bind+listen on a port that
+            # is already actively listened on, silently splitting which
+            # process receives connections. That voids the "second clipersal
+            # instance fails to bind and exits cleanly" single-instance
+            # backstop (see ARCHITECTURE.md's single-instance section), so
+            # Windows gets SO_EXCLUSIVEADDRUSE instead -- exclusive ownership
+            # of the port -- and allow_reuse_address is turned off so
+            # SO_REUSEADDR can't weaken that exclusivity.
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            self.allow_reuse_address = False
+        super().server_bind()
 
 
 class IpcServer:
