@@ -1,4 +1,6 @@
 import os
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,22 @@ from clipersal.tray_qt import TrayIcon
 def qapp():
     app = QApplication.instance() or QApplication([])
     yield app
+
+
+def _drain_until(predicate, timeout: float = 5.0) -> bool:
+    """Wait for an async (worker-thread) condition: tray saves run their IPC
+    send on a worker and deliver the response back through a queued signal.
+    Pumps sendPostedEvents(), NOT processEvents() -- the latter also fires
+    every leftover test window/tray's overdue timers (each a real socket
+    connect to a dead port, which can take seconds apiece), while
+    sendPostedEvents() dispatches just the queued slot calls."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        QApplication.sendPostedEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
 
 
 def test_menu_has_expected_items() -> None:
@@ -133,11 +151,55 @@ def test_on_save_last_30s_sends_trim_argument(monkeypatch) -> None:
 
         tray._on_save_last_30s()
 
+        # The send happens on a worker thread now; the notification lands via
+        # the queued _save_responded signal.
+        assert _drain_until(lambda: len(notified) == 1)
         assert received_args == ["30"]
-        assert len(notified) == 1
         assert notified[0][0] == "Last 30s saved"
     finally:
         server.stop()
+
+
+def test_on_save_sends_with_raised_timeout_on_worker_thread(monkeypatch) -> None:
+    sent = []
+
+    def fake_send(command, arg=None, host="127.0.0.1", port=51525, timeout=5.0):
+        sent.append(
+            {"command": command, "arg": arg, "port": port, "timeout": timeout, "thread": threading.current_thread()}
+        )
+        return "OK C:/clips/clip-1.mp4"
+
+    monkeypatch.setattr(tray_qt.ipc_client, "send_command", fake_send)
+    tray = TrayIcon(ipc_port=12345, clips_dir=Path("/tmp/clips"))
+    notified = []
+    monkeypatch.setattr(tray, "showMessage", lambda title, message, *a, **k: notified.append((title, message)))
+
+    tray._on_save()
+
+    assert _drain_until(lambda: len(sent) == 1 and len(notified) == 1)
+    assert sent[0]["command"] == "SAVE"
+    assert sent[0]["arg"] is None
+    # The timeout must clear the server-side remux limit (concat's 60s), not
+    # ipc_client's 5s default -- otherwise a slow-but-successful save gets
+    # reported as a failure.
+    assert sent[0]["timeout"] == tray_qt.ipc_client.SAVE_TIMEOUT
+    assert sent[0]["thread"] is not threading.current_thread()  # not the GUI thread
+    assert notified[0][0] == "Clip saved"
+
+
+def test_on_save_error_response_notifies(monkeypatch) -> None:
+    monkeypatch.setattr(
+        tray_qt.ipc_client, "send_command", lambda *a, **k: "ERROR Not enough has been captured yet"
+    )
+    tray = TrayIcon(ipc_port=12345, clips_dir=Path("/tmp/clips"))
+    notified = []
+    monkeypatch.setattr(tray, "showMessage", lambda title, message, *a, **k: notified.append((title, message)))
+
+    tray._on_save()
+
+    assert _drain_until(lambda: len(notified) == 1)
+    assert notified[0][0] == "Save failed"
+    assert "Not enough has been captured" in notified[0][1]
 
 
 def test_on_open_clips_opens_clips_dir(monkeypatch) -> None:

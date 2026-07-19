@@ -4,9 +4,11 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import clipersal.concat as concat_module
 from clipersal.concat import (
     ConcatFailedError,
     EmptyBufferError,
@@ -130,6 +132,86 @@ def test_finalized_segments_with_trim_returns_empty_when_nothing_recent_enough(t
     finalized = _finalized_segments(tmp_path, trim_seconds=30)
 
     assert finalized == []
+
+
+# ---- save vs cleanup-thread race (segments vanishing mid-save) ---------------
+
+
+def test_finalized_segments_with_trim_skips_segment_that_vanished_mid_listing(tmp_path: Path, monkeypatch) -> None:
+    # The cleanup thread can delete a segment between list_current_segments()
+    # and the trim filter's stat() -- simulate by returning a listing that
+    # includes an already-deleted file.
+    now = time.time()
+    keep = tmp_path / "seg-20260101-000100.ts"
+    gone = tmp_path / "seg-20260101-000200.ts"
+    newest = tmp_path / "seg-20260101-000300.ts"
+    for path in (keep, gone, newest):
+        _touch(path, mtime=now)
+    gone.unlink()
+    monkeypatch.setattr(concat_module, "list_current_segments", lambda d: [keep, gone, newest])
+
+    finalized = _finalized_segments(tmp_path, trim_seconds=30)
+
+    assert finalized == [keep]
+
+
+def _fake_run_recording_list_file(recorded: dict):
+    """Stand-in for subprocess.run that captures the concat list file's
+    contents (the real file is unlinked by save_clip's finally block, so it
+    must be read from inside the call)."""
+
+    def fake_run(cmd, **kwargs):
+        list_path = Path(cmd[cmd.index("-i") + 1])
+        recorded["list_text"] = list_path.read_text(encoding="utf-8")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    return fake_run
+
+
+def test_save_clip_skips_segment_that_vanished_before_ffmpeg_runs(tmp_path: Path, monkeypatch) -> None:
+    buffer_dir = tmp_path / "buffer"
+    clips_dir = tmp_path / "clips"
+    buffer_dir.mkdir()
+    clips_dir.mkdir()
+    keep = buffer_dir / "seg-20260101-000100.ts"
+    gone = buffer_dir / "seg-20260101-000200.ts"
+    newest = buffer_dir / "seg-20260101-000300.ts"
+    for path in (keep, gone, newest):
+        _touch(path)
+    gone.unlink()  # deleted by the cleanup thread after the listing, before the remux
+    monkeypatch.setattr(concat_module, "list_current_segments", lambda d: [keep, gone, newest])
+    recorded: dict = {}
+    monkeypatch.setattr(concat_module.subprocess, "run", _fake_run_recording_list_file(recorded))
+
+    output_path = save_clip("ffmpeg", buffer_dir, clips_dir)
+
+    # The vanished segment is simply left out of the clip instead of failing
+    # the whole save with ffmpeg's "No such file or directory".
+    assert str(keep.resolve()) in recorded["list_text"]
+    assert "seg-20260101-000200" not in recorded["list_text"]
+    assert output_path.parent == clips_dir
+
+
+def test_save_clip_raises_empty_buffer_when_every_segment_vanished(tmp_path: Path, monkeypatch) -> None:
+    buffer_dir = tmp_path / "buffer"
+    clips_dir = tmp_path / "clips"
+    buffer_dir.mkdir()
+    clips_dir.mkdir()
+    gone1 = buffer_dir / "seg-20260101-000100.ts"
+    gone2 = buffer_dir / "seg-20260101-000200.ts"
+    newest = buffer_dir / "seg-20260101-000300.ts"
+    for path in (gone1, gone2, newest):
+        _touch(path)
+    gone1.unlink()
+    gone2.unlink()
+    monkeypatch.setattr(concat_module, "list_current_segments", lambda d: [gone1, gone2, newest])
+    run_calls = []
+    monkeypatch.setattr(concat_module.subprocess, "run", lambda *a, **k: run_calls.append(True))
+
+    with pytest.raises(EmptyBufferError):
+        save_clip("ffmpeg", buffer_dir, clips_dir)
+
+    assert run_calls == []  # ffmpeg is never spawned for an empty buffer
 
 
 def test_render_filename_default_template_matches_original_hardcoded_format() -> None:

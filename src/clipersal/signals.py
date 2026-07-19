@@ -54,5 +54,6 @@ class AppSignals(QObject):
     show_requested = Signal(object)  # str | None -- a tab name, or None for "just show"
     toast_requested = Signal(Path)  # a newly saved clip's path
     save_completed = Signal()  # a save succeeded -- pulse the status dot, refresh recent clips
+    save_failed = Signal(str)  # a save attempt failed -- arg is the error detail, shown in the Home tab's status card (success already pops a toast via toast_requested, so only failure needs a client-side signal)
     quit_requested = Signal()  # ask the GUI thread to call QApplication.quit() -- see docstring above
     update_available = Signal(str, str)  # version, url -- a newer GitHub release was found; url opens in the browser via the Home tab's dismissible banner

@@ -16,6 +16,15 @@ class IpcClientError(RuntimeError):
     pass
 
 
+# SAVE gets a much longer leash than every other command: the server-side
+# remux (concat.py's _CONCAT_TIMEOUT) may legitimately run up to 60s, and a
+# client that gives up at the 5s default reports failure while the save
+# actually completes. 70s keeps the client comfortably above the server's own
+# timeout, so a genuine server-side error -- not a client timeout -- is what
+# comes back when a save fails.
+SAVE_TIMEOUT = 70.0
+
+
 def send_command(
     command: str,
     arg: str | None = None,

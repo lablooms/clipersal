@@ -208,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
 
     stop_event = threading.Event()
     pause_lock = threading.Lock()
+    save_lock = threading.Lock()
 
     os_ = platform_detect.get_os()
     session_type = platform_detect.get_linux_session_type() if os_ == OS.LINUX else None
@@ -224,22 +225,32 @@ def main(argv: list[str] | None = None) -> int:
         # arg, if given, is a "save just the last N seconds" trim request
         # (see clipersal-trigger's --trim and tray_qt's "Save last 30s").
         trim_seconds = float(arg) if arg else None
-        output_path = concat.save_clip(
-            state.setup.ffmpeg_path,
-            config.buffer_dir,
-            config.clips_dir,
-            filename_template=config.filename_template,
-            trim_seconds=trim_seconds,
-        )
-        concat.enforce_clip_retention(config.clips_dir, config.clip_retention_days)
-        # Only signaled on success -- the main window's status badge and the
-        # save toast both use this to know a save actually happened, and a
-        # failed save shouldn't look like one.
-        if app_signals is not None:
-            app_signals.save_completed.emit()
-            if main_window is not None:
-                app_signals.toast_requested.emit(output_path)
-        return str(output_path)
+        # IpcServer is a ThreadingTCPServer, so two SAVEs landing together
+        # (a hotkey double-press, hotkey + tray click, two trigger calls) run
+        # this handler concurrently -- and concat._unique_output_path is
+        # check-then-act, so both would see the same clip-{date}-{time} name
+        # (1-second template resolution) as free and remux into one path with
+        # `ffmpeg -y`: interleaved corruption on Linux, a file-lock failure
+        # on Windows. A plain lock -- not a try-lock; the second save should
+        # wait its turn, not be dropped -- serializes them, and the later one
+        # then gets a "-1" suffixed name.
+        with save_lock:
+            output_path = concat.save_clip(
+                state.setup.ffmpeg_path,
+                config.buffer_dir,
+                config.clips_dir,
+                filename_template=config.filename_template,
+                trim_seconds=trim_seconds,
+            )
+            concat.enforce_clip_retention(config.clips_dir, config.clip_retention_days)
+            # Only signaled on success -- the main window's status badge and the
+            # save toast both use this to know a save actually happened, and a
+            # failed save shouldn't look like one.
+            if app_signals is not None:
+                app_signals.save_completed.emit()
+                if main_window is not None:
+                    app_signals.toast_requested.emit(output_path)
+            return str(output_path)
 
     def handle_pause(arg: str | None = None) -> str:
         with pause_lock:
@@ -448,6 +459,7 @@ def main(argv: list[str] | None = None) -> int:
                 log_path=log_path,
                 tray_enabled=config.tray_enabled,
                 on_quit=stop_event.set,
+                app_signals=app_signals,
             )
         except Exception as exc:  # noqa: BLE001 -- never let a GUI hiccup block startup
             log.warning(
@@ -480,6 +492,7 @@ def main(argv: list[str] | None = None) -> int:
     if app_signals is not None and main_window is not None:
         app_signals.show_requested.connect(_on_show_requested)
         app_signals.save_completed.connect(main_window.on_save_completed)
+        app_signals.save_failed.connect(main_window.on_save_failed)
         app_signals.toast_requested.connect(_on_toast_requested)
         app_signals.update_available.connect(main_window.show_update_banner)
         main_window.show()  # visible on launch, like OBS

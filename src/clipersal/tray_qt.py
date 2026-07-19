@@ -10,10 +10,11 @@ action.
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
 from clipersal import config_store, ipc_client
@@ -45,6 +46,12 @@ def _make_icon(color: QColor) -> QIcon:
 
 
 class TrayIcon(QSystemTrayIcon):
+    # (trim_arg, response-or-None) from the save worker thread -- tray menu
+    # callbacks run on the GUI thread, so the actual IPC send happens off it
+    # and the response comes back through this queued signal (the same
+    # cross-thread rule as signals.py's AppSignals).
+    _save_responded = Signal(object)
+
     def __init__(self, ipc_port: int, clips_dir: Path, log_path: Path | None = None, parent=None) -> None:
         super().__init__(_make_icon(_RECORDING_COLOR), parent)
         self._ipc_port = ipc_port
@@ -54,6 +61,7 @@ class TrayIcon(QSystemTrayIcon):
 
         self.setToolTip("Clipersal - Recording")
         self.activated.connect(self._on_activated)
+        self._save_responded.connect(self._on_save_responded)
 
         self._menu = QMenu()
         self._menu.addAction("Open Clipersal", self._on_show)
@@ -69,9 +77,9 @@ class TrayIcon(QSystemTrayIcon):
         self._menu.addAction("Quit", self._on_quit)
         self.setContextMenu(self._menu)
 
-    def _send(self, command: str, arg: str | None = None) -> str | None:
+    def _send(self, command: str, arg: str | None = None, timeout: float = 5.0) -> str | None:
         try:
-            response = ipc_client.send_command(command, arg=arg, port=self._ipc_port)
+            response = ipc_client.send_command(command, arg=arg, port=self._ipc_port, timeout=timeout)
             log.info("Tray %s: %s", command, response)
             return response
         except ipc_client.IpcClientError as exc:
@@ -86,20 +94,32 @@ class TrayIcon(QSystemTrayIcon):
             self._on_show()
 
     def _on_save(self) -> None:
-        response = self._send("SAVE")
-        if response is None:
-            return
-        if response.startswith("OK"):
-            self.showMessage("Clip saved", response[len("OK") :].strip() or "Saved")
-        else:
-            self.showMessage("Save failed", response)
+        self._start_save_worker(None)
 
     def _on_save_last_30s(self) -> None:
-        response = self._send("SAVE", arg=str(_QUICK_TRIM_SECONDS))
+        self._start_save_worker(str(_QUICK_TRIM_SECONDS))
+
+    def _start_save_worker(self, trim_arg: str | None) -> None:
+        # A SAVE's server-side remux can legitimately run tens of seconds (up
+        # to concat.py's _CONCAT_TIMEOUT, 60s) -- far past ipc_client's 5s
+        # default -- and tray menu callbacks run on the GUI thread, so a
+        # synchronous send froze the tray menu for the remux and could report
+        # failure after 5s while the save actually completed. Worker thread
+        # with a timeout above the server's own; the response returns to the
+        # GUI thread via _save_responded.
+        threading.Thread(target=self._save_worker, args=(trim_arg,), daemon=True).start()
+
+    def _save_worker(self, trim_arg: str | None) -> None:
+        response = self._send("SAVE", arg=trim_arg, timeout=ipc_client.SAVE_TIMEOUT)
+        self._save_responded.emit((trim_arg, response))
+
+    def _on_save_responded(self, payload: tuple) -> None:
+        trim_arg, response = payload
         if response is None:
             return
         if response.startswith("OK"):
-            self.showMessage(f"Last {_QUICK_TRIM_SECONDS}s saved", response[len("OK") :].strip() or "Saved")
+            title = "Clip saved" if trim_arg is None else f"Last {_QUICK_TRIM_SECONDS}s saved"
+            self.showMessage(title, response[len("OK") :].strip() or "Saved")
         else:
             self.showMessage("Save failed", response)
 

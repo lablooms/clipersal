@@ -95,6 +95,7 @@ class MainWindow(QWidget):
         log_path: Path,
         tray_enabled: bool,
         on_quit: Callable[[], None],
+        app_signals=None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -105,6 +106,7 @@ class MainWindow(QWidget):
         self._log_path = log_path
         self._tray_enabled = tray_enabled
         self._on_quit = on_quit
+        self._app_signals = app_signals
         self._pulsing = False
         self._active_tab = "home"
         self._recent_thumb_labels: dict[Path, QLabel] = {}
@@ -270,9 +272,7 @@ class MainWindow(QWidget):
         status_label_font.setBold(True)
         self._status_label.setFont(status_label_font)
         status_text_col.addWidget(self._status_label)
-        self._status_meta_label = QLabel(
-            f"Buffer: {self._config.buffer_seconds}s   ·   {self._clips_dir}", status_card
-        )
+        self._status_meta_label = QLabel(self._default_status_meta(), status_card)
         self._status_meta_label.setObjectName("hint")
         self._status_meta_label.setFont(_qfont(size=11, weight="normal", mono=True))
         status_text_col.addWidget(self._status_meta_label)
@@ -282,13 +282,13 @@ class MainWindow(QWidget):
         self._pause_button = QPushButton("Pause", status_card)
         self._pause_button.clicked.connect(self._on_toggle_pause)
         actions.addWidget(self._pause_button)
-        save_30_button = QPushButton("Save last 30s", status_card)
-        save_30_button.clicked.connect(lambda: self._send("SAVE", "30"))
-        actions.addWidget(save_30_button)
-        save_now_button = QPushButton("Save now", status_card)
-        save_now_button.setObjectName("primary")
-        save_now_button.clicked.connect(lambda: self._send("SAVE"))
-        actions.addWidget(save_now_button)
+        self._save_30s_button = QPushButton("Save last 30s", status_card)
+        self._save_30s_button.clicked.connect(lambda: self._on_save("30"))
+        actions.addWidget(self._save_30s_button)
+        self._save_now_button = QPushButton("Save now", status_card)
+        self._save_now_button.setObjectName("primary")
+        self._save_now_button.clicked.connect(lambda: self._on_save())
+        actions.addWidget(self._save_now_button)
 
         recent_header = QHBoxLayout()
         layout.addLayout(recent_header)
@@ -426,6 +426,38 @@ class MainWindow(QWidget):
         else:
             self._send("PAUSE")
 
+    def _default_status_meta(self) -> str:
+        return f"Buffer: {self._config.buffer_seconds}s   ·   {self._clips_dir}"
+
+    def _on_save(self, trim_arg: str | None = None) -> None:
+        # A SAVE's server-side remux can legitimately run tens of seconds (up
+        # to concat.py's _CONCAT_TIMEOUT, 60s) -- far past ipc_client's 5s
+        # default -- and sent from a button click it ran ON the GUI thread,
+        # freezing the whole window for the remux and then reporting failure
+        # after 5s while the save actually completed. Run it on a worker
+        # thread with a timeout above the server's own instead. Success is
+        # announced by the server side (save_completed + toast via cli.py's
+        # handle_save), so only failure needs to come back here.
+        threading.Thread(target=self._save_worker, args=(trim_arg,), daemon=True).start()
+
+    def _save_worker(self, trim_arg: str | None = None) -> None:
+        try:
+            response = ipc_client.send_command(
+                "SAVE", arg=trim_arg, port=self._ipc_port, timeout=ipc_client.SAVE_TIMEOUT
+            )
+        except ipc_client.IpcClientError as exc:
+            detail = str(exc)
+        else:
+            if not response.startswith("ERROR"):
+                return
+            detail = response[len("ERROR") :].strip()
+        log.warning("Save failed: %s", detail)
+        if self._app_signals is not None:
+            # NEVER touch widgets from this worker thread -- deliver the
+            # failure to the GUI thread via the queued signal, the same rule
+            # as every other cross-thread update (see signals.py's docstring).
+            self._app_signals.save_failed.emit(detail)
+
     def _set_status_dot(self, color: str) -> None:
         self._status_dot.set_color(color)
 
@@ -470,10 +502,25 @@ class MainWindow(QWidget):
         """
         self._pulsing = True
         self._status_label.setText("Saving…")
+        # A successful save also clears any earlier save-failure note from the
+        # status card's meta line.
+        self._status_meta_label.setText(self._default_status_meta())
         self._run_pulse()
         self._refresh_recent_clips()
         if self._active_tab == "clips":
             self._tabs["clips"].refresh()
+
+    def on_save_failed(self, detail: str) -> None:
+        """Connected (by cli.py) to AppSignals.save_failed. The failure goes
+        on the status card's meta line rather than _status_label: the meta
+        line is persistent, whereas _poll_status would overwrite _status_label
+        again a second later. Cleared by the next successful save (see
+        on_save_completed).
+        """
+        summary = detail.strip().splitlines()[0] if detail.strip() else "unknown error"
+        if len(summary) > 120:
+            summary = summary[:117] + "..."
+        self._status_meta_label.setText(f"Save failed -- {summary}")
 
     def show_update_banner(self, version: str, url: str) -> None:
         """Connected (by cli.py) to AppSignals.update_available."""

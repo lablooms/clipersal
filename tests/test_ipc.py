@@ -3,8 +3,9 @@ import sys
 
 import pytest
 
+from clipersal import concat
 from clipersal.ipc import IpcServer, IpcServerBindError
-from clipersal.ipc_client import IpcClientError, send_command
+from clipersal.ipc_client import SAVE_TIMEOUT, IpcClientError, send_command
 
 
 @pytest.fixture
@@ -72,6 +73,27 @@ def test_command_is_case_insensitive(running_server: IpcServer) -> None:
 def test_client_raises_when_nothing_listening() -> None:
     with pytest.raises(IpcClientError):
         send_command("PING", port=1)  # port 1 is a privileged port nothing binds to in tests
+
+
+def test_send_command_forwards_timeout_to_socket(monkeypatch) -> None:
+    captured = {}
+
+    def fake_create_connection(address, timeout=None):
+        captured["timeout"] = timeout
+        raise OSError("no server in this test")
+
+    monkeypatch.setattr(socket, "create_connection", fake_create_connection)
+
+    with pytest.raises(IpcClientError):
+        send_command("SAVE", port=1, timeout=SAVE_TIMEOUT)
+
+    assert captured["timeout"] == SAVE_TIMEOUT
+
+
+def test_save_timeout_exceeds_server_concat_timeout() -> None:
+    # The client must out-wait the server's own remux limit, or a slow but
+    # successful save looks like a failure to the caller.
+    assert SAVE_TIMEOUT > concat._CONCAT_TIMEOUT
 
 
 def test_handler_receives_argument(running_server: IpcServer) -> None:

@@ -77,7 +77,18 @@ def _finalized_segments(buffer_dir: Path, trim_seconds: float | None = None) -> 
     finalized = segments[:-1] if len(segments) > 1 else []
     if trim_seconds is not None and finalized:
         cutoff = time.time() - trim_seconds
-        finalized = [p for p in finalized if p.stat().st_mtime >= cutoff]
+        kept = []
+        for p in finalized:
+            # The cleanup thread can delete a segment between the listing
+            # above and this stat() -- treat that as "no longer in the
+            # buffer" rather than letting a raw FileNotFoundError escape
+            # save_clip as an IPC ERROR (see save_clip's own re-check).
+            try:
+                if p.stat().st_mtime >= cutoff:
+                    kept.append(p)
+            except FileNotFoundError:
+                pass
+        finalized = kept
     return finalized
 
 
@@ -97,6 +108,20 @@ def save_clip(
     fails.
     """
     finalized = _finalized_segments(buffer_dir, trim_seconds=trim_seconds)
+    if not finalized:
+        raise EmptyBufferError(
+            "Not enough has been captured yet to save a clip -- wait a few seconds and try again."
+        )
+
+    # The cleanup thread (capture.delete_stale_segments) sweeps segments by
+    # mtime on a ~1s cadence, so at steady state the oldest segment of a full
+    # buffer has only ~0-3s of slack and can vanish between the listing above
+    # and ffmpeg opening the concat list -- which used to fail the whole save
+    # ("No such file or directory" -> ConcatFailedError) exactly when the
+    # buffer was full, i.e. the common case. Re-check existence immediately
+    # before spawning ffmpeg and simply leave a vanished segment out of the
+    # clip; if they ALL vanished the buffer is empty for real.
+    finalized = [p for p in finalized if p.exists()]
     if not finalized:
         raise EmptyBufferError(
             "Not enough has been captured yet to save a clip -- wait a few seconds and try again."

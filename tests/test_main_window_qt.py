@@ -1,4 +1,5 @@
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from clipersal import main_window_qt
 from clipersal.config import Config
 from clipersal.ipc import IpcServer
 from clipersal.main_window_qt import MainWindow
+from clipersal.signals import AppSignals
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -23,11 +25,13 @@ def qapp():
     yield app
 
 
-def _make_window(tmp_path: Path, tray_enabled: bool = True, on_quit=None, ipc_port: int = 1) -> MainWindow:
+def _make_window(
+    tmp_path: Path, tray_enabled: bool = True, on_quit=None, ipc_port: int = 1, app_signals=None
+) -> MainWindow:
     config = Config(buffer_dir=tmp_path / "buffer", clips_dir=tmp_path / "clips")
     return MainWindow(
         config, ipc_port, None, "libx264", lambda values: None, "ffmpeg", tmp_path / "clips",
-        tmp_path / "log.txt", tray_enabled, on_quit or (lambda: None),
+        tmp_path / "log.txt", tray_enabled, on_quit or (lambda: None), app_signals,
     )
 
 
@@ -183,6 +187,96 @@ def test_toggle_pause_sends_resume_when_crashed(tmp_path: Path) -> None:
         assert received == ["RESUME"]
     finally:
         server.stop()
+
+
+# ---- save buttons (worker thread + failure display) --------------------------
+
+
+def _wait_for(predicate, timeout: float = 5.0) -> bool:
+    """Wait for an async (worker-thread) condition: the save buttons run
+    their IPC send on a worker and deliver the outcome back through a queued
+    signal. Pumps sendPostedEvents(), NOT processEvents() -- the latter also
+    fires every leftover test window's overdue status/log timers (each a real
+    socket connect to a dead port, which can take seconds apiece), while
+    sendPostedEvents() dispatches just the queued slot calls."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        QApplication.sendPostedEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_save_now_button_sends_save_on_worker_with_raised_timeout(tmp_path: Path, monkeypatch) -> None:
+    sent = []
+
+    def fake_send(command, arg=None, host="127.0.0.1", port=51525, timeout=5.0):
+        sent.append(
+            {"command": command, "arg": arg, "port": port, "timeout": timeout, "thread": threading.current_thread()}
+        )
+        return "OK C:/clips/clip-1.mp4"
+
+    monkeypatch.setattr(main_window_qt.ipc_client, "send_command", fake_send)
+
+    win = _make_window(tmp_path)
+    win._save_now_button.click()
+
+    assert _wait_for(lambda: len(sent) == 1)
+    assert sent[0]["command"] == "SAVE"
+    assert sent[0]["arg"] is None
+    # The timeout must clear the server-side remux limit (concat's 60s), not
+    # ipc_client's 5s default -- otherwise a slow-but-successful save gets
+    # reported as a failure.
+    assert sent[0]["timeout"] == main_window_qt.ipc_client.SAVE_TIMEOUT
+    assert sent[0]["thread"] is not threading.current_thread()  # not the GUI thread
+
+
+def test_save_30s_button_sends_trim_argument(tmp_path: Path, monkeypatch) -> None:
+    sent = []
+
+    def fake_send(command, arg=None, host="127.0.0.1", port=51525, timeout=5.0):
+        sent.append((command, arg))
+        return "OK C:/clips/clip-1.mp4"
+
+    monkeypatch.setattr(main_window_qt.ipc_client, "send_command", fake_send)
+
+    win = _make_window(tmp_path)
+    win._save_30s_button.click()
+
+    assert _wait_for(lambda: len(sent) == 1)
+    assert sent == [("SAVE", "30")]
+
+
+def test_failed_save_is_shown_in_status_meta(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        main_window_qt.ipc_client,
+        "send_command",
+        lambda *a, **k: "ERROR Not enough has been captured yet to save a clip -- wait a few seconds and try again.",
+    )
+    signals = AppSignals()
+    win = _make_window(tmp_path, app_signals=signals)
+    # Mirrors cli.py's wiring of AppSignals.save_failed.
+    signals.save_failed.connect(win.on_save_failed)
+    default_meta = win._status_meta_label.text()
+
+    win._save_now_button.click()
+
+    assert _wait_for(lambda: win._status_meta_label.text() != default_meta)
+    text = win._status_meta_label.text()
+    assert "Save failed" in text
+    assert "Not enough has been captured" in text
+
+
+def test_save_completed_restores_status_meta_after_failure(tmp_path: Path) -> None:
+    win = _make_window(tmp_path)
+    default_meta = win._status_meta_label.text()
+
+    win.on_save_failed("boom")
+    assert "Save failed" in win._status_meta_label.text()
+
+    win.on_save_completed()
+    assert win._status_meta_label.text() == default_meta
 
 
 # ---- save-completed slot ----------------------------------------------------

@@ -1,5 +1,6 @@
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import clipersal.cli as cli
@@ -93,6 +94,8 @@ def _install_headless_startup_fakes(monkeypatch, tmp_path):
         buffer_seconds=30,
         buffer_dir=tmp_path / "buffer",
         clips_dir=tmp_path / "clips",
+        filename_template="clip-test",
+        clip_retention_days=0,
     )
 
     monkeypatch.setattr(cli, "_configure_logging", lambda: tmp_path / "clipersal.log")
@@ -157,3 +160,64 @@ def test_main_bind_failure_exits_before_starting_capture(monkeypatch, tmp_path) 
     # only then did the bind fail.
     assert "resolve_setup" not in fakes.calls
     assert "session_start" not in fakes.calls
+
+
+def test_concurrent_saves_are_serialized_and_get_distinct_names(monkeypatch, tmp_path) -> None:
+    fakes = _install_headless_startup_fakes(monkeypatch, tmp_path)
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+
+    # Fake save_clip records its own concurrency and -- deliberately, with a
+    # sleep between entry and the name pick -- reproduces the check-then-act
+    # race in _unique_output_path: without cli.py's save lock, both threads
+    # would see "clip-test.mp4" as free and return the SAME path.
+    concurrency = {"current": 0, "max": 0}
+    concurrency_lock = threading.Lock()
+
+    def fake_save_clip(ffmpeg_path, buffer_dir, clips_dir_, filename_template, trim_seconds):
+        with concurrency_lock:
+            concurrency["current"] += 1
+            concurrency["max"] = max(concurrency["max"], concurrency["current"])
+        try:
+            time.sleep(0.05)
+            output = cli.concat._unique_output_path(clips_dir_, filename_template)
+            output.write_bytes(b"clip")
+            return output
+        finally:
+            with concurrency_lock:
+                concurrency["current"] -= 1
+
+    monkeypatch.setattr(cli.concat, "save_clip", fake_save_clip)
+    monkeypatch.setattr(cli.concat, "enforce_clip_retention", lambda clips_dir, days: [])
+
+    result: dict = {}
+
+    def run() -> None:
+        result["rc"] = cli.main([])
+
+    main_thread = threading.Thread(target=run, daemon=True)
+    main_thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if fakes.server is not None and "QUIT" in fakes.server.handlers:
+            break
+        time.sleep(0.01)
+    assert fakes.server is not None and "QUIT" in fakes.server.handlers
+    save = fakes.server.handlers["SAVE"]
+
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(save())) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert all(not t.is_alive() for t in threads)
+
+    fakes.server.handlers["QUIT"]()
+    main_thread.join(timeout=10)
+
+    # The save lock serialized the two handler invocations...
+    assert concurrency["max"] == 1
+    # ...so the second one saw the first's file and got a suffixed name.
+    assert len(results) == 2
+    assert sorted(Path(r).name for r in results) == ["clip-test-1.mp4", "clip-test.mp4"]
