@@ -45,6 +45,9 @@ First public beta. Windows and Linux (X11) are supported; Wayland and macOS are 
   PyInstaller, onedir) and `Clipersal-x86_64.AppImage`/`Clipersal-Trigger-x86_64.AppImage`
   (Linux). ffmpeg itself is a system dependency, not bundled (see `ARCHITECTURE.md`
   for why).
+- A Windows installer (`ClipersalSetup-<version>.exe`, built with Inno Setup): license
+  page, per-user install with no admin elevation required, Start Menu shortcut, optional
+  desktop icon, and a proper "Add or Remove Programs" entry with a working uninstaller.
 
 ### Changed
 
@@ -67,5 +70,5 @@ First public beta. Windows and Linux (X11) are supported; Wayland and macOS are 
   but not yet run end-to-end on a real Linux machine — treat it as unverified before
   trusting it as a release process (see `ARCHITECTURE.md`'s "Packaging & distribution"
   section).
-- No installer (Windows or Linux) and no `.deb` package yet — a portable exe/AppImage plus
-  the first-run wizard was judged sufficient for a beta of a small background tool.
+- No Linux installer/`.deb` package yet — the AppImage already covers "download and
+  run" there with no install step needed.

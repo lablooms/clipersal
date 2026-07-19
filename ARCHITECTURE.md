@@ -671,12 +671,44 @@ the tray icon actually renders under whatever desktop environment you're targeti
 desktop environments), and that a full save/pause/resume/quit cycle works the same way
 it was verified to on Windows.
 
-### Why no installer (yet)
+### Windows installer
 
-Decided **not yet** -- a single portable exe plus the first-run wizard is the idiomatic
-pattern for a small background utility like this, the same way OBS itself ships
-portable-friendly. An installer mainly earns its keep for Start Menu integration,
-uninstall registration, or auto-update -- none of which Clipersal has yet.
+`packaging/clipersal_installer.iss` is an Inno Setup script that wraps the existing
+onedir PyInstaller build (it doesn't change `clipersal.spec` at all) into a standard
+`ClipersalSetup-<version>.exe`: a license page, a per-user install by default
+(`PrivilegesRequired=lowest` + `PrivilegesRequiredOverridesAllowed`, so no admin
+elevation is needed unless the user explicitly chooses an all-users install), a Start
+Menu group, an optional desktop icon, a proper "Add or Remove Programs" entry
+(name/version/publisher/uninstaller), and a "launch after install" checkbox. It uses
+Windows Restart Manager (`CloseApplications=yes`) to detect and offer to close a
+currently-running Clipersal before overwriting its files, covering both a fresh install
+over a running instance and an in-place upgrade.
+
+Build it with:
+
+```sh
+pyinstaller packaging/clipersal.spec --clean
+iscc packaging/clipersal_installer.iss
+```
+
+which produces `dist_installer/ClipersalSetup-<version>.exe`. `MyAppVersion` at the top
+of the script is a hand-maintained constant kept in sync with `pyproject.toml`'s version
+(Inno has no built-in way to read a TOML file at compile time); `AppId` is a fixed GUID
+that must never change across versions, since Windows uses it to recognize "this is an
+upgrade of the same app" rather than a separate parallel install.
+
+Verified end-to-end on this machine, not just written: a silent install
+(`/VERYSILENT /SUPPRESSMSGBOXES`) placed files under
+`%LOCALAPPDATA%\Programs\Lablooms\Clipersal`, created the Start Menu shortcuts, and
+registered the uninstall entry correctly; launching the installed `Clipersal.exe`
+started real capture (a live `ffmpeg` process); `clipersal-trigger quit` shut it down
+cleanly with no orphaned processes; and a silent uninstall removed the install
+directory, the Start Menu folder, and the registry uninstall key completely.
+
+The Linux side doesn't need this treatment -- the AppImage already is a "download and
+go" artifact, which is the Linux-native equivalent of a Windows installer's convenience.
+A `.deb` (for `apt install` integration, e.g. an ffmpeg `Recommends:` hint) remains a
+reasonable future addition if Debian/Ubuntu-specific packaging becomes a priority.
 
 ## Testing approach
 
@@ -700,7 +732,7 @@ mind when adding new animated/painted widgets.
 - **Linux AppImage packaging**: written to documented conventions and reviewed by hand,
   but not yet run end-to-end on a real Linux machine -- treat it as unverified before
   trusting it as a release process.
-- No installer (Windows or Linux) and no `.deb` package yet.
+- No Linux installer/`.deb` package yet (the AppImage covers "download and run" there).
 - Other ideas not yet scoped in detail: privacy auto-pause (blocklisted apps/windows),
   disk-space-based buffer retention as an alternative to `buffer_seconds`, a sound cue on
   save, a portable mode (config/clips relative to the executable), localization, and

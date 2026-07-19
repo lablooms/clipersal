@@ -41,18 +41,18 @@ optionally check GitHub Releases for a newer version at startup (notify-only —
 
 Prebuilt executables need only ffmpeg on `PATH` -- no Python required:
 
-- **Windows**: `Clipersal.exe` + `Clipersal-Trigger.exe`
+- **Windows**: a portable `Clipersal.exe` + `Clipersal-Trigger.exe`, or `ClipersalSetup.exe`
+  — a normal installer (Start Menu shortcut, optional desktop icon, "Add or Remove
+  Programs" entry) for anyone who'd rather not manage a folder by hand
 - **Linux**: `Clipersal-x86_64.AppImage` + `Clipersal-Trigger-x86_64.AppImage`
   (`chmod +x` and run, no install step)
-
-No separate installer yet — a portable exe plus the first-run wizard is enough for a
-small tool like this.
 
 To build them yourself:
 
 ```sh
 pip install -e ".[build]"
-pyinstaller packaging/clipersal.spec --clean        # Windows
+pyinstaller packaging/clipersal.spec --clean        # Windows (portable build)
+iscc packaging/clipersal_installer.iss              # Windows installer (needs Inno Setup)
 ./packaging/linux/build_appimage.sh                 # Linux
 ```
 

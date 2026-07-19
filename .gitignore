@@ -4,9 +4,11 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# Build artifacts (PyInstaller output, AppImage staging)
+# Build artifacts (PyInstaller output, AppImage staging, Inno Setup output)
 /build/
 /dist/
+/dist_installer/
+*.log
 
 # Editors / OS
 .vscode/
