@@ -1,9 +1,12 @@
 name: Build Linux AppImages
 
+# Standalone (workflow_dispatch) for testing the build, and reusable
+# (workflow_call) so release.yml's tag pipeline shares this single definition
+# instead of duplicating it -- release.yml owns the v* tag trigger.
+
 on:
   workflow_dispatch:
-  push:
-    tags: ["v*"]
+  workflow_call:
 
 jobs:
   appimage:

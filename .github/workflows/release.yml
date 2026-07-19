@@ -1,0 +1,94 @@
+name: Release
+
+# Tag-driven release pipeline: pushing a v* tag builds the Windows installer +
+# portable zip and both Linux AppImages (via the reusable build-appimage.yml
+# workflow, so the AppImage build has a single definition), then creates the
+# GitHub Release for that tag with everything attached. Tags containing a
+# pre-release suffix (v0.2.0-beta) are published as pre-releases.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package + build dependencies
+        run: pip install -e ".[build]"
+
+      - name: Install Inno Setup 6
+        run: choco install innosetup --no-progress -y
+
+      - name: Build PyInstaller executables
+        run: pyinstaller packaging/clipersal.spec --clean
+
+      - name: Compile the Inno Setup installer
+        shell: pwsh
+        run: & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging/clipersal_installer.iss
+
+      - name: Build the portable zip
+        shell: pwsh
+        run: |
+          $version = "$env:GITHUB_REF_NAME".TrimStart("v")
+          New-Item -ItemType Directory -Force dist_portable | Out-Null
+          Copy-Item -Recurse dist/Clipersal dist_portable/Clipersal
+          Copy-Item dist/Clipersal-Trigger.exe dist_portable/
+          Compress-Archive -Path dist_portable/Clipersal, dist_portable/Clipersal-Trigger.exe `
+            -DestinationPath "dist/Clipersal-Portable-$version.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist_installer/*.exe
+            dist/Clipersal-Portable-*.zip
+
+  appimage:
+    uses: ./.github/workflows/build-appimage.yml
+
+  release:
+    needs: [windows, appimage]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+          path: release-files
+          merge-multiple: true
+
+      - name: Publish the GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          # Release notes = this version's CHANGELOG section, minus the heading;
+          # fall back to auto-generated notes if the section is missing/empty.
+          awk -v version="$VERSION" '
+            $0 ~ "^## \\[" version "\\]" { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md | sed '/./,$!d' > notes.md
+          ARGS=()
+          if [ -s notes.md ]; then
+            ARGS+=(--notes-file notes.md)
+          else
+            ARGS+=(--generate-notes)
+          fi
+          case "$TAG" in
+            *-*) ARGS+=(--prerelease) ;;
+          esac
+          gh release create "$TAG" release-files/* --title "Clipersal $VERSION" "${ARGS[@]}"
