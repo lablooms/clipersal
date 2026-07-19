@@ -38,7 +38,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_DIR="${REPO_ROOT}/build/appimage"
 DIST_DIR="${REPO_ROOT}/dist"
-APPIMAGETOOL_VERSION="13"
+APPIMAGETOOL_VERSION="1.9.1"
 ARCH="$(uname -m)"
 
 rm -rf "${BUILD_DIR}"
