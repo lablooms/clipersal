@@ -36,6 +36,13 @@ optionally check GitHub Releases for a newer version at startup (notify-only —
 - [ffmpeg](https://ffmpeg.org/) installed and on `PATH` (not bundled, to keep the
   download small and avoid pulling in ffmpeg's GPL/nonfree licensing obligations --
   see `ARCHITECTURE.md` for the full reasoning, and what happens if it's missing)
+- **Linux Wayland sessions only**: GStreamer with the PipeWire plugin
+  (`gstreamer1.0-pipewire` on Debian/Ubuntu, `gstreamer1-plugin-pipewire` on Fedora) —
+  Wayland capture goes through xdg-desktop-portal + PipeWire, and since no released
+  ffmpeg can read PipeWire, frames reach ffmpeg through a GStreamer bridge. X11 and
+  Windows don't need it. Wayland support is experimental (see `ARCHITECTURE.md`'s
+  Wayland caveat); a global hotkey still isn't possible there — use
+  `clipersal-trigger` bound to a desktop-environment shortcut, as below.
 
 ## Packaging
 

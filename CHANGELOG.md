@@ -6,6 +6,22 @@ full design rationale behind each entry.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project
 does not yet follow strict semantic versioning (still pre-1.0).
 
+## [0.2.0] — Unreleased
+
+### Added
+
+- **Experimental Wayland screen capture** (Linux): capture now works on Wayland
+  sessions via xdg-desktop-portal ScreenCast + PipeWire — the desktop's own consent
+  dialog asks which screen (or window) to share on first launch, the choice is
+  remembered with a rotating restore token so re-launches and crash restarts are
+  silent, and revoking the share from the desktop's indicator stops capture cleanly.
+  Frames reach ffmpeg as rawvideo through a GStreamer bridge
+  (`gst-launch-1.0` + `gstreamer1.0-pipewire` required on Wayland only — no released
+  ffmpeg can read PipeWire directly). Unit-tested end-to-end against fakes; pending
+  verification on a real Wayland session (checklist in `ARCHITECTURE.md`). The global
+  hotkey still doesn't exist on Wayland — `clipersal-trigger` + a DE keybinding
+  remains the save trigger. New runtime dependency: `jeepney` (pure-Python D-Bus).
+
 ## [0.1.0] — 2026-07-19
 
 ### Added

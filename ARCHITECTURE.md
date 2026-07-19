@@ -101,32 +101,53 @@ Settings plug in a user choice without changing `capture.py`.
 |---|---|---|---|
 | Windows | -- | `ddagrab` (lavfi source, Desktop Duplication API) | implemented, falls back to `gdigrab` if `ddagrab` unavailable in the local ffmpeg build |
 | Linux | X11 (`XDG_SESSION_TYPE=x11`) | `x11grab` on `$DISPLAY` | implemented |
-| Linux | Wayland (`XDG_SESSION_TYPE=wayland`) | xdg-desktop-portal `ScreenCast` -> PipeWire | **not implemented** -- see caveat below |
+| Linux | Wayland (`XDG_SESSION_TYPE=wayland`) | xdg-desktop-portal `ScreenCast` -> PipeWire -> GStreamer -> rawvideo stdin | implemented, **experimental** -- see caveat below |
 | macOS | -- | `avfoundation` | not yet started |
 
 ### Wayland caveat
 
 Plain `x11grab` **does not work under Wayland** -- there is no global framebuffer a
 process can just grab, by design (Wayland's security model). The only sanctioned way to
-capture the screen is:
+capture the screen is the xdg-desktop-portal `ScreenCast` API, and Phase 9 implements it
+like this:
 
-1. Call `org.freedesktop.portal.ScreenCast` over D-Bus to open a screencast session. This
-   triggers a compositor-drawn picker/consent dialog -- the user explicitly chooses what
-   to share, every time (or a remembered choice, if the portal backend supports it).
-2. The portal hands back a PipeWire **node id** and, over the D-Bus connection, a file
-   descriptor for the PipeWire socket (fd passing, not a plain string).
-3. ffmpeg needs to be built with PipeWire support (`--enable-libpipewire`, an `avdevice`
-   pipewire input merged around ffmpeg 6.1) to consume that fd/node id directly as a
-   `-f pipewire` input; if the local ffmpeg build lacks that, capture would have to go
-   through a GStreamer intermediary instead.
+1. `portal_screencast.py` calls `org.freedesktop.portal.ScreenCast` over D-Bus (via
+   `jeepney`, a pure-Python client -- the project's third runtime dependency): open a
+   screencast session, which triggers a compositor-drawn picker/consent dialog the
+   first time. With `persist_mode=2` (portal interface v4+) the portal returns a
+   **restore token** -- single-use, rotating (each successful start issues a fresh one,
+   stored in `wayland_portal.json` next to the config), so re-launches and crash
+   restarts are dialog-free. Revoking the share from the DE's indicator fires the
+   session's `Closed` signal, which maps to a clean stopped status, not a crash loop.
+2. The portal hands back a PipeWire **node id** and, over the same D-Bus connection, a
+   file descriptor for the PipeWire remote (fd passing, not a plain string).
+3. **No released ffmpeg can consume PipeWire** -- the `pipewiregrab` input device
+   exists only as an unmerged patch series (last activity March 2024), in contradiction
+   of what this section used to claim. Frames therefore travel as rawvideo over pipes:
+   `wayland_gstreamer.py` runs `gst-launch-1.0 pipewiresrc fd=N path=M ! videoconvert !
+   video/x-raw,format=BGRA ! fdsink` (the Kooha/vokoscreenNG pattern) and pumps the
+   frames into the ffmpeg process's stdin, which reads them as
+   `-f rawvideo -pix_fmt bgra -i pipe:0`. This makes GStreamer + the
+   `gstreamer1.0-pipewire` plugin a second system dependency **on Wayland only**
+   (probed with the same fail-fast-with-actionable-message pattern as ffmpeg itself).
 
-This is a meaningfully different code path from X11 (async D-Bus session negotiation,
-user-consent UI, fd handoff, a PipeWire-capable ffmpeg build) -- enough surface area that
-it's tracked as its own future project, not part of the initial skeleton. Today, on
-Wayland, the tool detects the session type and logs a clear "Wayland capture not
-implemented yet" message and exits rather than attempting (and silently failing at)
-`x11grab`. Likely libraries for that work: `dbus-next` or `jeepney` for the D-Bus
-portal calls.
+Deliberate scope limits: single stream per session (each monitor is its own stream --
+multi-monitor is a follow-up); window capture means the *desktop's* picker chooses the
+window (no programmatic pre-selection like X11's window id), and wlroots-based
+compositors (`xdg-desktop-portal-wlr`) lack both window capture and persist tokens;
+the global hotkey still doesn't exist on Wayland (the GlobalShortcuts portal is
+KDE-5.27+/GNOME-48+ only, and Ubuntu 24.04's GNOME 46 predates it), so
+`clipersal-trigger` + a DE keybinding remains the save trigger there.
+
+**Experimental status**: the whole path is unit-tested against scripted fake D-Bus
+connections and fake processes (Windows dev box, headless CI), but has **not yet run
+against a real portal/PipeWire session** -- the same position the AppImage script was
+in before its first real-CI run. Manual verification checklist before removing the
+experimental flag, on both GNOME (Ubuntu 24.04+) and KDE Plasma Wayland: first-launch
+consent dialog appears and capture starts; second launch restores silently (token);
+save/pause/resume cycle produces a playable clip; revoking the share from the DE
+indicator stops capture cleanly without a restart loop; RESUME afterwards re-asks and
+recovers; resolution change / monitor hotplug doesn't corrupt the buffer.
 
 ## Audio capture caveat
 
@@ -763,9 +784,10 @@ workflow was written; only `pull_request` events ever ran it.
 
 ## Known limitations
 
-- **Wayland**: no screen capture yet (needs xdg-desktop-portal + PipeWire support).
-  `clipersal-trigger` + a DE keybinding is the documented save-trigger workaround in the
-  meantime, since a global hotkey can't be grabbed there either.
+- **Wayland**: capture works experimentally (portal + PipeWire + GStreamer -- see the
+  Wayland caveat, including the backend support matrix and the pending real-session
+  verification checklist). The global hotkey still doesn't exist there;
+  `clipersal-trigger` + a DE keybinding remains the save-trigger workaround.
 - **macOS**: not implemented yet (capture, launch-on-startup, and packaging are all
   Windows/Linux only so far).
 - **Linux AppImage packaging**: the build itself is now verified on real Linux CI (see
