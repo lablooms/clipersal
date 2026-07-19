@@ -115,3 +115,22 @@ def test_quality_preset_cli_flag_overrides_persisted() -> None:
     config = config_from_args(args)
 
     assert config.quality_preset == "performance"
+
+
+def test_default_buffer_dir_is_a_fresh_temp_dir_marked_for_cleanup() -> None:
+    args = build_arg_parser(persisted={}).parse_args([])
+    config = config_from_args(args)
+
+    assert config.buffer_dir_is_temp is True
+    assert config.buffer_dir.exists()
+    # The dir is empty at construction -- remove it so the test itself doesn't
+    # leak the very temp dirs the shutdown cleanup was built for.
+    config.buffer_dir.rmdir()
+
+
+def test_user_supplied_buffer_dir_is_not_marked_for_cleanup(tmp_path: Path) -> None:
+    args = build_arg_parser(persisted={}).parse_args(["--buffer-dir", str(tmp_path / "buf")])
+    config = config_from_args(args)
+
+    assert config.buffer_dir == tmp_path / "buf"
+    assert config.buffer_dir_is_temp is False

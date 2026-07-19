@@ -94,6 +94,7 @@ def _install_headless_startup_fakes(monkeypatch, tmp_path):
         tray_enabled=False,
         buffer_seconds=30,
         buffer_dir=tmp_path / "buffer",
+        buffer_dir_is_temp=False,
         clips_dir=tmp_path / "clips",
         filename_template="clip-test",
         clip_retention_days=0,
@@ -588,3 +589,22 @@ def test_shutdown_stops_session_under_pause_lock(monkeypatch, tmp_path) -> None:
             break
     assert enclosing is not None
     assert ("lock_release", enclosing) in calls[stop_idx + 1 :]
+
+
+def test_cleanup_temp_buffer_removes_auto_created_dir(tmp_path: Path) -> None:
+    config = Config(clips_dir=tmp_path / "clips")  # no buffer_dir -> auto temp dir
+    buffer_dir = config.buffer_dir
+    (buffer_dir / "seg-leftover.ts").write_bytes(b"x")
+
+    cli._cleanup_temp_buffer(config)
+
+    assert not buffer_dir.exists()
+
+
+def test_cleanup_temp_buffer_preserves_user_supplied_dir(tmp_path: Path) -> None:
+    config = Config(clips_dir=tmp_path / "clips", buffer_dir=tmp_path / "buf")
+    (config.buffer_dir / "seg.ts").write_bytes(b"x")
+
+    cli._cleanup_temp_buffer(config)
+
+    assert (config.buffer_dir / "seg.ts").exists()

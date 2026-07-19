@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import shutil
 import sys
 import threading
 from logging.handlers import RotatingFileHandler
@@ -621,11 +622,27 @@ def main(argv: list[str] | None = None) -> int:
         # replacement ffmpeg would never be terminated.
         with pause_lock:
             state.session.stop()
+        _cleanup_temp_buffer(config)
         if main_window is not None:
             main_window.deleteLater()
         print("Stopped.")
 
     return 0
+
+
+def _cleanup_temp_buffer(config) -> None:
+    """Delete the auto-created temp buffer dir on shutdown -- only when we
+    created it ourselves (config.buffer_dir_is_temp), never a user-supplied
+    --buffer-dir. Whatever segments remain at exit (up to a full rolling
+    buffer, ~60 MB at the 60 s / 8 Mbit defaults) would otherwise stay in the
+    system temp dir forever, accumulating across runs.
+    """
+    if not config.buffer_dir_is_temp:
+        return
+    log.info("Removing temp buffer dir %s", config.buffer_dir)
+    # ignore_errors: a lingering segment still held by a just-terminated
+    # ffmpeg must never turn shutdown into a crash.
+    shutil.rmtree(config.buffer_dir, ignore_errors=True)
 
 
 def _trigger_save_via_ipc(port: int) -> None:

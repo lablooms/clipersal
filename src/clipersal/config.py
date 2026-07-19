@@ -23,10 +23,6 @@ def _default_clips_dir() -> Path:
     return Path.home() / "Videos" / "Clipersal"
 
 
-def _default_buffer_dir() -> Path:
-    return Path(tempfile.mkdtemp(prefix="clipersal-buffer-"))
-
-
 @dataclass
 class Config:
     buffer_seconds: int = 60
@@ -41,7 +37,12 @@ class Config:
     encoder_override: str | None = None
     mic_device: str | None = None  # None = no microphone mixed in (default, unchanged behavior)
     clips_dir: Path = field(default_factory=_default_clips_dir)
-    buffer_dir: Path = field(default_factory=_default_buffer_dir)
+    # None = not supplied -> a fresh temp dir is created in __post_init__ and
+    # buffer_dir_is_temp flips True so cli.py's shutdown can delete it again
+    # (otherwise every run leaks up to a full buffer, ~60 MB at defaults, into
+    # the system temp dir). After __post_init__ this is always a Path.
+    buffer_dir: Path | None = None
+    buffer_dir_is_temp: bool = field(init=False, default=False)
     ipc_port: int = _DEFAULT_IPC_PORT
     hotkey_combo: str = _DEFAULT_HOTKEY_COMBO
     hotkey_enabled: bool = True
@@ -53,8 +54,15 @@ class Config:
 
     def __post_init__(self) -> None:
         self.clips_dir = Path(self.clips_dir).expanduser()
-        self.buffer_dir = Path(self.buffer_dir).expanduser()
         self.clips_dir.mkdir(parents=True, exist_ok=True)
+        if self.buffer_dir is None:
+            self.buffer_dir = Path(tempfile.mkdtemp(prefix="clipersal-buffer-"))
+            self.buffer_dir_is_temp = True
+        else:
+            # Note: dataclasses.replace() passes the resolved path back in, so
+            # a replaced Config always reads as non-temp -- the safe direction
+            # (shutdown never deletes a dir it didn't create itself).
+            self.buffer_dir = Path(self.buffer_dir).expanduser()
         self.buffer_dir.mkdir(parents=True, exist_ok=True)
 
 
