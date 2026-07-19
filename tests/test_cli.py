@@ -8,6 +8,7 @@ from clipersal import ipc
 from clipersal.cli import _another_instance_running
 from clipersal.config import Config
 from clipersal.ipc import IpcServer
+from clipersal.portal_screencast import PortalCancelledError
 from clipersal.portal_screencast import PortalBackendError, PortalCancelledError, PortalUnavailableError
 from clipersal.wayland_gstreamer import GStreamerNotFoundError, PipewirePluginMissingError
 
@@ -48,7 +49,7 @@ def _install_headless_startup_fakes(monkeypatch, tmp_path):
     """
     calls = []
     startup_errors = []
-    fakes = SimpleNamespace(server=None, fail_on_start=False, calls=calls, startup_errors=startup_errors)
+    fakes = SimpleNamespace(server=None, fail_on_start=False, session_fail_with=None, calls=calls, startup_errors=startup_errors)
 
     class FakeIpcServer:
         def __init__(self, host="127.0.0.1", port=51525):
@@ -74,6 +75,8 @@ def _install_headless_startup_fakes(monkeypatch, tmp_path):
 
         def start(self):
             calls.append("session_start")
+            if fakes.session_fail_with is not None:
+                raise fakes.session_fail_with
 
         def stop(self):
             calls.append("session_stop")
@@ -164,6 +167,22 @@ def test_main_bind_failure_exits_before_starting_capture(monkeypatch, tmp_path) 
     # only then did the bind fail.
     assert "resolve_setup" not in fakes.calls
     assert "session_start" not in fakes.calls
+
+
+def test_main_start_failure_exits_cleanly_with_startup_error(monkeypatch, tmp_path) -> None:
+    # On Wayland the portal handshake happens inside session.start() -- the
+    # user can cancel the desktop's share-dialog (PortalCancelledError) there,
+    # which previously escaped main() as an uncaught exception.
+    fakes = _install_headless_startup_fakes(monkeypatch, tmp_path)
+    fakes.session_fail_with = PortalCancelledError("user declined the share dialog")
+
+    rc = cli.main([])
+
+    assert rc == 1
+    assert "session_start" in fakes.calls
+    assert len(fakes.startup_errors) == 1
+    assert "user declined" in fakes.startup_errors[0]
+    assert "ipc_stop" in fakes.calls  # port released, same early-exit shape
 
 
 def test_main_wayland_setup_errors_hit_the_clean_startup_error_path(monkeypatch, tmp_path) -> None:

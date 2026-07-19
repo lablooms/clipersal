@@ -230,7 +230,16 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     session = capture.SegmentedCapture(config, setup)
-    session.start()
+    try:
+        session.start()
+    except _SETUP_ERRORS as exc:
+        # On Wayland the portal handshake happens HERE, not in resolve_setup --
+        # the first start blocks on the desktop's share-dialog, which the user
+        # can cancel (PortalCancelledError), and the backend/fd handoff can
+        # fail too. Same clean early-exit shape as the resolve_setup failure.
+        server.stop()
+        _show_startup_error(str(exc))
+        return 1
     state = _AppState(session, setup)
 
     stop_event = threading.Event()
