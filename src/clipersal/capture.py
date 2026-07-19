@@ -15,10 +15,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from clipersal import ffmpeg_utils, platform_detect
+from clipersal import ffmpeg_utils, platform_detect, wayland_gstreamer
 from clipersal.config import Config
 from clipersal.ffmpeg_utils import AudioSource, CaptureSource
-from clipersal.platform_detect import OS
+from clipersal.platform_detect import OS, LinuxSessionType
 from clipersal.subprocess_utils import NO_WINDOW_KWARGS
 
 log = logging.getLogger(__name__)
@@ -54,7 +54,15 @@ def resolve_setup(config: Config) -> ResolvedSetup:
     session_type = platform_detect.get_linux_session_type() if os_ == OS.LINUX else None
 
     encoder = ffmpeg_utils.pick_encoder(ffmpeg_path, os_, forced=config.encoder_override)
-    if config.capture_mode == "window" and config.window_title:
+    # On Wayland the stored window title plays no role -- the desktop's own
+    # share-dialog picks the window (see portal_screencast.py) -- so window
+    # mode routes to the portal window source even with no title stored,
+    # where X11/Windows treat an empty title as "no window chosen" and fall
+    # back to the whole desktop.
+    wants_window = config.capture_mode == "window" and (
+        bool(config.window_title) or session_type == LinuxSessionType.WAYLAND
+    )
+    if wants_window:
         video_source = ffmpeg_utils.build_window_capture_source(
             ffmpeg_path, os_, session_type, config.window_title, framerate=config.framerate
         )
@@ -117,8 +125,17 @@ def delete_stale_segments(buffer_dir: Path, buffer_seconds: float, now: float | 
     return deleted
 
 
+def _default_portal_session_factory(source_type: str):
+    # Lazy import on purpose: portal_screencast pulls in jeepney, and Windows
+    # must never touch jeepney at runtime -- this only ever runs on the
+    # Wayland capture path.
+    from clipersal.portal_screencast import open_screencast_session
+
+    return open_screencast_session(source_type)
+
+
 class SegmentedCapture:
-    def __init__(self, config: Config, setup: ResolvedSetup):
+    def __init__(self, config: Config, setup: ResolvedSetup, portal_session_factory=None):
         self.config = config
         self.setup = setup
         self._process: subprocess.Popen | None = None
@@ -127,6 +144,14 @@ class SegmentedCapture:
         self._stop_event = threading.Event()
         self._restart_timestamps: list[float] = []
         self._gave_up = False
+        # Wayland portal path state (all None on Windows/X11): the live
+        # ScreenCast session, the GStreamer frame pump feeding ffmpeg's
+        # stdin, and the cached ensure_gstreamer() result (resolve_setup
+        # already probed; re-probing on every crash-restart is waste).
+        self._portal_session_factory = portal_session_factory or _default_portal_session_factory
+        self._portal_session = None
+        self._frame_pump = None
+        self._gst_launch: str | None = None
 
     def start(self) -> None:
         if self.is_running():
@@ -160,30 +185,135 @@ class SegmentedCapture:
         self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
         self._cleanup_thread.start()
 
+    def _uses_wayland_portal(self) -> bool:
+        return self.setup.video_source.kind == ffmpeg_utils.WAYLAND_PORTAL_KIND
+
+    def _acquire_portal_session(self):
+        """Open the portal ScreenCast session for this capture start.
+
+        Only ever called from _start_process -- never at probe time: the
+        first Start shows the desktop's share-dialog, and resolve_setup must
+        stay dialog-free. Crash-restarts re-acquire through here too; the
+        persisted restore token makes that dialog-free after first approval.
+        """
+        session = self._portal_session_factory(self.setup.video_source.portal_source_type)
+        session.on_closed = self._on_portal_session_closed
+        return session
+
+    def _on_portal_session_closed(self) -> None:
+        # The user revoked screen sharing from the desktop's own indicator.
+        # That is a deliberate user stop, not a crash: mark gave_up so the
+        # health check performs NO re-acquire (the user just said no --
+        # asking again would be exactly the wrong response) and STATUS
+        # reports capture as stopped. The pipeline is left to wind down on
+        # its own (the dead PipeWire remote kills gst-launch; ffmpeg stalls
+        # on stdin) and is torn down on the next stop()/start().
+        log.info("Screen sharing was revoked from the desktop; capture stays stopped until started again")
+        self._gave_up = True
+
+    def _teardown_wayland(self) -> None:
+        """Stop the frame pump, close the portal session, and close a
+        previous ffmpeg's stdin pipe. Idempotent (a no-op on Windows/X11 and
+        after a first teardown), so both _stop_process and the crash-restart
+        path in _start_process can call it. Order matters: the pump goes
+        first so nothing is still writing into the pipe when ffmpeg's stdin
+        closes; the stdin EOF then lets ffmpeg finish before terminate().
+        """
+        pump, self._frame_pump = self._frame_pump, None
+        session, self._portal_session = self._portal_session, None
+        if pump is not None:
+            pump.stop()
+            if session is not None:
+                # The pump owns the PipeWire fd once constructed (its stop()
+                # just closed it) -- close() must not os.close() it a second
+                # time, or it could close an unrelated fd that reused the
+                # number (see ScreenCastSession.close's docstring).
+                session.pipewire_fd = None
+        if session is not None:
+            session.close()
+        process = self._process
+        stdin = getattr(process, "stdin", None) if process is not None else None
+        if stdin is not None:
+            try:
+                stdin.close()
+            except OSError:
+                pass
+
     def _start_process(self) -> None:
-        cmd = self._build_command()
+        wayland = self._uses_wayland_portal()
+        portal_session = None
+        video_input_args = None
+        if wayland:
+            # Defensive teardown of any previous pipeline half (dead pump /
+            # open session / stale stdin from a crashed run) before
+            # re-acquiring -- the health check's restart path lands here with
+            # the old resources still attached.
+            self._teardown_wayland()
+            if self._gst_launch is None:
+                self._gst_launch = wayland_gstreamer.ensure_gstreamer()
+            portal_session = self._acquire_portal_session()
+            stream = portal_session.stream
+            if not stream.width or not stream.height:
+                # The portal may legally omit the stream size (0x0 = "let
+                # PipeWire negotiate"), but ffmpeg's rawvideo input needs an
+                # explicit -video_size -- there is no negotiation on a pipe.
+                portal_session.close()
+                from clipersal.portal_screencast import PortalBackendError
+
+                raise PortalBackendError(
+                    "The portal approved screen sharing but returned no stream size -- "
+                    "cannot build the raw-video input for ffmpeg."
+                )
+            video_input_args = ffmpeg_utils.build_wayland_input_args(stream.width, stream.height, self.config.framerate)
+
+        cmd = self._build_command(video_input_args=video_input_args)
         log.info("Starting capture process: %s", " ".join(cmd))
 
         # ffmpeg's own stderr is sent to a log file rather than piped: piping
-        # without a dedicated reader thread risks a full-pipe deadlock, and
-        # stdin is closed rather than inherited so ffmpeg's interactive
-        # "press q to stop" handling doesn't steal keystrokes from this
-        # process's own Enter-to-save input() loop.
+        # without a dedicated reader thread risks a full-pipe deadlock.
+        # stdin is DEVNULL for the direct capture backends (nothing here
+        # talks to ffmpeg's interactive "press q to stop" handling -- control
+        # goes through the IPC socket), and PIPE on the Wayland path, where
+        # the GStreamer frame pump writes raw BGRA frames into it.
         log_path = self.config.buffer_dir / "ffmpeg.log"
-        self._ffmpeg_log_file = open(log_path, "a", encoding="utf-8")
+        try:
+            self._ffmpeg_log_file = open(log_path, "a", encoding="utf-8")
+        except Exception:
+            # Don't leak the just-acquired portal session if the log can't
+            # be opened -- same don't-leak discipline as the Popen path below.
+            if portal_session is not None:
+                portal_session.close()
+            raise
 
         try:
             self._process = subprocess.Popen(
                 cmd,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE if wayland else subprocess.DEVNULL,
                 stdout=self._ffmpeg_log_file,
                 stderr=subprocess.STDOUT,
                 **NO_WINDOW_KWARGS,
             )
+            if wayland:
+                pump = wayland_gstreamer.GStreamerFramePump(
+                    self._gst_launch, portal_session.pipewire_fd, portal_session.stream.node_id, self._process.stdin
+                )
+                pump.start()
+                self._frame_pump = pump
+                self._portal_session = portal_session
         except Exception:
             # Popen can fail after the log file was opened (ffmpeg binary
-            # removed or blocked mid-session); don't leak the handle. The
-            # caller (_cleanup_loop) logs the failure and keeps sweeping.
+            # removed or blocked mid-session), and pump.start() can fail with
+            # ffmpeg already spawned -- don't leak the handle, a frameless
+            # ffmpeg, or the portal session. The caller (_cleanup_loop) logs
+            # the failure and keeps sweeping.
+            if portal_session is not None:
+                portal_session.close()
+            process = self._process
+            if process is not None and process.poll() is None:
+                try:
+                    self._terminate_process(process)
+                except Exception:  # noqa: BLE001 -- already failing; don't mask the original error
+                    log.warning("Could not terminate ffmpeg after a failed capture start", exc_info=True)
             self._ffmpeg_log_file.close()
             self._ffmpeg_log_file = None
             raise
@@ -214,6 +344,16 @@ class SegmentedCapture:
         return self._gave_up
 
     def _stop_process(self) -> None:
+        # Wayland teardown first (pump -> session -> stdin EOF; see
+        # _teardown_wayland) so ffmpeg stops receiving frames and sees its
+        # stdin close before the terminate below lands. A no-op elsewhere.
+        self._teardown_wayland()
+        process = self._process
+        if process is None or process.poll() is not None:
+            return
+        self._terminate_process(process)
+
+    def _terminate_process(self, process) -> None:
         # A plain terminate() (SIGTERM / TerminateProcess), not a graceful
         # CTRL_BREAK_EVENT, deliberately: CTRL_BREAK relies on
         # GenerateConsoleCtrlEvent, which needs an attached console and
@@ -224,9 +364,6 @@ class SegmentedCapture:
         # excludes the newest (possibly still-being-written) segment from
         # every save regardless -- an abruptly-terminated last segment is
         # never read either way.
-        process = self._process
-        if process.poll() is not None:
-            return
         try:
             process.terminate()
             process.wait(timeout=_PROCESS_STOP_TIMEOUT)
@@ -235,7 +372,11 @@ class SegmentedCapture:
             process.kill()
             process.wait(timeout=_PROCESS_STOP_TIMEOUT)
 
-    def _build_command(self) -> list[str]:
+    def _build_command(self, video_input_args: list[str] | None = None) -> list[str]:
+        # video_input_args overrides the source's stored input args -- the
+        # Wayland portal path only learns them at capture-start (the stream
+        # size comes from the portal handshake), so its marker CaptureSource
+        # carries an empty list and _start_process passes the real args in.
         cfg = self.config
         setup = self.setup
         # Loopback (system audio) always comes before the mic when both are
@@ -244,7 +385,7 @@ class SegmentedCapture:
 
         cmd = [setup.ffmpeg_path, "-y", "-hide_banner", "-loglevel", "warning"]
         cmd += ffmpeg_utils.encoder_global_args(setup.encoder)
-        cmd += setup.video_source.input_args
+        cmd += video_input_args if video_input_args is not None else setup.video_source.input_args
         for source in audio_sources:
             cmd += source.input_args
 
@@ -305,6 +446,16 @@ class SegmentedCapture:
                 # keep going, same best-effort style as the app's probes.
                 log.exception("Cleanup iteration failed; retrying on the next interval")
 
+    def _frame_pump_failed(self) -> bool:
+        """True when the Wayland frame pump died (or is dying) -- gst-launch
+        exiting on its own, or the pump thread hitting an unexpected EOF.
+        Always False on Windows/X11 (no pump exists there).
+        """
+        pump = self._frame_pump
+        if pump is None:
+            return False
+        return bool(pump.exited_unexpectedly) or not pump.is_running
+
     def _check_process_health(self) -> None:
         """Detect ffmpeg dying unexpectedly (driver hiccup, etc.) and restart
         it in place, reusing the same buffer_dir -- segment filenames are
@@ -316,12 +467,25 @@ class SegmentedCapture:
         separate timer -- there's no need for a tighter check than that.
         """
         process = self._process
-        if process is None or process.poll() is None:
-            return  # never started, or still running -- nothing to do
+        if process is None:
+            return  # never started -- nothing to do
+        pump_failed = self._frame_pump_failed()
+        if process.poll() is None and not pump_failed:
+            return  # still running -- nothing to do
         if self._gave_up:
             return  # already exhausted the restart budget; don't keep trying
 
-        log.warning("ffmpeg exited unexpectedly (code %s); attempting to restart capture", process.poll())
+        if pump_failed and process.poll() is None:
+            # gst-launch died out from under a live ffmpeg (pipewiresrc
+            # error, portal stream gone). ffmpeg itself can't notice -- it
+            # just sits blocked on a stdin nobody writes to anymore -- so a
+            # dead pump with a live ffmpeg is a capture death too, with the
+            # same restart semantics; the live half of the pipeline just has
+            # to come down first.
+            log.warning("GStreamer frame pump stopped unexpectedly; restarting capture")
+            self._stop_process()
+        else:
+            log.warning("ffmpeg exited unexpectedly (code %s); attempting to restart capture", process.poll())
 
         now = time.time()
         self._restart_timestamps = [t for t in self._restart_timestamps if now - t < _RESTART_WINDOW_SECONDS]

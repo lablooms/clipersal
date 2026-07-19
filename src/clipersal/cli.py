@@ -38,8 +38,10 @@ from clipersal import (
     update_check,
 )
 from clipersal.config import build_arg_parser, config_from_args
-from clipersal.ffmpeg_utils import FfmpegNotFoundError, NoWorkingEncoderError, WaylandCaptureNotImplementedError
+from clipersal.ffmpeg_utils import WAYLAND_PORTAL_KIND, FfmpegNotFoundError, NoWorkingEncoderError
 from clipersal.platform_detect import OS
+from clipersal.portal_screencast import PortalError
+from clipersal.wayland_gstreamer import GStreamerNotFoundError, PipewirePluginMissingError
 
 try:
     from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
@@ -52,6 +54,19 @@ except ImportError:
     AppSignals = None
 
 log = logging.getLogger(__name__)
+
+# resolve_setup failures that surface as a clean startup/apply error (the
+# actionable message, no traceback): missing ffmpeg, no working encoder, and
+# the Wayland preflight probes (no GStreamer / no pipewiresrc / no portal
+# backend). portal_screencast pulls in jeepney -- pure Python, safe to import
+# on Windows, and importing it here guarantees the packaged build bundles it.
+_SETUP_ERRORS = (
+    FfmpegNotFoundError,
+    NoWorkingEncoderError,
+    GStreamerNotFoundError,
+    PipewirePluginMissingError,
+    PortalError,
+)
 
 
 def _configure_logging() -> Path:
@@ -199,10 +214,20 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         setup = capture.resolve_setup(config)
-    except (FfmpegNotFoundError, WaylandCaptureNotImplementedError, NoWorkingEncoderError) as exc:
+    except _SETUP_ERRORS as exc:
         server.stop()  # release the port before the error dialog blocks on the user
         _show_startup_error(str(exc))
         return 1
+
+    if setup.video_source.kind == WAYLAND_PORTAL_KIND:
+        # session.start() below blocks on the desktop's own share-dialog the
+        # first time around -- say so up front so that wait doesn't look like
+        # a hang. The persisted restore token makes re-launches (and crash
+        # restarts) dialog-free. See portal_screencast.py.
+        log.info(
+            "Wayland capture: on first launch your desktop will ask which screen to share; "
+            "the choice is remembered, so re-launches reuse it silently."
+        )
 
     session = capture.SegmentedCapture(config, setup)
     session.start()
@@ -427,8 +452,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             try:
                 new_setup = capture.resolve_setup(candidate)
-            except (FfmpegNotFoundError, WaylandCaptureNotImplementedError, NoWorkingEncoderError) as exc:
-                return f"Could not apply encoder/bitrate change: {exc}"
+            except _SETUP_ERRORS as exc:
+                return f"Could not apply capture settings: {exc}"
 
         config.buffer_seconds = new_values["buffer_seconds"]
         config.clips_dir = new_clips_dir

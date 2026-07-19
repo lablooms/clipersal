@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 from clipersal import settings_window_qt
 from clipersal.config import Config
 from clipersal.monitors import MonitorInfo
+from clipersal.platform_detect import OS, LinuxSessionType
 from clipersal.settings_window_qt import SettingsFrame, bitrate_string_to_mbps
 from clipersal.window_capture import WindowInfo
 
@@ -417,3 +418,38 @@ def test_save_while_hotkey_recording_cancels_recorder_instead_of_persisting_plac
     assert frame.hotkey_field.is_recording() is False
     assert captured["hotkey_combo"] == "<ctrl>+<alt>+r"
     assert frame.status_label.text() == "Settings saved."
+
+
+# ---- Wayland window-capture hint ----------------------------------------------
+#
+# On Wayland the desktop portal's own share-dialog picks the window at
+# capture-start, so the title picker can't pre-select one: it is disabled and
+# a hint explains why. X11 keeps the picker exactly as before.
+
+
+def test_wayland_window_mode_disables_title_entry_with_explanatory_hint(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(settings_window_qt.platform_detect, "get_os", lambda: OS.LINUX)
+    monkeypatch.setattr(
+        settings_window_qt.platform_detect, "get_linux_session_type", lambda: LinuxSessionType.WAYLAND
+    )
+    frame = _build(tmp_path, capture_mode="window")
+
+    assert frame.target_control.current() == "Window"
+    assert frame.window_container.isHidden() is False
+    assert frame.window_combo.isEnabled() is False
+    assert frame.window_refresh_button.isEnabled() is False
+    assert frame.window_wayland_hint is not None
+    assert frame.window_wayland_hint.isHidden() is False
+    assert "system dialog" in frame.window_wayland_hint.text()
+
+
+def test_x11_window_mode_keeps_title_entry_enabled_without_hint(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(settings_window_qt.platform_detect, "get_os", lambda: OS.LINUX)
+    monkeypatch.setattr(settings_window_qt.platform_detect, "get_linux_session_type", lambda: LinuxSessionType.X11)
+    frame = _build(tmp_path, capture_mode="window")
+
+    assert frame.target_control.current() == "Window"
+    assert frame.window_container.isHidden() is False
+    assert frame.window_combo.isEnabled() is True
+    assert frame.window_refresh_button.isEnabled() is True
+    assert frame.window_wayland_hint is None

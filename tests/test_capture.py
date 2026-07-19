@@ -1,7 +1,12 @@
+import io
 import os
+import subprocess
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from clipersal.capture import (
     _MAX_RESTARTS_PER_WINDOW,
@@ -11,7 +16,8 @@ from clipersal.capture import (
     list_current_segments,
 )
 from clipersal.config import Config
-from clipersal.ffmpeg_utils import AudioSource, CaptureSource
+from clipersal.ffmpeg_utils import AudioSource, CaptureSource, build_wayland_input_args
+from clipersal.portal_screencast import PortalCancelledError
 
 
 class _FakeProcess:
@@ -339,3 +345,259 @@ def test_build_command_loopback_and_mic_are_mixed_via_amix(tmp_path: Path) -> No
     assert "-c:a" in cmd
     # loopback's input args should precede the mic's in the command
     assert cmd.index("loop.monitor") < cmd.index("mic0")
+
+
+# ---- Wayland portal capture path --------------------------------------------
+#
+# Everything external is faked: the portal session factory (no D-Bus), the
+# GStreamer probe + frame pump (no gst-launch), and subprocess.Popen (no
+# ffmpeg). The fake pump/session/process record into one shared `events`
+# list so teardown ORDERING can be asserted directly.
+
+
+def _make_wayland_session(tmp_path: Path, factory, portal_source_type: str = "monitor") -> SegmentedCapture:
+    config = Config(buffer_dir=tmp_path / "buffer", clips_dir=tmp_path / "clips")
+    config.buffer_dir.mkdir(parents=True, exist_ok=True)
+    # The cleanup thread must never fire on its own mid-test -- the tests
+    # drive _check_process_health() directly and assert exact call counts.
+    config.cleanup_interval_seconds = 3600
+    setup = ResolvedSetup(
+        ffmpeg_path="ffmpeg",
+        encoder="libx264",
+        video_source=CaptureSource(
+            input_args=[], video_filter=None, kind="wayland-portal", portal_source_type=portal_source_type
+        ),
+        audio_source=None,
+    )
+    return SegmentedCapture(config, setup, portal_session_factory=factory)
+
+
+def _install_wayland_fakes(monkeypatch, width=1920, height=1080):
+    rec = SimpleNamespace(events=[], sessions=[], pumps=[], popen_calls=[], source_types=[])
+
+    class FakeSession:
+        """Stands in for ScreenCastSession: a stream, a PipeWire fd, a
+        settable on_closed callback, and an idempotent close()."""
+
+        def __init__(self):
+            self.stream = SimpleNamespace(node_id=7, width=width, height=height)
+            self.pipewire_fd = 42
+            self.on_closed = None
+            self.closed = False
+            rec.sessions.append(self)
+
+        def close(self):
+            self.closed = True
+            rec.events.append("session_close")
+
+    class FakePump:
+        """Stands in for GStreamerFramePump."""
+
+        def __init__(self, gst_launch, pipewire_fd, node_id, sink):
+            self.init_args = (gst_launch, pipewire_fd, node_id, sink)
+            self.started = False
+            self.exited_unexpectedly = False
+            self._running = False
+            rec.pumps.append(self)
+
+        def start(self):
+            self.started = True
+            self._running = True
+
+        def stop(self):
+            self._running = False
+            rec.events.append("pump_stop")
+
+        @property
+        def is_running(self):
+            return self._running
+
+    class FakeWaylandProcess:
+        def __init__(self):
+            self.returncode = None
+            self.stdin = io.BytesIO()
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = 0
+            rec.events.append("terminate")
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            pass
+
+    def session_factory(source_type):
+        rec.source_types.append(source_type)
+        return FakeSession()
+
+    def fake_popen(cmd, **kwargs):
+        proc = FakeWaylandProcess()
+        rec.popen_calls.append(SimpleNamespace(cmd=cmd, kwargs=kwargs, proc=proc))
+        return proc
+
+    rec.session_factory = session_factory
+    monkeypatch.setattr("clipersal.wayland_gstreamer.ensure_gstreamer", lambda: "/usr/bin/gst-launch-1.0")
+    monkeypatch.setattr("clipersal.wayland_gstreamer.GStreamerFramePump", FakePump)
+    monkeypatch.setattr("clipersal.capture.subprocess.Popen", fake_popen)
+    return rec
+
+
+def test_wayland_start_wires_session_pump_and_stdin_pipe(tmp_path: Path, monkeypatch) -> None:
+    rec = _install_wayland_fakes(monkeypatch)
+    session = _make_wayland_session(tmp_path, rec.session_factory)
+
+    session.start()
+    try:
+        # The portal session is acquired at capture-start (never at probe
+        # time), with the mode plumbed through and the revoke callback wired.
+        assert rec.source_types == ["monitor"]
+        portal_session = rec.sessions[0]
+        assert portal_session.on_closed is not None
+
+        # ffmpeg reads rawvideo from a stdin pipe at the portal stream's size.
+        popen = rec.popen_calls[0]
+        assert popen.kwargs["stdin"] == subprocess.PIPE
+        expected_input = build_wayland_input_args(1920, 1080, session.config.framerate)
+        i = popen.cmd.index("rawvideo")
+        assert popen.cmd[i - 1 : i - 1 + len(expected_input)] == expected_input
+
+        # The pump bridges the session's fd/node into ffmpeg's stdin.
+        pump = rec.pumps[0]
+        gst_launch, fd, node_id, sink = pump.init_args
+        assert gst_launch == "/usr/bin/gst-launch-1.0"  # probed once, cached
+        assert (fd, node_id) == (portal_session.pipewire_fd, portal_session.stream.node_id)
+        assert sink is popen.proc.stdin
+        assert pump.started and pump.is_running
+        assert session.is_running()
+    finally:
+        session.stop()
+
+
+def test_wayland_start_passes_window_source_type_to_factory(tmp_path: Path, monkeypatch) -> None:
+    rec = _install_wayland_fakes(monkeypatch)
+    session = _make_wayland_session(tmp_path, rec.session_factory, portal_source_type="window")
+
+    session.start()
+    try:
+        assert rec.source_types == ["window"]
+    finally:
+        session.stop()
+
+
+def test_wayland_stop_tears_down_pump_then_session_then_ffmpeg(tmp_path: Path, monkeypatch) -> None:
+    rec = _install_wayland_fakes(monkeypatch)
+    session = _make_wayland_session(tmp_path, rec.session_factory)
+
+    session.start()
+    session.stop()
+
+    # pump.stop() (frames stop flowing) -> session.close() (portal revoked
+    # locally) -> terminate ffmpeg -- the stdin EOF lands before the SIGTERM.
+    assert rec.events == ["pump_stop", "session_close", "terminate"]
+    assert not session.is_running()
+
+
+def test_wayland_pump_death_restarts_and_reacquires_session(tmp_path: Path, monkeypatch) -> None:
+    rec = _install_wayland_fakes(monkeypatch)
+    session = _make_wayland_session(tmp_path, rec.session_factory)
+    session.start()
+    try:
+        first_pump = rec.pumps[0]
+        first_session = rec.sessions[0]
+        first_process = rec.popen_calls[0].proc
+        # gst-launch dies out from under a still-running ffmpeg.
+        first_pump.exited_unexpectedly = True
+        first_pump._running = False
+
+        session._check_process_health()
+
+        # Same restart semantics as an ffmpeg crash: within budget, and the
+        # portal session is re-acquired through the factory (the stored
+        # restore token makes that dialog-free in reality).
+        assert rec.source_types == ["monitor", "monitor"]
+        assert len(rec.sessions) == 2
+        assert first_session.closed
+        assert first_process.returncode == 0  # the live half was terminated, not orphaned
+        assert len(rec.popen_calls) == 2
+        assert len(rec.pumps) == 2 and rec.pumps[1].started and rec.pumps[1].is_running
+        assert len(session._restart_timestamps) == 1
+        assert not session.gave_up_restarting()
+        assert session.is_running()
+    finally:
+        session.stop()
+
+
+def test_wayland_portal_revoke_sets_gave_up_and_blocks_reacquire(tmp_path: Path, monkeypatch) -> None:
+    rec = _install_wayland_fakes(monkeypatch)
+    session = _make_wayland_session(tmp_path, rec.session_factory)
+    session.start()
+    try:
+        rec.sessions[0].on_closed()  # user revoked sharing from the desktop's indicator
+        assert session.gave_up_restarting()
+
+        # Everything downstream of the revoked session then dies -- the
+        # health check must NOT re-acquire: the user just said no.
+        rec.pumps[0].exited_unexpectedly = True
+        rec.pumps[0]._running = False
+        rec.popen_calls[0].proc.returncode = 1
+        session._check_process_health()
+
+        assert len(rec.sessions) == 1
+        assert len(rec.popen_calls) == 1
+        assert session.gave_up_restarting()
+    finally:
+        session.stop()
+
+
+def test_wayland_factory_failure_propagates_without_leaking(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("clipersal.wayland_gstreamer.ensure_gstreamer", lambda: "/usr/bin/gst-launch-1.0")
+
+    def cancelling_factory(source_type):
+        raise PortalCancelledError("cancelled in the system dialog (fake)")
+
+    session = _make_wayland_session(tmp_path, cancelling_factory)
+
+    with pytest.raises(PortalCancelledError):
+        session._start_process()
+
+    # Nothing half-built is left behind: no process, pump, session, or log handle.
+    assert session._process is None
+    assert session._frame_pump is None
+    assert session._portal_session is None
+    assert session._ffmpeg_log_file is None
+
+
+def test_wayland_factory_failure_is_contained_by_cleanup_loop(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("clipersal.wayland_gstreamer.ensure_gstreamer", lambda: "/usr/bin/gst-launch-1.0")
+
+    def cancelling_factory(source_type):
+        raise PortalCancelledError("cancelled in the system dialog (fake)")
+
+    session = _make_wayland_session(tmp_path, cancelling_factory)
+    session.config.cleanup_interval_seconds = 0.05
+    session._process = _FakeProcess(returncode=1)  # crashed; every restart's re-acquire fails
+
+    thread = threading.Thread(target=session._cleanup_loop, daemon=True)
+    thread.start()
+    try:
+        # Only a still-living loop deletes this: the A1 exception containment
+        # must hold across the portal re-acquire failure too.
+        stale = session.config.buffer_dir / "seg-20260101-000100.ts"
+        _touch(stale, mtime=time.time() - 120)  # older than the 60s default buffer
+
+        deadline = time.time() + 5
+        while time.time() < deadline and stale.exists():
+            time.sleep(0.01)
+
+        assert not stale.exists()
+        assert thread.is_alive()
+    finally:
+        session._stop_event.set()
+        thread.join(timeout=5)
+    # The failing re-acquire happens before the log file is opened, so no
+    # handle can leak either.
+    assert session._ffmpeg_log_file is None

@@ -8,6 +8,8 @@ from clipersal import ipc
 from clipersal.cli import _another_instance_running
 from clipersal.config import Config
 from clipersal.ipc import IpcServer
+from clipersal.portal_screencast import PortalBackendError, PortalCancelledError, PortalUnavailableError
+from clipersal.wayland_gstreamer import GStreamerNotFoundError, PipewirePluginMissingError
 
 
 def test_another_instance_running_true_when_something_answers_ping() -> None:
@@ -162,6 +164,38 @@ def test_main_bind_failure_exits_before_starting_capture(monkeypatch, tmp_path) 
     # only then did the bind fail.
     assert "resolve_setup" not in fakes.calls
     assert "session_start" not in fakes.calls
+
+
+def test_main_wayland_setup_errors_hit_the_clean_startup_error_path(monkeypatch, tmp_path) -> None:
+    # The Wayland preflight probes (GStreamer/pipewiresrc/portal) raise typed
+    # errors from resolve_setup; each must surface exactly like a missing
+    # ffmpeg: port released, actionable message shown, no capture started.
+    fakes = _install_headless_startup_fakes(monkeypatch, tmp_path)
+
+    setup_errors = [
+        GStreamerNotFoundError("GStreamer was not found on PATH (fake)"),
+        PipewirePluginMissingError("the 'pipewiresrc' element is missing (fake)"),
+        PortalUnavailableError("the ScreenCast service is not reachable (fake)"),
+        PortalBackendError("the portal service appears to be wedged (fake)"),
+        PortalCancelledError("cancelled in the system dialog (fake)"),
+    ]
+    for exc in setup_errors:
+        fakes.calls.clear()
+        fakes.startup_errors.clear()
+
+        def fake_resolve_setup(config, exc=exc):
+            raise exc
+
+        monkeypatch.setattr(cli.capture, "resolve_setup", fake_resolve_setup)
+
+        rc = cli.main([])
+
+        assert rc == 1, exc
+        assert fakes.startup_errors == [str(exc)]
+        assert "session_construct" not in fakes.calls
+        assert "session_start" not in fakes.calls
+        # The port is released before the error dialog can block on the user.
+        assert "ipc_stop" in fakes.calls
 
 
 def test_concurrent_saves_are_serialized_and_get_distinct_names(monkeypatch, tmp_path) -> None:

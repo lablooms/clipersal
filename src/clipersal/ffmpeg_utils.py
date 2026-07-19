@@ -45,12 +45,17 @@ class FfmpegNotFoundError(RuntimeError):
     pass
 
 
-class WaylandCaptureNotImplementedError(RuntimeError):
-    pass
-
-
 class NoWorkingEncoderError(RuntimeError):
     pass
+
+
+# Marker CaptureSource.kind for the Wayland portal capture path. The real
+# ffmpeg input args depend on the stream size the portal handshake returns,
+# so resolve_setup can only return a placeholder -- capture.py builds the
+# actual args at capture-start via build_wayland_input_args. Opening the
+# portal session at probe time is not an option: the first Start shows the
+# desktop's share-dialog, and resolve_setup must stay dialog-free.
+WAYLAND_PORTAL_KIND = "wayland-portal"
 
 
 @dataclass
@@ -58,6 +63,10 @@ class CaptureSource:
     input_args: list[str]
     video_filter: str | None
     kind: str
+    # Only meaningful when kind == WAYLAND_PORTAL_KIND: which source type the
+    # portal's share-dialog asks for ("monitor" or "window"). Defaults to
+    # "monitor" so every pre-Wayland construction site keeps its behavior.
+    portal_source_type: str = "monitor"
 
 
 @dataclass
@@ -359,12 +368,7 @@ def build_video_capture_source(
 
     if os_ == OS.LINUX:
         if session_type == LinuxSessionType.WAYLAND:
-            raise WaylandCaptureNotImplementedError(
-                "Wayland screen capture is not implemented yet. It requires the "
-                "xdg-desktop-portal ScreenCast API + PipeWire, which is a separate, "
-                "larger phase of work -- see the Wayland caveat in ARCHITECTURE.md. "
-                "As a workaround, log into an X11 session to use this tool today."
-            )
+            return _build_wayland_portal_source(source_type="monitor")
         if session_type == LinuxSessionType.X11:
             display = os.environ.get("DISPLAY", ":0.0")
             if monitor_index == 0:
@@ -430,12 +434,7 @@ def build_window_capture_source(
 
     if os_ == OS.LINUX:
         if session_type == LinuxSessionType.WAYLAND:
-            raise WaylandCaptureNotImplementedError(
-                "Wayland screen capture is not implemented yet. It requires the "
-                "xdg-desktop-portal ScreenCast API + PipeWire, which is a separate, "
-                "larger phase of work -- see the Wayland caveat in ARCHITECTURE.md. "
-                "As a workaround, log into an X11 session to use this tool today."
-            )
+            return _build_wayland_portal_source(source_type="window")
         if session_type == LinuxSessionType.X11:
             display = os.environ.get("DISPLAY", ":0.0")
             win = _find_window(os_, window_title)
@@ -468,6 +467,46 @@ def build_window_capture_source(
         )
 
     raise NotImplementedError(f"Video capture is not implemented for {os_} yet")
+
+
+def _build_wayland_portal_source(source_type: str) -> CaptureSource:
+    """The Wayland capture source: a placeholder, not real ffmpeg args.
+
+    Wayland capture goes through the xdg-desktop-portal ScreenCast API +
+    PipeWire (portal_screencast.py), with a GStreamer bridge feeding raw
+    frames into ffmpeg's stdin (wayland_gstreamer.py) -- no released ffmpeg
+    has a PipeWire input device. The actual input args depend on the stream
+    size the portal handshake returns, so they can't be built here; and the
+    portal session can't be opened here either, since the first Start shows
+    the desktop's share-dialog and resolve_setup must stay dialog-free.
+    capture.py acquires the session and builds the real args at
+    capture-start.
+
+    GStreamer is probed NOW, though: a missing gst-launch-1.0/pipewiresrc
+    fails fast at startup with the actionable install message (typed errors
+    cli.py surfaces cleanly) instead of at the first capture start.
+    """
+    from clipersal import wayland_gstreamer
+
+    wayland_gstreamer.ensure_gstreamer()
+    return CaptureSource(
+        input_args=[], video_filter=None, kind=WAYLAND_PORTAL_KIND, portal_source_type=source_type
+    )
+
+
+def build_wayland_input_args(width: int, height: int, framerate: int) -> list[str]:
+    """ffmpeg input args for the Wayland portal path: the GStreamer frame
+    pump writes raw BGRA frames into ffmpeg's stdin, so ffmpeg reads rawvideo
+    from pipe:0 at the portal-reported stream size. Kept separate (and pure)
+    so the exact argv shape is unit-testable without a portal session.
+    """
+    return [
+        "-f", "rawvideo",
+        "-pix_fmt", "bgra",
+        "-video_size", f"{width}x{height}",
+        "-framerate", str(framerate),
+        "-i", "pipe:0",
+    ]
 
 
 def find_audio_source(ffmpeg_path: str, os_: OS) -> AudioSource | None:

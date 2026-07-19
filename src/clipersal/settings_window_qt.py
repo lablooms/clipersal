@@ -111,6 +111,13 @@ class SettingsFrame(QWidget):
         self._config = config
         self._on_apply = on_apply
         self._os = platform_detect.get_os()
+        # On Wayland the window-title picker can't work: window capture goes
+        # through the desktop portal's own share-dialog, which picks the
+        # window at capture-start -- our title list can't pre-select one.
+        self._on_wayland = (
+            self._os == platform_detect.OS.LINUX
+            and platform_detect.get_linux_session_type() == platform_detect.LinuxSessionType.WAYLAND
+        )
 
         self._preset_value_by_label = {label: value for label, value in _QUALITY_PRESET_CHOICES}
         self._encoder_label_by_value = {value: label for label, value in _ENCODER_CHOICES}
@@ -277,10 +284,22 @@ class SettingsFrame(QWidget):
         self.window_combo = QComboBox(self.window_container)
         self.window_combo.addItem(config.window_title or _NO_WINDOW_SELECTED)
         window_row.addWidget(self.window_combo, 1)
-        refresh_windows_button = QPushButton("Refresh", self.window_container)
-        refresh_windows_button.clicked.connect(self._refresh_windows)
-        window_row.addWidget(refresh_windows_button)
+        self.window_refresh_button = QPushButton("Refresh", self.window_container)
+        self.window_refresh_button.clicked.connect(self._refresh_windows)
+        window_row.addWidget(self.window_refresh_button)
         self._hint(window_layout, "Captures just this one window instead of the whole screen", self.window_container)
+        self.window_wayland_hint: QLabel | None = None
+        if self._on_wayland:
+            # The title entry is meaningless on Wayland (see __init__):
+            # disable it and say what picks the window instead.
+            self.window_combo.setEnabled(False)
+            self.window_refresh_button.setEnabled(False)
+            self.window_wayland_hint = self._hint(
+                window_layout,
+                "On Wayland, your desktop's own system dialog asks which window to share when "
+                "capture starts -- this list can't pre-select one, so it's disabled.",
+                self.window_container,
+            )
         capture_layout.addWidget(self.window_container)
         self._refresh_windows()  # populate immediately rather than showing it empty until first click
 

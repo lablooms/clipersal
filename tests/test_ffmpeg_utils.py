@@ -1,8 +1,12 @@
 import subprocess
 
+import pytest
+
 from clipersal.ffmpeg_utils import (
     QUALITY_PRESETS,
+    WAYLAND_PORTAL_KIND,
     build_video_capture_source,
+    build_wayland_input_args,
     build_window_capture_source,
     encoder_output_args,
     find_microphone_source,
@@ -13,6 +17,7 @@ from clipersal.ffmpeg_utils import (
 )
 from clipersal.monitors import MonitorInfo
 from clipersal.platform_detect import OS, LinuxSessionType
+from clipersal.wayland_gstreamer import GStreamerNotFoundError
 from clipersal.window_capture import WindowInfo
 
 _WINDOWS = [WindowInfo(handle="12345", title="My App", x=100, y=50, width=800, height=600)]
@@ -286,3 +291,56 @@ def test_linux_window_capture_falls_back_to_whole_display_when_window_not_found(
 
     assert source.kind == "x11grab"
     assert source.input_args == ["-f", "x11grab", "-framerate", "30", "-i", ":0.0"]
+
+
+# ---- Wayland portal capture source ------------------------------------------
+#
+# resolve_setup must stay dialog-free, so the Wayland branch only returns a
+# marker CaptureSource (the real input args need the portal handshake's stream
+# size, known at capture-start) -- but it DOES probe GStreamer, so a missing
+# gst-launch fails at startup with the actionable message.
+
+
+def test_linux_wayland_desktop_returns_portal_marker_and_probes_gstreamer(monkeypatch) -> None:
+    probes = []
+    monkeypatch.setattr(
+        "clipersal.wayland_gstreamer.ensure_gstreamer",
+        lambda: probes.append("probe") or "/usr/bin/gst-launch-1.0",
+    )
+
+    source = build_video_capture_source("ffmpeg", OS.LINUX, LinuxSessionType.WAYLAND, framerate=30, monitor_index=0)
+
+    assert source.kind == WAYLAND_PORTAL_KIND
+    assert source.input_args == []  # real args are built at capture-start from the stream size
+    assert source.video_filter is None
+    assert source.portal_source_type == "monitor"
+    assert probes == ["probe"]
+
+
+def test_linux_wayland_gstreamer_probe_failure_propagates(monkeypatch) -> None:
+    def boom():
+        raise GStreamerNotFoundError("GStreamer was not found on PATH (fake)")
+
+    monkeypatch.setattr("clipersal.wayland_gstreamer.ensure_gstreamer", boom)
+
+    with pytest.raises(GStreamerNotFoundError):
+        build_video_capture_source("ffmpeg", OS.LINUX, LinuxSessionType.WAYLAND, framerate=30, monitor_index=0)
+
+
+def test_linux_wayland_window_mode_maps_to_window_source_type(monkeypatch) -> None:
+    monkeypatch.setattr("clipersal.wayland_gstreamer.ensure_gstreamer", lambda: "/usr/bin/gst-launch-1.0")
+
+    source = build_window_capture_source("ffmpeg", OS.LINUX, LinuxSessionType.WAYLAND, "Any Title", framerate=30)
+
+    assert source.kind == WAYLAND_PORTAL_KIND
+    assert source.portal_source_type == "window"
+
+
+def test_build_wayland_input_args_exact_argv() -> None:
+    assert build_wayland_input_args(1920, 1080, 30) == [
+        "-f", "rawvideo",
+        "-pix_fmt", "bgra",
+        "-video_size", "1920x1080",
+        "-framerate", "30",
+        "-i", "pipe:0",
+    ]
