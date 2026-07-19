@@ -12,7 +12,7 @@ shipped so far.
 
 ## Status
 
-**Beta (0.1.0-beta)**. Continuous segmented capture + rolling buffer + concat-to-save,
+**0.1.0**. Continuous segmented capture + rolling buffer + concat-to-save,
 triggered over a local IPC socket via a real global hotkey (Windows / Linux-X11), the
 `clipersal-trigger` script (Wayland fallback), or the system tray icon. Capture can
 target the whole desktop, a specific monitor, or a single window, with an optional

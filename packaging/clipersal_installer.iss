@@ -13,7 +13,7 @@
 ; to recognize "this is an upgrade of the same app" rather than a separate install.
 
 #define MyAppName "Clipersal"
-#define MyAppVersion "0.1.0-beta"
+#define MyAppVersion "0.1.0"
 #define MyAppPublisher "Lablooms"
 #define MyAppURL "https://github.com/lablooms/clipersal"
 #define MyAppExeName "Clipersal.exe"

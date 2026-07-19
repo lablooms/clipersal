@@ -6,7 +6,20 @@ full design rationale behind each entry.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project
 does not yet follow strict semantic versioning (still pre-1.0).
 
-## [0.1.0] — Unreleased
+## [0.1.0] — 2026-07-19
+
+### Added
+
+- A tag-driven release workflow (`.github/workflows/release.yml`): pushing a `v*` tag
+  builds the Windows installer + portable zip and both AppImages, then publishes the
+  GitHub Release with this changelog's section for the tag as its notes. Tags with a
+  pre-release suffix are published as pre-releases.
+
+### Changed
+
+- The update checker's version comparison now treats a stable release as newer than
+  the same-numeric beta (`0.1.0` > `0.1.0-beta`, per semver), so beta installs are
+  notified about the stable promotion.
 
 ### Fixed
 
@@ -48,7 +61,7 @@ does not yet follow strict semantic versioning (still pre-1.0).
 - Linux: windows at negative coordinates (other viewports) no longer vanish from the
   window picker.
 
-## [0.1.0-beta] — Unreleased
+## [0.1.0-beta] — 2026-07-19
 
 First public beta. Windows and Linux (X11) are supported; Wayland and macOS are not yet
 (see "Known limitations" below).
