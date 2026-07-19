@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import threading
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtCore import Qt, Signal
@@ -52,10 +53,15 @@ class TrayIcon(QSystemTrayIcon):
     # cross-thread rule as signals.py's AppSignals).
     _save_responded = Signal(object)
 
-    def __init__(self, ipc_port: int, clips_dir: Path, log_path: Path | None = None, parent=None) -> None:
+    def __init__(
+        self, ipc_port: int, clips_dir_provider: Callable[[], Path], log_path: Path | None = None, parent=None
+    ) -> None:
         super().__init__(_make_icon(_RECORDING_COLOR), parent)
         self._ipc_port = ipc_port
-        self._clips_dir = clips_dir
+        # A live provider, not a frozen Path: apply_settings live-mutates
+        # config.clips_dir, and "Open clips folder" must open the folder
+        # saves go to NOW, not the one captured when the tray was built.
+        self._clips_dir_provider = clips_dir_provider
         self._log_path = log_path or config_store.default_log_path()
         self._paused = False
 
@@ -124,7 +130,7 @@ class TrayIcon(QSystemTrayIcon):
             self.showMessage("Save failed", response)
 
     def _on_open_clips(self) -> None:
-        open_folder(self._clips_dir)
+        open_folder(self._clips_dir_provider())
 
     def _on_show(self) -> None:
         response = self._send("SHOW")

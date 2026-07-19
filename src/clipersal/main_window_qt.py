@@ -91,7 +91,7 @@ class MainWindow(QWidget):
         current_encoder: str,
         on_apply: Callable[[dict], str | None],
         ffmpeg_path: str,
-        clips_dir: Path,
+        clips_dir_provider: Callable[[], Path],
         log_path: Path,
         tray_enabled: bool,
         on_quit: Callable[[], None],
@@ -102,7 +102,10 @@ class MainWindow(QWidget):
         self._config = config
         self._ipc_port = ipc_port
         self._ffmpeg_path = ffmpeg_path
-        self._clips_dir = clips_dir
+        # A live provider, not a frozen Path: apply_settings live-mutates
+        # config.clips_dir, and the recent-clips strip / status meta must
+        # follow a clips-folder change without an app restart.
+        self._clips_dir_provider = clips_dir_provider
         self._log_path = log_path
         self._tray_enabled = tray_enabled
         self._on_quit = on_quit
@@ -124,7 +127,7 @@ class MainWindow(QWidget):
 
         self._build_shell()
         self._tabs["home"] = self._build_home_tab()
-        self._tabs["clips"] = build_gallery_frame(None, ffmpeg_path, clips_dir)
+        self._tabs["clips"] = build_gallery_frame(None, ffmpeg_path, clips_dir_provider)
         self._tabs["settings"] = build_settings_frame(
             None, config, ipc_port, save_events, current_encoder, on_apply, ffmpeg_path
         )
@@ -321,7 +324,10 @@ class MainWindow(QWidget):
                 widget.deleteLater()
         self._recent_thumb_labels.clear()
 
-        clip_paths = sorted(self._clips_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+        # Read the provider once per refresh: the folder can't meaningfully
+        # change mid-pass, and a Settings change is picked up on the next one.
+        clips_dir = self._clips_dir_provider()
+        clip_paths = sorted(clips_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
         clip_paths = clip_paths[:_RECENT_CLIPS_COUNT]
         if not clip_paths:
             self._recent_strip.addWidget(SprigAccent(size=40))
@@ -348,7 +354,7 @@ class MainWindow(QWidget):
 
         self._recent_stop_worker = threading.Event()
         worker = ThumbnailWorker(
-            self._ffmpeg_path, clip_paths, self._clips_dir / thumbnails.THUMBNAIL_DIR_NAME, self._recent_stop_worker
+            self._ffmpeg_path, clip_paths, clips_dir / thumbnails.THUMBNAIL_DIR_NAME, self._recent_stop_worker
         )
         worker.ready.connect(self._apply_recent_thumbnail)
         self._recent_worker = worker
@@ -427,7 +433,7 @@ class MainWindow(QWidget):
             self._send("PAUSE")
 
     def _default_status_meta(self) -> str:
-        return f"Buffer: {self._config.buffer_seconds}s   ·   {self._clips_dir}"
+        return f"Buffer: {self._config.buffer_seconds}s   ·   {self._clips_dir_provider()}"
 
     def _on_save(self, trim_arg: str | None = None) -> None:
         # A SAVE's server-side remux can legitimately run tens of seconds (up

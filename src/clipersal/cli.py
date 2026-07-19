@@ -504,7 +504,11 @@ def main(argv: list[str] | None = None) -> int:
                 current_encoder=state.setup.encoder,
                 on_apply=apply_settings,
                 ffmpeg_path=state.setup.ffmpeg_path,
-                clips_dir=config.clips_dir,
+                # A live provider, not a frozen Path -- apply_settings
+                # mutates config.clips_dir in place, and the window (Home
+                # recent-clips, status meta, Clips tab) must follow it
+                # without an app restart.
+                clips_dir_provider=lambda: config.clips_dir,
                 log_path=log_path,
                 tray_enabled=config.tray_enabled,
                 on_quit=stop_event.set,
@@ -565,7 +569,8 @@ def main(argv: list[str] | None = None) -> int:
             if QSystemTrayIcon is not None and QSystemTrayIcon.isSystemTrayAvailable():
                 from clipersal import tray_qt
 
-                tray_icon = tray_qt.TrayIcon(server.port, config.clips_dir, log_path=log_path)
+                # Same live clips-dir provider as the main window above.
+                tray_icon = tray_qt.TrayIcon(server.port, lambda: config.clips_dir, log_path=log_path)
                 tray_icon.show()
             else:
                 log.warning(

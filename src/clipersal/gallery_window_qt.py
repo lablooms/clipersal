@@ -22,6 +22,7 @@ import sys
 import threading
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QPixmap
@@ -147,10 +148,13 @@ class ClipRow(QFrame):
 
 
 class GalleryFrame(QWidget):
-    def __init__(self, ffmpeg_path: str, clips_dir: Path, parent: QWidget | None = None) -> None:
+    def __init__(self, ffmpeg_path: str, clips_dir_provider: Callable[[], Path], parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._ffmpeg_path = ffmpeg_path
-        self._clips_dir = clips_dir
+        # A live provider, not a frozen Path: apply_settings live-mutates
+        # config.clips_dir, and this tab must list/open the folder saves go
+        # to NOW, not the one captured when the window was built.
+        self._clips_dir_provider = clips_dir_provider
         self._rows: dict[Path, ClipRow] = {}
         self._stop_worker = threading.Event()
         self._worker: ThumbnailWorker | None = None
@@ -170,7 +174,7 @@ class GalleryFrame(QWidget):
         header.addStretch()
 
         open_folder_button = QPushButton("Open folder", self)
-        open_folder_button.clicked.connect(lambda: open_folder(self._clips_dir))
+        open_folder_button.clicked.connect(lambda: open_folder(self._clips_dir_provider()))
         header.addWidget(open_folder_button)
 
         refresh_button = QPushButton("Refresh", self)
@@ -211,7 +215,10 @@ class GalleryFrame(QWidget):
         self._rows.clear()
         self._empty_container.hide()
 
-        clip_paths = sorted(self._clips_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+        # Read the provider once per refresh: the folder can't meaningfully
+        # change mid-pass, and a Settings change is picked up on the next one.
+        clips_dir = self._clips_dir_provider()
+        clip_paths = sorted(clips_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not clip_paths:
             self._empty_container.show()
             return
@@ -220,12 +227,12 @@ class GalleryFrame(QWidget):
             self._add_row(clip_path)
 
         thumbnails.cleanup_orphaned_thumbnails(
-            self._clips_dir / thumbnails.THUMBNAIL_DIR_NAME, {p.stem for p in clip_paths}
+            clips_dir / thumbnails.THUMBNAIL_DIR_NAME, {p.stem for p in clip_paths}
         )
 
         self._stop_worker = threading.Event()
         worker = ThumbnailWorker(
-            self._ffmpeg_path, clip_paths, self._clips_dir / thumbnails.THUMBNAIL_DIR_NAME, self._stop_worker
+            self._ffmpeg_path, clip_paths, clips_dir / thumbnails.THUMBNAIL_DIR_NAME, self._stop_worker
         )
         worker.ready.connect(self._apply_thumbnail)
         self._worker = worker  # kept alive for the duration of the background thread
@@ -248,7 +255,21 @@ class GalleryFrame(QWidget):
         new_stem, ok = QInputDialog.getText(self, "Rename clip", f"New name for {clip_path.name}:", text=clip_path.stem)
         if not ok or not new_stem:
             return
+        # A name containing a path separator makes with_name() raise an
+        # uncaught ValueError ("Invalid name") -- and a clip can never
+        # legitimately live outside clips_dir, so reject it as a bad name.
+        if "/" in new_stem or "\\" in new_stem:
+            QMessageBox.warning(self, "Rename clip", f"A clip name cannot contain path separators: {new_stem!r}")
+            return
         new_path = clip_path.with_name(f"{new_stem}{clip_path.suffix}")
+        if new_path == clip_path:
+            return  # unchanged name -- nothing to do, and not an overwrite
+        # Path.rename() silently REPLACES an existing destination on POSIX;
+        # only Windows raises FileExistsError. Refuse up front on every
+        # platform rather than destroy another clip without any prompt.
+        if new_path.exists():
+            QMessageBox.warning(self, "Rename clip", f"A clip named {new_path.name} already exists.")
+            return
         try:
             clip_path.rename(new_path)
         except OSError as exc:
@@ -293,8 +314,9 @@ class GalleryFrame(QWidget):
         row.set_thumbnail(scaled)
 
 
-def build_gallery_frame(parent: QWidget | None, ffmpeg_path: str, clips_dir: Path) -> GalleryFrame:
+def build_gallery_frame(parent: QWidget | None, ffmpeg_path: str, clips_dir_provider: Callable[[], Path]) -> GalleryFrame:
     """Thin factory function kept for API parity with the CustomTkinter
-    original's `build_gallery_frame(parent, ffmpeg_path, clips_dir)` shape.
+    original's `build_gallery_frame(parent, ffmpeg_path, clips_dir)` shape --
+    the third argument is now a live clips-dir provider, see GalleryFrame.
     """
-    return GalleryFrame(ffmpeg_path, clips_dir, parent)
+    return GalleryFrame(ffmpeg_path, clips_dir_provider, parent)

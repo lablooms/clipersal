@@ -26,11 +26,17 @@ def qapp():
 
 
 def _make_window(
-    tmp_path: Path, tray_enabled: bool = True, on_quit=None, ipc_port: int = 1, app_signals=None
+    tmp_path: Path,
+    tray_enabled: bool = True,
+    on_quit=None,
+    ipc_port: int = 1,
+    app_signals=None,
+    clips_dir_provider=None,
 ) -> MainWindow:
     config = Config(buffer_dir=tmp_path / "buffer", clips_dir=tmp_path / "clips")
     return MainWindow(
-        config, ipc_port, None, "libx264", lambda values: None, "ffmpeg", tmp_path / "clips",
+        config, ipc_port, None, "libx264", lambda values: None, "ffmpeg",
+        clips_dir_provider or (lambda: tmp_path / "clips"),
         tmp_path / "log.txt", tray_enabled, on_quit or (lambda: None), app_signals,
     )
 
@@ -317,6 +323,26 @@ def test_refresh_recent_clips_lists_clips_newest_first(tmp_path: Path) -> None:
 
     win = _make_window(tmp_path)
     assert list(win._recent_thumb_labels.keys()) == [newer, older]
+
+
+def test_recent_clips_and_status_meta_follow_live_clips_dir_provider(tmp_path: Path) -> None:
+    dir_a = tmp_path / "clips-a"
+    dir_b = tmp_path / "clips-b"
+    dir_b.mkdir(parents=True)
+    clip_b = dir_b / "clip-b.mp4"
+    clip_b.write_bytes(b"x")
+    current = {"clips_dir": dir_a}
+
+    win = _make_window(tmp_path, clips_dir_provider=lambda: current["clips_dir"])
+    assert str(dir_a) in win._default_status_meta()
+
+    # A Settings clips-folder change must be picked up live -- the window
+    # holds a provider, not a Path frozen at construction (which used to show
+    # the OLD folder until an app restart).
+    current["clips_dir"] = dir_b
+    win._refresh_recent_clips()
+    assert list(win._recent_thumb_labels.keys()) == [clip_b]
+    assert str(dir_b) in win._default_status_meta()
 
 
 def test_apply_recent_thumbnail_sets_pixmap(tmp_path: Path) -> None:

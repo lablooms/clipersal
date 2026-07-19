@@ -39,7 +39,7 @@ def _drain_until(predicate, timeout: float = 5.0) -> bool:
 
 
 def test_menu_has_expected_items() -> None:
-    tray = TrayIcon(ipc_port=51525, clips_dir=Path("/tmp/clips"))
+    tray = TrayIcon(ipc_port=51525, clips_dir_provider=lambda: Path("/tmp/clips"))
     labels = [action.text() for action in tray._menu.actions() if not action.isSeparator()]
     assert labels == [
         "Open Clipersal",
@@ -60,7 +60,7 @@ def test_pause_label_toggles_after_successful_pause_and_resume() -> None:
     server.register("RESUME", lambda arg: "resumed")
     server.start()
     try:
-        tray = TrayIcon(ipc_port=server.port, clips_dir=Path("/tmp/clips"))
+        tray = TrayIcon(ipc_port=server.port, clips_dir_provider=lambda: Path("/tmp/clips"))
         assert tray._pause_label() == "Pause capture"
 
         tray._on_toggle_pause()
@@ -76,7 +76,7 @@ def test_pause_label_toggles_after_successful_pause_and_resume() -> None:
 
 
 def test_pause_state_unchanged_when_ipc_unreachable() -> None:
-    tray = TrayIcon(ipc_port=1, clips_dir=Path("/tmp/clips"))
+    tray = TrayIcon(ipc_port=1, clips_dir_provider=lambda: Path("/tmp/clips"))
     tray._on_toggle_pause()
     assert tray._paused is False
 
@@ -90,7 +90,7 @@ def test_pause_state_unchanged_on_error_response() -> None:
     server.register("PAUSE", boom)
     server.start()
     try:
-        tray = TrayIcon(ipc_port=server.port, clips_dir=Path("/tmp/clips"))
+        tray = TrayIcon(ipc_port=server.port, clips_dir_provider=lambda: Path("/tmp/clips"))
         tray._on_toggle_pause()
         assert tray._paused is False
     finally:
@@ -102,7 +102,7 @@ def test_on_settings_success_does_not_notify(monkeypatch) -> None:
     server.register("SETTINGS", lambda arg: "opening settings window")
     server.start()
     try:
-        tray = TrayIcon(ipc_port=server.port, clips_dir=Path("/tmp/clips"))
+        tray = TrayIcon(ipc_port=server.port, clips_dir_provider=lambda: Path("/tmp/clips"))
         notified = []
         monkeypatch.setattr(tray, "showMessage", lambda title, message, *a, **k: notified.append((title, message)))
 
@@ -122,7 +122,7 @@ def test_on_settings_error_notifies(monkeypatch) -> None:
     server.register("SETTINGS", boom)
     server.start()
     try:
-        tray = TrayIcon(ipc_port=server.port, clips_dir=Path("/tmp/clips"))
+        tray = TrayIcon(ipc_port=server.port, clips_dir_provider=lambda: Path("/tmp/clips"))
         notified = []
         monkeypatch.setattr(tray, "showMessage", lambda title, message, *a, **k: notified.append((title, message)))
 
@@ -145,7 +145,7 @@ def test_on_save_last_30s_sends_trim_argument(monkeypatch) -> None:
     server.register("SAVE", handle_save)
     server.start()
     try:
-        tray = TrayIcon(ipc_port=server.port, clips_dir=Path("/tmp/clips"))
+        tray = TrayIcon(ipc_port=server.port, clips_dir_provider=lambda: Path("/tmp/clips"))
         notified = []
         monkeypatch.setattr(tray, "showMessage", lambda title, message, *a, **k: notified.append((title, message)))
 
@@ -170,7 +170,7 @@ def test_on_save_sends_with_raised_timeout_on_worker_thread(monkeypatch) -> None
         return "OK C:/clips/clip-1.mp4"
 
     monkeypatch.setattr(tray_qt.ipc_client, "send_command", fake_send)
-    tray = TrayIcon(ipc_port=12345, clips_dir=Path("/tmp/clips"))
+    tray = TrayIcon(ipc_port=12345, clips_dir_provider=lambda: Path("/tmp/clips"))
     notified = []
     monkeypatch.setattr(tray, "showMessage", lambda title, message, *a, **k: notified.append((title, message)))
 
@@ -191,7 +191,7 @@ def test_on_save_error_response_notifies(monkeypatch) -> None:
     monkeypatch.setattr(
         tray_qt.ipc_client, "send_command", lambda *a, **k: "ERROR Not enough has been captured yet"
     )
-    tray = TrayIcon(ipc_port=12345, clips_dir=Path("/tmp/clips"))
+    tray = TrayIcon(ipc_port=12345, clips_dir_provider=lambda: Path("/tmp/clips"))
     notified = []
     monkeypatch.setattr(tray, "showMessage", lambda title, message, *a, **k: notified.append((title, message)))
 
@@ -206,11 +206,26 @@ def test_on_open_clips_opens_clips_dir(monkeypatch) -> None:
     opened = []
     monkeypatch.setattr(tray_qt, "open_folder", lambda path: opened.append(path))
     clips_dir = Path("/tmp/clips")
-    tray = TrayIcon(ipc_port=1, clips_dir=clips_dir)
+    tray = TrayIcon(ipc_port=1, clips_dir_provider=lambda: clips_dir)
 
     tray._on_open_clips()
 
     assert opened == [clips_dir]
+
+
+def test_on_open_clips_opens_the_providers_current_dir(monkeypatch) -> None:
+    opened = []
+    monkeypatch.setattr(tray_qt, "open_folder", lambda path: opened.append(path))
+    current = {"clips_dir": Path("/tmp/clips-a")}
+    tray = TrayIcon(ipc_port=1, clips_dir_provider=lambda: current["clips_dir"])
+
+    tray._on_open_clips()
+    # A Settings clips-folder change must be picked up live -- the tray holds
+    # a provider, not a Path frozen at construction.
+    current["clips_dir"] = Path("/tmp/clips-b")
+    tray._on_open_clips()
+
+    assert opened == [Path("/tmp/clips-a"), Path("/tmp/clips-b")]
 
 
 def test_on_show_error_notifies(monkeypatch) -> None:
@@ -222,7 +237,7 @@ def test_on_show_error_notifies(monkeypatch) -> None:
     server.register("SHOW", boom)
     server.start()
     try:
-        tray = TrayIcon(ipc_port=server.port, clips_dir=Path("/tmp/clips"))
+        tray = TrayIcon(ipc_port=server.port, clips_dir_provider=lambda: Path("/tmp/clips"))
         notified = []
         monkeypatch.setattr(tray, "showMessage", lambda title, message, *a, **k: notified.append((title, message)))
 
@@ -235,7 +250,7 @@ def test_on_show_error_notifies(monkeypatch) -> None:
 
 
 def test_activated_trigger_and_double_click_open_window(monkeypatch) -> None:
-    tray = TrayIcon(ipc_port=1, clips_dir=Path("/tmp/clips"))
+    tray = TrayIcon(ipc_port=1, clips_dir_provider=lambda: Path("/tmp/clips"))
     calls = []
     monkeypatch.setattr(tray, "_on_show", lambda: calls.append("show"))
 
@@ -247,5 +262,5 @@ def test_activated_trigger_and_double_click_open_window(monkeypatch) -> None:
 
 
 def test_tray_icon_defaults_log_path_when_not_given() -> None:
-    tray = TrayIcon(ipc_port=1, clips_dir=Path("/tmp/clips"))
+    tray = TrayIcon(ipc_port=1, clips_dir_provider=lambda: Path("/tmp/clips"))
     assert tray._log_path == tray_qt.config_store.default_log_path()

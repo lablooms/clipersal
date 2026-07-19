@@ -87,6 +87,10 @@ class SaveToast(QWidget):
         # (below) is opaque and rounded, so the rounded corners actually show
         # against the desktop instead of leaving square artifacts.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        # close() (auto-dismiss or click) only HIDES a parented widget --
+        # without this, every save leaves a permanent hidden child (animation
+        # group, thumbnail fetcher and all) on the persistent MainWindow.
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -133,7 +137,10 @@ class SaveToast(QWidget):
         self._fetcher.ready.connect(self._on_thumbnail_ready)
         threading.Thread(target=self._fetcher.fetch, daemon=True).start()
 
-        QTimer.singleShot(_DISPLAY_MS, self.close)
+        # The context overload ties the timer to this toast's lifetime: once
+        # WA_DeleteOnClose has destroyed the toast (e.g. an early click), the
+        # pending singleShot must never fire close() on a dead C++ object.
+        QTimer.singleShot(_DISPLAY_MS, self, self.close)
 
     def _final_geometry(self) -> QRect:
         # availableGeometry() natively excludes the taskbar, unlike the old

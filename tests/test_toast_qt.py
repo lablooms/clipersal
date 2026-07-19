@@ -54,6 +54,15 @@ def test_save_toast_is_frameless_and_stays_on_top(tmp_path: Path) -> None:
     assert bool(flags & Qt.WindowType.WindowStaysOnTopHint)
 
 
+def test_save_toast_is_deleted_on_close(tmp_path: Path) -> None:
+    from PySide6.QtCore import Qt
+
+    # close() only hides a parented widget -- WA_DeleteOnClose is what keeps
+    # every save from leaving a permanent hidden child on the MainWindow.
+    toast = _make_toast(tmp_path)
+    assert toast.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose) is True
+
+
 def test_save_toast_final_geometry_within_available_screen_geometry(tmp_path: Path) -> None:
     from PySide6.QtGui import QGuiApplication
 
