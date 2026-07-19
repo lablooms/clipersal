@@ -1,6 +1,7 @@
 import subprocess
 
-from clipersal.platform_detect import OS
+from clipersal.ffmpeg_utils import build_window_capture_source
+from clipersal.platform_detect import OS, LinuxSessionType
 from clipersal.window_capture import WindowInfo, _list_linux_windows, list_windows
 
 _WMCTRL_OUTPUT = (
@@ -44,6 +45,40 @@ def test_list_linux_windows_returns_empty_when_wmctrl_missing(monkeypatch) -> No
     monkeypatch.setattr("clipersal.window_capture.subprocess.run", fake_run)
 
     assert _list_linux_windows() == []
+
+
+def test_list_linux_windows_parses_negative_coordinates(monkeypatch) -> None:
+    # Real "wmctrl -lG" output reports negative x/y for a window on another
+    # viewport or hanging off the left/top screen edge; the regex must not
+    # silently drop such windows from the Settings picker.
+    output = "0x0201c24f  0 -2552 96   1920 1080 host.local Offscreen Window\n"
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr("clipersal.window_capture.subprocess.run", fake_run)
+
+    assert _list_linux_windows() == [
+        WindowInfo(handle="0x0201c24f", title="Offscreen Window", x=-2552, y=96, width=1920, height=1080),
+    ]
+
+
+def test_window_capture_geometry_args_clamp_negative_origin(monkeypatch) -> None:
+    # XParseGeometry reads "display+-2552,96" as an offset relative to the
+    # right edge, so the x11grab input string must clamp a negative origin
+    # to the screen edge rather than pass it through.
+    monkeypatch.setenv("DISPLAY", ":0.0")
+    windows = [WindowInfo(handle="0x0201c24f", title="My App", x=-2552, y=-96, width=1920, height=1080)]
+    monkeypatch.setattr("clipersal.ffmpeg_utils.list_windows", lambda os_: windows)
+
+    source = build_window_capture_source("ffmpeg", OS.LINUX, LinuxSessionType.X11, "My App", framerate=30)
+
+    assert source.kind == "x11grab-window"
+    assert source.input_args == [
+        "-f", "x11grab", "-framerate", "30",
+        "-video_size", "1920x1080",
+        "-i", ":0.0+0,0",
+    ]
 
 
 def test_list_windows_returns_empty_for_unsupported_os() -> None:

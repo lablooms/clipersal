@@ -62,6 +62,36 @@ def test_linux_enable_disable_round_trip(tmp_path, monkeypatch) -> None:
     assert autostart.is_enabled(OS.LINUX) is False
 
 
+def test_linux_exec_line_double_quotes_space_containing_path(tmp_path, monkeypatch) -> None:
+    # The Desktop Entry Spec does not shell-parse Exec: a single quote is a
+    # reserved character treated literally, so a space-containing path must
+    # be wrapped in double quotes or a spec-conforming launcher splits it
+    # into bogus arguments.
+    desktop_path = tmp_path / "autostart" / "clipersal.desktop"
+    monkeypatch.setattr(autostart, "_autostart_desktop_path", lambda: desktop_path)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", "/home/user/My Apps/clipersal.AppImage", raising=False)
+
+    autostart.enable(OS.LINUX)
+
+    content = desktop_path.read_text(encoding="utf-8")
+    assert 'Exec="/home/user/My Apps/clipersal.AppImage"\n' in content
+
+
+def test_linux_exec_line_escapes_percent_as_field_code(tmp_path, monkeypatch) -> None:
+    # "%" introduces Exec field codes (%f, %u, ...); a literal percent sign
+    # in the command must be written as "%%".
+    desktop_path = tmp_path / "autostart" / "clipersal.desktop"
+    monkeypatch.setattr(autostart, "_autostart_desktop_path", lambda: desktop_path)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", "/opt/100%/clipersal", raising=False)
+
+    autostart.enable(OS.LINUX)
+
+    content = desktop_path.read_text(encoding="utf-8")
+    assert "Exec=/opt/100%%/clipersal\n" in content
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows registry only")
 def test_windows_enable_disable_round_trip(monkeypatch) -> None:
     # A dedicated test-only value name -- never touches the real

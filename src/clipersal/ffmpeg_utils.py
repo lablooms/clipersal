@@ -91,13 +91,22 @@ def find_ffmpeg() -> str:
 
 
 def list_encoders(ffmpeg_path: str) -> set[str]:
-    result = subprocess.run(
-        [ffmpeg_path, "-hide_banner", "-encoders"],
-        capture_output=True,
-        text=True,
-        timeout=_SMOKE_TEST_TIMEOUT,
-        **NO_WINDOW_KWARGS,
-    )
+    # A hung or unrunnable ffmpeg here must not escape: startup only catches
+    # the specific resolve_setup exceptions, and the Settings apply path
+    # reaches this through restart_capture from a Qt slot. Returning an empty
+    # set instead lets encoder auto-detection fall through to
+    # NoWorkingEncoderError, which both call sites already handle.
+    try:
+        result = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            timeout=_SMOKE_TEST_TIMEOUT,
+            **NO_WINDOW_KWARGS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("Could not list ffmpeg encoders: %s", exc)
+        return set()
     names = set()
     for line in result.stdout.splitlines():
         # Encoder lines look like: " V....D h264_nvenc  NVIDIA NVENC H.264 encoder ..."
@@ -108,13 +117,20 @@ def list_encoders(ffmpeg_path: str) -> set[str]:
 
 
 def list_filters(ffmpeg_path: str) -> set[str]:
-    result = subprocess.run(
-        [ffmpeg_path, "-hide_banner", "-filters"],
-        capture_output=True,
-        text=True,
-        timeout=_SMOKE_TEST_TIMEOUT,
-        **NO_WINDOW_KWARGS,
-    )
+    # Same containment as list_encoders above: on failure an empty set just
+    # means "no filters detected", which degrades ddagrab to the gdigrab
+    # fallback instead of crashing startup or a Settings-triggered restart.
+    try:
+        result = subprocess.run(
+            [ffmpeg_path, "-hide_banner", "-filters"],
+            capture_output=True,
+            text=True,
+            timeout=_SMOKE_TEST_TIMEOUT,
+            **NO_WINDOW_KWARGS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("Could not list ffmpeg filters: %s", exc)
+        return set()
     names = set()
     for line in result.stdout.splitlines():
         match = re.match(r"\s*[T.][S.][C.]\s+(\S+)", line)
@@ -430,12 +446,18 @@ def build_window_capture_source(
                     video_filter=None,
                     kind="x11grab",
                 )
+            # wmctrl can report a negative x/y for a window on another
+            # viewport or hanging off the left/top screen edge, and
+            # XParseGeometry reads "display+-2552,96" as an offset relative
+            # to the RIGHT/bottom edge -- passing it through would capture
+            # the wrong region entirely, so clamp to the screen edge.
+            x, y = max(0, win.x), max(0, win.y)
             return CaptureSource(
                 input_args=[
                     "-f", "x11grab",
                     "-framerate", str(framerate),
                     "-video_size", f"{win.width}x{win.height}",
-                    "-i", f"{display}+{win.x},{win.y}",
+                    "-i", f"{display}+{x},{y}",
                 ],
                 video_filter=None,
                 kind="x11grab-window",

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -109,10 +108,34 @@ def _windows_delete_value() -> None:
         pass
 
 
+# Characters the Desktop Entry Spec reserves in Exec arguments (space is
+# the argument separator, so it is what actually forces quoting).
+_DESKTOP_ENTRY_RESERVED = " \t\n\"\\'`$<>~|&;*?#()"
+
+
+def _desktop_entry_quote(arg: str) -> str:
+    """Quote one Exec argument per the Desktop Entry Spec, which does NOT
+    shell-parse the Exec line: quoting is double-quotes-only with the
+    double quote, backtick, dollar sign, and backslash escaped by a
+    preceding backslash -- a single quote is a reserved character treated
+    LITERALLY, so ``shlex.quote`` would turn a space-containing AppImage
+    path into two bogus arguments and login autostart would silently fail.
+    A literal ``%`` must also be doubled everywhere, quoted or not, because
+    ``%<char>`` sequences are field codes the launcher expands.
+    https://specifications.freedesktop.org/desktop-entry-spec/latest/exec-variables.html
+    """
+    arg = arg.replace("%", "%%")
+    if arg and not any(char in arg for char in _DESKTOP_ENTRY_RESERVED):
+        return arg
+    for char in ("\\", '"', "`", "$"):
+        arg = arg.replace(char, "\\" + char)
+    return f'"{arg}"'
+
+
 def _linux_write_desktop_file(command: list[str]) -> None:
     path = _autostart_desktop_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    exec_line = " ".join(shlex.quote(part) for part in command)
+    exec_line = " ".join(_desktop_entry_quote(part) for part in command)
     content = (
         "[Desktop Entry]\n"
         "Type=Application\n"

@@ -88,7 +88,11 @@ def _list_windows_windows() -> list[WindowInfo]:
     return windows
 
 
-_WMCTRL_LINE_RE = re.compile(r"^(\S+)\s+(-?\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$")
+# wmctrl -lG columns: handle, desktop, x, y, width, height, host, title.
+# x/y can be NEGATIVE -- a window on another viewport or hanging off the
+# left/top screen edge (e.g. "0x0201c24f  0 -2552 96 ...") -- and a plain
+# \d+ would fail to match, silently dropping those windows from the picker.
+_WMCTRL_LINE_RE = re.compile(r"^(\S+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$")
 
 
 def _list_linux_windows() -> list[WindowInfo]:

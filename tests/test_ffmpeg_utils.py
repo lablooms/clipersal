@@ -6,6 +6,8 @@ from clipersal.ffmpeg_utils import (
     build_window_capture_source,
     encoder_output_args,
     find_microphone_source,
+    list_encoders,
+    list_filters,
     list_microphones,
     resolve_quality_preset,
 )
@@ -75,6 +77,42 @@ def test_encoder_output_args_qsv_speed_only_added_when_given() -> None:
 
 def test_encoder_output_args_vaapi_ignores_speed() -> None:
     assert encoder_output_args("h264_vaapi", "8M", speed="fast") == ["-c:v", "h264_vaapi", "-b:v", "8M"]
+
+
+def test_list_encoders_returns_empty_when_probe_times_out(monkeypatch) -> None:
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=10)
+
+    monkeypatch.setattr("clipersal.ffmpeg_utils.subprocess.run", fake_run)
+
+    assert list_encoders("ffmpeg") == set()
+
+
+def test_list_encoders_returns_empty_when_probe_fails(monkeypatch) -> None:
+    def fake_run(*args, **kwargs):
+        raise FileNotFoundError("ffmpeg not found")
+
+    monkeypatch.setattr("clipersal.ffmpeg_utils.subprocess.run", fake_run)
+
+    assert list_encoders("ffmpeg") == set()
+
+
+def test_list_filters_returns_empty_when_probe_times_out(monkeypatch) -> None:
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="ffmpeg", timeout=10)
+
+    monkeypatch.setattr("clipersal.ffmpeg_utils.subprocess.run", fake_run)
+
+    assert list_filters("ffmpeg") == set()
+
+
+def test_list_filters_returns_empty_when_probe_fails(monkeypatch) -> None:
+    def fake_run(*args, **kwargs):
+        raise FileNotFoundError("ffmpeg not found")
+
+    monkeypatch.setattr("clipersal.ffmpeg_utils.subprocess.run", fake_run)
+
+    assert list_filters("ffmpeg") == set()
 
 
 def test_windows_ddagrab_monitor_index_zero_matches_current_default(monkeypatch) -> None:
