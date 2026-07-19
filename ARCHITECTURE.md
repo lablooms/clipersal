@@ -729,6 +729,18 @@ status dot's satellites being painted over) only showed up when rendering actual
 and checking them, not from asserting on internal widget state alone -- worth keeping in
 mind when adding new animated/painted widgets.
 
+**CI on Linux needs a real (virtual) X server, not just Qt's offscreen platform**: this
+was only discovered once `tests.yml`'s push trigger was fixed (see below) and Linux CI
+actually ran for the first time. `QT_QPA_PLATFORM=offscreen` satisfies Qt/PySide6 itself,
+but `pynput`'s own backend selection tries to open a real X connection at import time
+regardless of Qt's platform plugin, and raises `ImportError` immediately on a runner with
+no `DISPLAY` at all -- unrelated to anything Qt-specific. Fixed by installing `xvfb` and
+running the suite under `xvfb-run -a`, which gives `pynput` an actual (if virtual) X
+server to connect to. `tests.yml` had another, unrelated bug in the same discovery: its
+`push` trigger watched a branch named `main`, which doesn't exist on this repo (the
+default branch is `master`) -- so the push trigger had silently never fired since the
+workflow was written; only `pull_request` events ever ran it.
+
 ## Known limitations
 
 - **Wayland**: no screen capture yet (needs xdg-desktop-portal + PipeWire support).

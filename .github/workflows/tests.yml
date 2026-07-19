@@ -20,16 +20,21 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install ffmpeg + Qt runtime libs (Linux)
+      - name: Install ffmpeg + Qt/X11 runtime deps (Linux)
         if: runner.os == 'Linux'
         # libegl1/libgl1/libxkbcommon(-x11)/libdbus/libfontconfig are what
         # PySide6's "offscreen" QT_QPA_PLATFORM plugin needs on a bare,
         # display-less runner -- every Qt-based test file sets that env var
         # itself, but the platform plugin still needs these system libs
         # loadable even though nothing is actually rendered to a screen.
+        # xvfb is separate: pynput's own backend selection tries to open a
+        # real X connection at import time regardless of Qt's platform
+        # plugin, and raises ImportError with no DISPLAY at all -- a plain
+        # "offscreen" Qt platform doesn't help pynput, which needs an
+        # actual (even if virtual) X server to import successfully.
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 libdbus-1-3 libfontconfig1
+          sudo apt-get install -y ffmpeg libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 libdbus-1-3 libfontconfig1 xvfb
 
       - name: Install ffmpeg (Windows)
         if: runner.os == 'Windows'
@@ -38,5 +43,10 @@ jobs:
       - name: Install package + test dependencies
         run: pip install -e ".[test]"
 
-      - name: Run tests
+      - name: Run tests (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a pytest -v
+
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
         run: pytest -v
