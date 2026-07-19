@@ -48,6 +48,10 @@ First public beta. Windows and Linux (X11) are supported; Wayland and macOS are 
 - A Windows installer (`ClipersalSetup-<version>.exe`, built with Inno Setup): license
   page, per-user install with no admin elevation required, Start Menu shortcut, optional
   desktop icon, and a proper "Add or Remove Programs" entry with a working uninstaller.
+- A GitHub Actions workflow that builds both Linux AppImages on a real Ubuntu runner
+  (`.github/workflows/build-appimage.yml`), and a CI fix (`tests.yml` was watching
+  pushes to a branch named "main" that doesn't exist on this repo, so its push trigger
+  had never actually fired).
 
 ### Changed
 
@@ -66,9 +70,8 @@ First public beta. Windows and Linux (X11) are supported; Wayland and macOS are 
   meantime, since a global hotkey can't be grabbed there either.
 - **macOS**: not implemented yet (capture, launch-on-startup, and packaging are all
   Windows/Linux only so far).
-- **Linux AppImage packaging**: written to documented conventions and reviewed by hand,
-  but not yet run end-to-end on a real Linux machine — treat it as unverified before
-  trusting it as a release process (see `ARCHITECTURE.md`'s "Packaging & distribution"
-  section).
+- **Linux AppImage packaging**: the build is now verified end-to-end on real Linux CI,
+  but runtime behavior on an actual desktop session (tray icon, a full capture/save
+  cycle) hasn't been (see `ARCHITECTURE.md`'s "Packaging & distribution" section).
 - No Linux installer/`.deb` package yet — the AppImage already covers "download and
   run" there with no install step needed.

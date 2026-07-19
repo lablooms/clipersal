@@ -661,15 +661,22 @@ proactively offer to install it. An AppImage has zero package-manager awareness 
 do anything like that -- on Linux, exactly as on Windows, the clear-error-on-first-run
 path is the only safety net for a missing ffmpeg.
 
-**Caveat, stated plainly**: this Linux packaging was written to documented AppImage
-conventions and manually reviewed, but this project's entire history so far was built
-and verified on a Windows machine with no Linux available -- so, unlike the Windows
-build, it has not been executed or run end-to-end. Before trusting it as a release
-process: run `build_appimage.sh` on a real Linux box, confirm both AppImages launch, that
-the tray icon actually renders under whatever desktop environment you're targeting
-(StatusNotifierItem/AppIndicator support for `QSystemTrayIcon` varies between Linux
-desktop environments), and that a full save/pause/resume/quit cycle works the same way
-it was verified to on Windows.
+**Build verified, runtime not yet**: `.github/workflows/build-appimage.yml` runs
+`build_appimage.sh` on a real Ubuntu GitHub Actions runner (`workflow_dispatch`, or
+automatically on a version tag) and uploads both AppImages as artifacts -- this project's
+own dev environment is Windows-only, so this is the only real Linux execution the build
+gets. Running it there for the first time caught one genuine bug: `APPIMAGETOOL_VERSION`
+was pinned to a release tag ("13") that no longer exists on the `AppImage/appimagetool`
+repo, so the download 404'd -- current releases use version-number tags (fixed to
+`"1.9.1"`) or `"continuous"`. With that fixed, both AppImages now build successfully end
+to end on real Linux.
+
+What's still unverified is *runtime* behavior on an actual desktop session, since a CI
+runner is headless with no real X11/Wayland display or tray host: whether the tray icon
+actually renders under a given desktop environment (StatusNotifierItem/AppIndicator
+support for `QSystemTrayIcon` varies between them), and a full save/pause/resume/quit
+cycle against real capture. Confirm those on a real Linux desktop before fully trusting
+this as a release process.
 
 ### Windows installer
 
@@ -729,9 +736,9 @@ mind when adding new animated/painted widgets.
   meantime, since a global hotkey can't be grabbed there either.
 - **macOS**: not implemented yet (capture, launch-on-startup, and packaging are all
   Windows/Linux only so far).
-- **Linux AppImage packaging**: written to documented conventions and reviewed by hand,
-  but not yet run end-to-end on a real Linux machine -- treat it as unverified before
-  trusting it as a release process.
+- **Linux AppImage packaging**: the build itself is now verified on real Linux CI (see
+  "Linux: AppImage, not .deb" above), but runtime behavior on an actual desktop session
+  (tray icon rendering, a full capture/save cycle) hasn't been.
 - No Linux installer/`.deb` package yet (the AppImage covers "download and run" there).
 - Other ideas not yet scoped in detail: privacy auto-pause (blocklisted apps/windows),
   disk-space-based buffer retention as an alternative to `buffer_seconds`, a sound cue on
