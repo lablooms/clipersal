@@ -1,0 +1,37 @@
+name: Build Linux AppImages
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  appimage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ffmpeg, Qt/X11 runtime libs, and AppImage tooling deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libegl1 libgl1 libxkbcommon0 \
+            libxkbcommon-x11-0 libdbus-1-3 libfontconfig1 libx11-6 \
+            libxext6 libxrender1 libxi6 libsm6 libice6 libfuse2 \
+            wmctrl x11-xserver-utils
+
+      - name: Install package + build dependencies
+        run: pip install -e ".[build]"
+
+      - name: Build AppImages
+        run: |
+          chmod +x packaging/linux/build_appimage.sh
+          ./packaging/linux/build_appimage.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimages
+          path: dist/*.AppImage
