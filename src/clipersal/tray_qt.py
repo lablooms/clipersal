@@ -52,6 +52,9 @@ class TrayIcon(QSystemTrayIcon):
     # and the response comes back through this queued signal (the same
     # cross-thread rule as signals.py's AppSignals).
     _save_responded = Signal(object)
+    # STATUS response-or-None from the re-sync worker -- same worker-thread +
+    # queued-signal shape as _save_responded (see _on_menu_about_to_show).
+    _status_responded = Signal(object)
 
     def __init__(
         self, ipc_port: int, clips_dir_provider: Callable[[], Path], log_path: Path | None = None, parent=None
@@ -68,6 +71,7 @@ class TrayIcon(QSystemTrayIcon):
         self.setToolTip("Clipersal - Recording")
         self.activated.connect(self._on_activated)
         self._save_responded.connect(self._on_save_responded)
+        self._status_responded.connect(self._on_status_responded)
 
         self._menu = QMenu()
         self._menu.addAction("Open Clipersal", self._on_show)
@@ -81,6 +85,7 @@ class TrayIcon(QSystemTrayIcon):
         self._menu.addAction("View logs", self._on_view_logs)
         self._menu.addSeparator()
         self._menu.addAction("Quit", self._on_quit)
+        self._menu.aboutToShow.connect(self._on_menu_about_to_show)
         self.setContextMenu(self._menu)
 
     def _send(self, command: str, arg: str | None = None, timeout: float = 5.0) -> str | None:
@@ -164,6 +169,30 @@ class TrayIcon(QSystemTrayIcon):
 
     def _on_quit(self) -> None:
         self._send("QUIT")
+
+    def _on_menu_about_to_show(self) -> None:
+        # _paused only flipped on the tray's OWN toggle, so pausing from the
+        # main window / hotkey / `clipersal-trigger` (or an ffmpeg crash)
+        # left the menu showing a stale "Recording" icon and an inverted
+        # Pause/Resume label. Re-sync from the server's STATUS each time the
+        # menu opens. The send goes on a worker thread (same shape as
+        # _start_save_worker): aboutToShow fires on the GUI thread, and the
+        # menu must never block on IPC -- best-effort, the last known state
+        # stays if the send fails.
+        threading.Thread(target=self._status_worker, daemon=True).start()
+
+    def _status_worker(self) -> None:
+        response = self._send("STATUS")
+        self._status_responded.emit(response)
+
+    def _on_status_responded(self, response: str | None) -> None:
+        if response is None:
+            return  # IPC unreachable -- keep the last known state
+        # CRASHED maps onto the paused presentation deliberately: capture is
+        # not running either way, and RESUME doubles as the manual recovery
+        # action after ffmpeg gave up restarting (see cli.py's handle_resume).
+        self._paused = "PAUSED" in response or "CRASHED" in response
+        self._refresh_status()
 
     def _refresh_status(self) -> None:
         self.setIcon(_make_icon(_PAUSED_COLOR if self._paused else _RECORDING_COLOR))

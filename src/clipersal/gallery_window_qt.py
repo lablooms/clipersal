@@ -82,6 +82,27 @@ def _format_size(num_bytes: int) -> str:
     return f"{size:.1f} GB"
 
 
+def clips_newest_first(clips_dir: Path) -> list[Path]:
+    """clips_dir's .mp4 files, newest mtime first. A clip can vanish between
+    the glob and the sort-key stat (the retention sweep runs on the IPC
+    thread, or the user deletes a file externally) -- a bare
+    `sorted(..., key=lambda p: p.stat().st_mtime)` let that one racy
+    deletion abort the whole refresh with FileNotFoundError, so each stat
+    gets the same skip-on-OSError rule as GalleryFrame._add_row. Shared by
+    the gallery and the main window's recent-clips strip so there's exactly
+    one implementation.
+    """
+    with_mtimes: list[tuple[float, Path]] = []
+    for path in clips_dir.glob("*.mp4"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue  # vanished between glob and stat -- leave it out
+        with_mtimes.append((mtime, path))
+    with_mtimes.sort(key=lambda item: item[0], reverse=True)
+    return [path for _, path in with_mtimes]
+
+
 def parse_timestamp(text: str) -> float | None:
     """Parse a trim-dialog timestamp: either plain seconds ("90", "90.5")
     or mm:ss.s ("1:30", "1:30.5"). Returns seconds as a float, or None for
@@ -564,7 +585,7 @@ class GalleryFrame(QWidget):
         # Read the provider once per refresh: the folder can't meaningfully
         # change mid-pass, and a Settings change is picked up on the next one.
         clips_dir = self._clips_dir_provider()
-        clip_paths = sorted(clips_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+        clip_paths = clips_newest_first(clips_dir)
         if not clip_paths:
             self._empty_container.show()
             return

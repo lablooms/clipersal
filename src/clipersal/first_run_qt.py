@@ -142,6 +142,13 @@ class _FirstRunDialog(QDialog):
         style.polish(self._error_label)
 
     def _skip(self) -> None:
+        # Same mid-record hazard as _get_started, but for the listener itself:
+        # closing the wizard while the recorder is listening must tear down
+        # its OS-wide pynput Listener, not leak it for the rest of the
+        # process. (The config values persisted below were never mutated by
+        # the recorder, so there's no placeholder-persist hazard here.)
+        if self._hotkey_field.is_recording():
+            self._hotkey_field.cancel_recording()
         _persist(self._config)
         self.accept()
 

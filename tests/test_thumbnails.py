@@ -39,6 +39,90 @@ def test_thumbnail_path_changes_when_clip_mtime_changes(tmp_path: Path) -> None:
     assert first != second
 
 
+def test_thumbnail_path_for_returns_none_for_a_vanished_clip(tmp_path: Path) -> None:
+    # A clip deleted between the gallery's glob and the thumbnail worker's
+    # stat must not raise FileNotFoundError -- no thumbnail, no crash.
+    ghost = tmp_path / "clip-gone.mp4"
+    assert thumbnails.thumbnail_path_for(ghost, tmp_path / ".thumbnails") is None
+
+
+def test_ensure_thumbnail_returns_none_for_a_vanished_clip(tmp_path: Path) -> None:
+    # Bails out before ffmpeg is ever spawned, so no real ffmpeg is needed.
+    ghost = tmp_path / "clip-gone.mp4"
+    assert thumbnails.ensure_thumbnail("ffmpeg", ghost, tmp_path / ".thumbnails") is None
+
+
+def test_grab_frame_at_writes_via_temp_then_replaces_into_place(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake")
+    target = tmp_path / ".thumbnails" / "clip.123.jpg"
+    ran_cmds = []
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        ran_cmds.append(cmd)
+        Path(cmd[-1]).write_bytes(b"jpeg-bytes")  # ffmpeg writes its output to the last argv element
+        return _Result()
+
+    monkeypatch.setattr(thumbnails.subprocess, "run", fake_run)
+
+    assert thumbnails.grab_frame_at("ffmpeg", clip, 0.5, target) == target
+
+    output_path = Path(ran_cmds[0][-1])
+    # ffmpeg must never write the cache path directly: a temp name in the
+    # same directory, atomically replace()d into place, so concurrent
+    # writers can't interleave into a corrupt-but-cached JPEG.
+    assert output_path != target
+    assert output_path.parent == target.parent
+    assert ".tmp-" in output_path.name
+    assert not output_path.exists()  # replaced into place, not left behind
+    assert target.read_bytes() == b"jpeg-bytes"
+
+
+def test_grab_frame_at_failure_leaves_no_target(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake")
+    target = tmp_path / ".thumbnails" / "clip.123.jpg"
+
+    class _Result:
+        returncode = 1
+
+    def fake_run(cmd, **kwargs):
+        Path(cmd[-1]).write_bytes(b"partial")  # a failed grab can still leave bytes on disk
+        return _Result()
+
+    monkeypatch.setattr(thumbnails.subprocess, "run", fake_run)
+
+    # The partial temp must never be promoted to the cache path.
+    assert thumbnails.grab_frame_at("ffmpeg", clip, 0.5, target) is None
+    assert not target.exists()
+
+
+def test_grab_frame_at_returns_none_when_replace_fails(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake")
+    target = tmp_path / ".thumbnails" / "clip.123.jpg"
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        Path(cmd[-1]).write_bytes(b"jpeg-bytes")
+        return _Result()
+
+    def boom(self, *args, **kwargs):
+        raise OSError("temp vanished mid-grab")
+
+    monkeypatch.setattr(thumbnails.subprocess, "run", fake_run)
+    monkeypatch.setattr(Path, "replace", boom)
+
+    # A failed atomic move degrades to "no thumbnail", never an exception.
+    assert thumbnails.grab_frame_at("ffmpeg", clip, 0.5, target) is None
+    assert not target.exists()
+
+
 def test_cleanup_orphaned_thumbnails_removes_unmatched_files(tmp_path: Path) -> None:
     cache_dir = tmp_path / ".thumbnails"
     cache_dir.mkdir()

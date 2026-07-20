@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 from clipersal.subprocess_utils import NO_WINDOW_KWARGS
@@ -37,8 +38,18 @@ def find_ffprobe(ffmpeg_path: str) -> str | None:
     return shutil.which("ffprobe")
 
 
-def thumbnail_path_for(clip_path: Path, cache_dir: Path) -> Path:
-    mtime_ns = clip_path.stat().st_mtime_ns
+def thumbnail_path_for(clip_path: Path, cache_dir: Path) -> Path | None:
+    """Cache path for clip_path's thumbnail, keyed on the clip's mtime.
+    Returns None when the clip vanished between the caller's directory
+    listing and this stat (the retention sweep runs on the IPC thread, or
+    the file was deleted externally) -- the same skip-don't-crash rule as
+    the gallery's own stat calls; the thumbnail worker just emits no
+    thumbnail for that clip.
+    """
+    try:
+        mtime_ns = clip_path.stat().st_mtime_ns
+    except OSError:
+        return None
     return cache_dir / f"{clip_path.stem}.{mtime_ns}.jpg"
 
 
@@ -53,6 +64,17 @@ def grab_frame_at(
     failure -- the same degrade-don't-crash rule as ensure_thumbnail.
     """
     target_path.parent.mkdir(parents=True, exist_ok=True)
+    # Concurrent writers (the toast fetcher, the gallery worker, the main
+    # window's recent-clips worker) can grab the same clip's frame at the
+    # same time, and two ffmpegs writing one file interleave their bytes --
+    # leaving a corrupt JPEG that target.exists() then treated as a valid
+    # cache hit forever. ffmpeg writes to a per-thread temp name in the SAME
+    # directory instead, then Path.replace() moves it into place atomically
+    # (the codebase's tmp+replace rule, same as config_store's writes), so
+    # readers only ever see a complete file and the last writer wins
+    # cleanly. A leftover temp from a crashed grab is reclaimed by
+    # cleanup_orphaned_thumbnails: its rsplit-stem never matches a clip.
+    temp_path = target_path.with_name(f"{target_path.stem}.tmp-{threading.get_ident()}{target_path.suffix}")
     cmd = [
         ffmpeg_path,
         "-y",
@@ -69,16 +91,23 @@ def grab_frame_at(
         f"scale={size}:-1",
         "-update",
         "1",
-        str(target_path),
+        str(temp_path),
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=_THUMBNAIL_TIMEOUT, **NO_WINDOW_KWARGS)
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.warning("Frame grab at %.3fs for %s raised: %s", offset_seconds, clip_path, exc)
         return None
-    if result.returncode == 0 and target_path.exists():
-        return target_path
-    return None
+    if result.returncode != 0 or not temp_path.exists():
+        return None
+    try:
+        temp_path.replace(target_path)
+    except OSError as exc:
+        # e.g. the orphan sweep unlinked the temp mid-grab on POSIX -- lose
+        # the thumbnail, not the worker (degrade, don't crash).
+        log.warning("Could not move thumbnail %s into place for %s: %s", temp_path, clip_path, exc)
+        return None
+    return target_path
 
 
 def ensure_thumbnail(ffmpeg_path: str, clip_path: Path, cache_dir: Path, size: int = THUMBNAIL_SIZE) -> Path | None:
@@ -89,6 +118,8 @@ def ensure_thumbnail(ffmpeg_path: str, clip_path: Path, cache_dir: Path, size: i
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
     target = thumbnail_path_for(clip_path, cache_dir)
+    if target is None:
+        return None  # clip vanished between the gallery's listing and this stat
     if target.exists():
         return target
 

@@ -39,17 +39,49 @@ def test_pulse_starts_progress_animation() -> None:
 
 
 def test_pulse_can_be_retriggered_before_finishing() -> None:
-    # A second save shouldn't crash even if the previous pulse's animation
-    # hasn't finished yet -- pulse() must stop the old one before starting a
-    # new one rather than letting two animations drive the same property.
+    # A second save shouldn't crash even if the previous pulse hasn't
+    # finished yet -- pulse() stops and re-arms the ONE reused animation
+    # rather than letting two animations drive the same property (the old
+    # per-save QPropertyAnimation leaked one stopped child QObject per save).
     from PySide6.QtCore import QAbstractAnimation
 
     dot = StatusDot()
     dot.pulse("#ff8800")
     first_anim = dot._pulse_anim
     dot.pulse("#3fae4a")
-    assert first_anim.state() == QAbstractAnimation.State.Stopped
+    assert dot._pulse_anim is first_anim
     assert dot._pulse_anim.state() == QAbstractAnimation.State.Running
+    assert dot._progress == 0.0  # restarted from the beginning
+
+
+def test_pulse_reuses_a_single_animation_child_across_pulses() -> None:
+    from PySide6.QtCore import QPropertyAnimation
+
+    dot = StatusDot()
+    dot.pulse("#ff8800")
+    dot.pulse("#3fae4a")
+    dot.pulse("#ff8800")
+    animations = [child for child in dot.children() if isinstance(child, QPropertyAnimation)]
+    assert animations == [dot._pulse_anim]
+
+
+def test_reused_animation_reaches_its_end_state_after_retrigger() -> None:
+    # The re-armed animation must run 0.0 -> 1.0 exactly like a freshly
+    # constructed one -- the pixel-verified Phase-8.6 behavior unchanged.
+    from PySide6.QtCore import QAbstractAnimation
+    from clipersal.status_dot import _PULSE_DURATION_MS
+
+    dot = StatusDot()
+    dot.pulse("#ff8800")
+    dot._pulse_anim.setCurrentTime(_PULSE_DURATION_MS)  # drive to the end deterministically
+    assert dot._progress == 1.0
+    assert dot._pulse_anim.state() == QAbstractAnimation.State.Stopped
+
+    dot.pulse("#3fae4a")
+    assert dot._progress == 0.0
+    assert dot._pulse_anim.state() == QAbstractAnimation.State.Running
+    dot._pulse_anim.setCurrentTime(_PULSE_DURATION_MS)
+    assert dot._progress == 1.0
 
 
 def test_paints_without_raising_idle_and_mid_pulse() -> None:

@@ -114,6 +114,17 @@ class HotkeyField(QWidget):
         if self._recording:
             self._finish_recording(None)
 
+    def hideEvent(self, event) -> None:  # noqa: N802 -- Qt's own naming convention
+        # Defense in depth against leaking the pynput Listener: every host
+        # (the first-run wizard's Skip/✕, the main window hiding to the
+        # tray, a tab switch away from Settings) hides this widget, and Qt
+        # propagates hide events to children -- so cancelling here tears the
+        # OS-wide keyboard hook down even when a host's own close path
+        # forgets to. Privacy-sensitive: a leaked Listener keeps capturing
+        # global keystrokes for the rest of the process.
+        self.cancel_recording()
+        super().hideEvent(event)
+
     def _restyle_record_button(self, recording: bool) -> None:
         # setProperty() alone doesn't force Qt to re-evaluate QSS selectors
         # keyed on it (e.g. #recordButton[recording="true"]) -- unpolish()

@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 from clipersal import __version__, ipc_client, theme, thumbnails, update_check
 from clipersal.brand import BrandMark, SprigAccent
 from clipersal.config import Config
-from clipersal.gallery_window_qt import ThumbnailWorker, build_gallery_frame
+from clipersal.gallery_window_qt import ThumbnailWorker, build_gallery_frame, clips_newest_first
 from clipersal.settings_window_qt import build_settings_frame
 from clipersal.status_dot import StatusDot
 from clipersal.theme import qfont as _qfont
@@ -330,8 +330,10 @@ class MainWindow(QWidget):
         # Read the provider once per refresh: the folder can't meaningfully
         # change mid-pass, and a Settings change is picked up on the next one.
         clips_dir = self._clips_dir_provider()
-        clip_paths = sorted(clips_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-        clip_paths = clip_paths[:_RECENT_CLIPS_COUNT]
+        # clips_newest_first, not a bare glob+stat sort: a clip deleted
+        # mid-listing (retention sweep on the IPC thread, external delete)
+        # must be skipped, not crash the refresh -- see gallery_window_qt.
+        clip_paths = clips_newest_first(clips_dir)[:_RECENT_CLIPS_COUNT]
         if not clip_paths:
             self._recent_strip.addWidget(SprigAccent(size=40))
             no_clips_label = QLabel("No clips yet -- press your hotkey or Save now to make one.")

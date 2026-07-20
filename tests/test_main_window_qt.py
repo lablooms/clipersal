@@ -90,6 +90,45 @@ def test_close_event_quits_when_tray_disabled(tmp_path: Path) -> None:
     assert quit_calls == [True]
 
 
+class _FakeListener:
+    """Stands in for pynput.keyboard.Listener -- tests never hook real global
+    keyboard input (same rule as test_hotkey_widget_qt.py).
+    """
+
+    def __init__(self, on_press=None, on_release=None):
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def test_close_event_cancels_a_mid_record_settings_hotkey_capture(tmp_path: Path, monkeypatch) -> None:
+    # The Settings tab's hotkey recorder runs an OS-wide pynput Listener;
+    # closing the window to the tray mid-record must tear it down (via the
+    # HotkeyField's hideEvent defense), not leak it for the rest of the
+    # process. Privacy-sensitive -- see hotkey_widget_qt.py.
+    import pynput.keyboard
+
+    monkeypatch.setattr(pynput.keyboard, "Listener", _FakeListener)
+    win = _make_window(tmp_path, tray_enabled=True)
+    win.select_tab("settings")
+    win.show()
+    hotkey_field = win._tabs["settings"].hotkey_field
+    hotkey_field.record_button.click()
+    listener = hotkey_field._listener
+    assert hotkey_field.is_recording() is True
+
+    win.closeEvent(QCloseEvent())  # hides to the tray, like the real ✕
+
+    assert win.isHidden() is True
+    assert hotkey_field.is_recording() is False
+    assert listener.stopped is True
+
+
 # ---- status polling ---------------------------------------------------------
 
 
@@ -323,6 +362,31 @@ def test_refresh_recent_clips_lists_clips_newest_first(tmp_path: Path) -> None:
 
     win = _make_window(tmp_path)
     assert list(win._recent_thumb_labels.keys()) == [newer, older]
+
+
+def test_refresh_recent_clips_skips_a_clip_that_vanishes_mid_listing(tmp_path: Path, monkeypatch) -> None:
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    survivor = clips_dir / "clip-survivor.mp4"
+    ghost = clips_dir / "clip-ghost.mp4"
+    survivor.write_bytes(b"x")
+    ghost.write_bytes(b"x")
+    os.utime(survivor, (1000, 1000))
+    os.utime(ghost, (2000, 2000))
+    real_stat = Path.stat
+
+    def stat_that_deletes_ghost(self, *args, **kwargs):
+        # The retention sweep (on the IPC thread) or an external delete can
+        # remove a clip after the glob but before the sort-key stat.
+        if self == ghost:
+            ghost.unlink()
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat_that_deletes_ghost)
+
+    win = _make_window(tmp_path)  # must not raise FileNotFoundError
+
+    assert list(win._recent_thumb_labels.keys()) == [survivor]
 
 
 def test_recent_clips_and_status_meta_follow_live_clips_dir_provider(tmp_path: Path) -> None:

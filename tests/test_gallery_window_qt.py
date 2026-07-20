@@ -83,6 +83,26 @@ def test_lists_clips_sorted_newest_first(tmp_path: Path) -> None:
     assert list(gallery._rows.keys()) == [newer, older]
 
 
+def test_refresh_skips_a_clip_that_vanishes_between_glob_and_stat(tmp_path: Path, monkeypatch) -> None:
+    clips_dir = tmp_path / "clips"
+    survivor = _make_clip(clips_dir, "clip-survivor.mp4", mtime=1000)
+    ghost = _make_clip(clips_dir, "clip-ghost.mp4", mtime=2000)
+    real_stat = Path.stat
+
+    def stat_that_deletes_ghost(self, *args, **kwargs):
+        # The retention sweep (on the IPC thread) or an external delete can
+        # remove a clip after refresh()'s glob but before its sort-key stat.
+        if self == ghost:
+            ghost.unlink()
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat_that_deletes_ghost)
+
+    gallery = _make_gallery(clips_dir)  # must not raise FileNotFoundError
+
+    assert list(gallery._rows.keys()) == [survivor]
+
+
 def test_refresh_reads_the_providers_current_dir(tmp_path: Path) -> None:
     dir_a = tmp_path / "clips-a"
     dir_b = tmp_path / "clips-b"

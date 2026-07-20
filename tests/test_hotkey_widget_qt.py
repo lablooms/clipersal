@@ -212,3 +212,30 @@ def test_cancel_recording_is_a_noop_when_idle() -> None:
     assert field.is_recording() is False
     assert field.combo() == "<ctrl>+<alt>+r"
     assert _FakeListener.instances == []
+
+
+def test_hide_event_cancels_an_in_progress_recording() -> None:
+    # Every host hides this widget on its close path (the first-run wizard,
+    # the main window hiding to the tray, a tab switch away from Settings)
+    # and Qt propagates the hide event to children -- hiding must tear down
+    # the OS-wide listener even if the host's own close path forgets to.
+    field = HotkeyField("<ctrl>+<alt>+r")
+    field.show()
+    field.record_button.click()  # hideEvent only fires on a visible->hidden transition
+    assert field.is_recording() is True
+
+    field.hide()
+
+    assert field.is_recording() is False
+    assert field.combo() == "<ctrl>+<alt>+r"
+    assert field.record_button.text() == "Record"
+    assert _FakeListener.instances[0].stopped is True
+
+
+def test_hide_event_while_idle_is_harmless() -> None:
+    field = HotkeyField("<ctrl>+<alt>+r")
+    field.show()
+    field.hide()
+    assert field.is_recording() is False
+    assert field.combo() == "<ctrl>+<alt>+r"
+    assert _FakeListener.instances == []

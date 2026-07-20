@@ -68,16 +68,23 @@ class StatusDot(QWidget):
         same timer via set_color(), not by this animation.
         """
         self._pulse_color = QColor(color)
-        if self._pulse_anim is not None:
-            self._pulse_anim.stop()
+        if self._pulse_anim is None:
+            # ONE animation object for the dot's whole lifetime, re-armed on
+            # every pulse. The old version constructed a new
+            # QPropertyAnimation(parent=self) per save, and the stopped
+            # previous one stayed a child QObject of this long-lived widget
+            # forever -- one leaked animation per save.
+            anim = QPropertyAnimation(self, b"progress", self)
+            anim.setDuration(_PULSE_DURATION_MS)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._pulse_anim = anim
+        # stop() + start() restarts from 0 even mid-pulse -- the same visual
+        # behavior as the old stop-the-old-one / start-a-new-one pair.
+        self._pulse_anim.stop()
         self._progress = 0.0
-        anim = QPropertyAnimation(self, b"progress", self)
-        anim.setDuration(_PULSE_DURATION_MS)
-        anim.setStartValue(0.0)
-        anim.setEndValue(1.0)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        self._pulse_anim = anim
-        anim.start()
+        self._pulse_anim.start()
 
     def paintEvent(self, _event) -> None:  # noqa: N802 -- Qt's own naming convention
         painter = QPainter(self)

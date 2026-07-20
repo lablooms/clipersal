@@ -264,3 +264,67 @@ def test_activated_trigger_and_double_click_open_window(monkeypatch) -> None:
 def test_tray_icon_defaults_log_path_when_not_given() -> None:
     tray = TrayIcon(ipc_port=1, clips_dir_provider=lambda: Path("/tmp/clips"))
     assert tray._log_path == tray_qt.config_store.default_log_path()
+
+
+def test_about_to_show_resyncs_pause_state_from_status() -> None:
+    # Pausing (or resuming) from the main window / hotkey / trigger never
+    # touched the tray's own _paused flag -- the menu must re-sync from the
+    # server's STATUS each time it opens instead of showing a stale label.
+    state = {"status": "PAUSED"}
+    server = IpcServer(port=0)
+    server.register("STATUS", lambda arg: state["status"])
+    server.start()
+    try:
+        tray = TrayIcon(ipc_port=server.port, clips_dir_provider=lambda: Path("/tmp/clips"))
+        assert tray._paused is False
+
+        tray._menu.aboutToShow.emit()
+
+        assert _drain_until(lambda: tray._paused is True)
+        assert tray._pause_action.text() == "Resume capture"
+        assert tray.toolTip() == "Clipersal - Paused"
+
+        state["status"] = "RECORDING"
+        tray._menu.aboutToShow.emit()
+
+        assert _drain_until(lambda: tray._paused is False)
+        assert tray._pause_action.text() == "Pause capture"
+        assert tray.toolTip() == "Clipersal - Recording"
+
+        # A crashed ffmpeg auto-restart budget presents as paused too:
+        # capture is down, and RESUME is the recovery action for both.
+        state["status"] = "CRASHED"
+        tray._menu.aboutToShow.emit()
+
+        assert _drain_until(lambda: tray._paused is True)
+        assert tray._pause_action.text() == "Resume capture"
+    finally:
+        server.stop()
+
+
+def test_about_to_show_resync_failure_keeps_last_known_state(monkeypatch) -> None:
+    sent = []
+
+    def fake_send(command, arg=None, host="127.0.0.1", port=51525, timeout=5.0):
+        sent.append({"command": command, "timeout": timeout, "thread": threading.current_thread()})
+        raise tray_qt.ipc_client.IpcClientError("no server")
+
+    monkeypatch.setattr(tray_qt.ipc_client, "send_command", fake_send)
+    tray = TrayIcon(ipc_port=12345, clips_dir_provider=lambda: Path("/tmp/clips"))
+    tray._paused = True
+    tray._refresh_status()
+    responses = []
+    tray._status_responded.connect(responses.append)
+
+    tray._menu.aboutToShow.emit()
+
+    assert _drain_until(lambda: len(responses) == 1)
+    assert responses == [None]  # the failure came back as None, not an exception on the GUI thread
+    assert sent[0]["command"] == "STATUS"
+    # The tray's regular-command timeout pattern (the 5s _send default), not
+    # SAVE's 70s leash -- and off the GUI thread, so the menu never blocks.
+    assert sent[0]["timeout"] == 5.0
+    assert sent[0]["thread"] is not threading.current_thread()
+    # Stale state survives an unreachable server.
+    assert tray._paused is True
+    assert tray._pause_action.text() == "Resume capture"

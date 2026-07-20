@@ -182,3 +182,37 @@ def test_get_started_while_recording_cancels_recorder_instead_of_persisting_plac
 
     saved = config_store.load_overrides()
     assert saved["hotkey_combo"] == DEFAULT_COMBO
+
+
+def test_skip_while_recording_stops_the_listener(tmp_path: Path, monkeypatch) -> None:
+    import pynput.keyboard
+
+    monkeypatch.setattr(pynput.keyboard, "Listener", _FakeListener)
+    config = _make_config(tmp_path)
+    dialog = _FirstRunDialog(config)
+    dialog._hotkey_field.record_button.click()
+    listener = dialog._hotkey_field._listener
+    assert dialog._hotkey_field.is_recording() is True
+
+    dialog._skip()
+
+    # Closing the wizard mid-record must not leak the OS-wide keyboard hook.
+    assert dialog._hotkey_field.is_recording() is False
+    assert listener.stopped is True
+    assert dialog.result() == _FirstRunDialog.DialogCode.Accepted
+
+
+def test_close_event_while_recording_stops_the_listener(tmp_path: Path, monkeypatch) -> None:
+    import pynput.keyboard
+
+    monkeypatch.setattr(pynput.keyboard, "Listener", _FakeListener)
+    config = _make_config(tmp_path)
+    dialog = _FirstRunDialog(config)
+    dialog._hotkey_field.record_button.click()
+    listener = dialog._hotkey_field._listener
+
+    dialog.closeEvent(QCloseEvent())  # the ✕ button routes through _skip
+
+    assert dialog._hotkey_field.is_recording() is False
+    assert listener.stopped is True
+    assert dialog.result() == _FirstRunDialog.DialogCode.Accepted
