@@ -6,7 +6,7 @@ full design rationale behind each entry.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project
 does not yet follow strict semantic versioning (still pre-1.0).
 
-## [0.2.0] — Unreleased
+## [0.1.1-beta] — Unreleased
 
 ### Added
 
@@ -21,6 +21,52 @@ does not yet follow strict semantic versioning (still pre-1.0).
   verification on a real Wayland session (checklist in `ARCHITECTURE.md`). The global
   hotkey still doesn't exist on Wayland — `clipersal-trigger` + a DE keybinding
   remains the save trigger. New runtime dependency: `jeepney` (pure-Python D-Bus).
+- **In-app clip trimmer**: the Clips tab gains a Trim action per row — a dialog
+  with start/end fields, live result duration, frame-grab previews at both cut
+  points, and an honest note that cuts snap to the nearest ~2 s keyframe. The cut
+  is a stream copy (instant, zero quality loss; a precise re-encode mode is a
+  documented deferral), the original clip is always kept, and the trimmed copy
+  gets a unique `-trimmed` name.
+- **Dark mode**: a Pollen Gold dark variant (same gold accent family on warm
+  charcoal-brown) with a Settings → Appearance toggle. Applies live without a
+  restart and persists. (This reverses the pre-beta "light-only" removal — the
+  owner asked for it back.)
+- **Desktop and microphone volume sliders** (0–200 %) in Settings → Capture,
+  baked into the capture's audio mix as per-source `volume=` filter stages.
+  Changes restart capture; at the 100 % defaults the ffmpeg command is
+  byte-identical to before. Sliders disable with a hint when their source
+  doesn't exist.
+
+### Fixed
+
+- Failed or timed-out saves/trims no longer leave a partial, broken `.mp4` in
+  the gallery.
+- A hand-edited config file with wrong-typed values (e.g. text where a number
+  belongs) is now ignored entry-by-entry instead of crashing startup.
+- Filename templates rendering to a Windows reserved device name (`NUL`,
+  `CON`, …) fall back to `clip` instead of "successfully" saving into the void.
+- The update checker no longer suppresses retries for 24 h after one transient
+  network error, and no longer lets the banner flicker off for a launch.
+- IPC error responses with embedded newlines no longer arrive truncated
+  client-side; a foreign non-UTF-8 service on the port can't crash the
+  single-instance probe.
+- Linux: window/monitor enumeration can't crash on non-ASCII titles under
+  C locales; minimized windows are excluded from the picker (they captured as
+  black frames); sticky ("always on visible workspace") windows are no longer
+  dropped from the picker along with the desktop background.
+- Windows: all `user32` ctypes calls use proper 64-bit prototypes (a latent
+  handle-truncation landmine).
+- The tray re-syncs its pause state when its menu opens — pausing from the
+  window, another trigger, or a crash no longer leaves it showing a stale
+  "Recording" state.
+- Closing the first-run wizard or hiding the window while recording a hotkey
+  no longer leaks a live OS-wide keyboard listener for the rest of the process.
+- Clip lists and thumbnails no longer error when a clip vanishes mid-listing;
+  thumbnail writes are atomic (a corrupt JPEG can't get permanently cached);
+  the status dot no longer accumulates dead animation objects per save.
+- Settings: out-of-range config values display clamped consistently (what's
+  shown is what's saved), and the launch-on-startup toggle reconciles with the
+  real registration state instead of a stale persisted belief.
 
 ## [0.1.0] — 2026-07-19
 

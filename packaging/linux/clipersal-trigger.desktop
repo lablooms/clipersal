@@ -6,4 +6,4 @@ Exec=Clipersal-Trigger save
 Icon=clipersal
 Categories=Utility;
 Terminal=true
-X-AppImage-Version=0.1.0
+X-AppImage-Version=0.1.1-beta
