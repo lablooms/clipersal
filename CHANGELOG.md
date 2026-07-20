@@ -6,7 +6,7 @@ full design rationale behind each entry.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project
 does not yet follow strict semantic versioning (still pre-1.0).
 
-## [0.1.2-beta] — Unreleased
+## [0.1.2-beta] — 2026-07-20
 
 ### Fixed
 

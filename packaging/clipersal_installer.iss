@@ -13,7 +13,7 @@
 ; to recognize "this is an upgrade of the same app" rather than a separate install.
 
 #define MyAppName "Clipersal"
-#define MyAppVersion "0.1.1-beta"
+#define MyAppVersion "0.1.2-beta"
 #define MyAppPublisher "Lablooms"
 #define MyAppURL "https://github.com/lablooms/clipersal"
 #define MyAppExeName "Clipersal.exe"
@@ -26,7 +26,7 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-VersionInfoVersion=0.1.1.0
+VersionInfoVersion=0.1.2.0
 DefaultDirName={autopf}\Lablooms\Clipersal
 DefaultGroupName=Clipersal
 UninstallDisplayIcon={app}\{#MyAppExeName}
