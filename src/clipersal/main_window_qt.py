@@ -98,6 +98,10 @@ class MainWindow(QWidget):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        # Opts into the global stylesheet's top-level background rule
+        # (QWidget#mainWindow) -- the window owns the app's background surface
+        # now that backgrounds are scoped, not blanket-painted (see theme.py).
+        self.setObjectName("mainWindow")
         self._config = config
         self._ipc_port = ipc_port
         self._ffmpeg_path = ffmpeg_path

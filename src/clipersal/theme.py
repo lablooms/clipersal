@@ -125,6 +125,12 @@ def build_stylesheet() -> str:
     module-level constants at call time, so it always renders whichever
     palette `apply_theme()` last installed.
 
+    Backgrounds are scoped to the containers that own a surface (the main
+    window, dialogs, menus, cards, inputs) rather than painted by a blanket
+    `QWidget` rule -- a blanket background put a visible box behind every
+    label sitting on a card. Everything else stays transparent so the surface
+    beneath shows through.
+
     Deliberately doesn't try to cover *every* pixel: the Home tab's status
     dot (imperative GOOD/LIVE/NEUTRAL recoloring + pulse animation) and the
     custom-painted ToggleSwitch/SegmentedControl widgets (qt_widgets.py) set
@@ -132,8 +138,8 @@ def build_stylesheet() -> str:
     selectors, the same "opt out of blanket theming, set this one directly"
     shape used throughout this file.
 
-    Object names (`#card`, `#cardTitle`, `#hint`, `#primary`) are how a
-    widget opts into this sheet's per-role look -- set via
+    Object names (`#mainWindow`, `#card`, `#cardTitle`, `#hint`, `#primary`)
+    are how a widget opts into this sheet's per-role look -- set via
     `setObjectName(...)` on whichever widget should get that look.
     """
     bg, surface, surface_raised, border, text, text_muted, accent, accent_hover, track, live, good = (
@@ -153,8 +159,33 @@ def build_stylesheet() -> str:
 
     return f"""
     QWidget {{
-        background-color: {bg};
         color: {text};
+    }}
+
+    /* Backgrounds are scoped to the containers that own a surface -- no
+       blanket QWidget background, which painted a visible BACKGROUND-colored
+       box behind every label sitting on a SURFACE card (and read as "a
+       background behind each label"). Plain container widgets and labels stay
+       transparent so the surface beneath them shows through. */
+    QWidget#mainWindow, QDialog {{
+        background-color: {bg};
+    }}
+
+    QLabel {{
+        background: transparent;
+    }}
+
+    QMenu {{
+        background-color: {surface};
+        color: {text};
+        border: 1px solid {border};
+    }}
+
+    QToolTip {{
+        background-color: {surface};
+        color: {text};
+        border: 1px solid {border};
+        padding: 4px 8px;
     }}
 
     QFrame#card {{

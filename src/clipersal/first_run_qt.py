@@ -57,7 +57,9 @@ class _FirstRunDialog(QDialog):
         super().__init__(parent)
         self._config = config
         self.setWindowTitle("Welcome to Clipersal")
-        self.setFixedSize(440, 420)
+        # Snug fit: the old 420px height left a large dead gap between the
+        # card and the footer (the stretch below absorbs the difference).
+        self.setFixedSize(440, 360)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 24, 22, 22)

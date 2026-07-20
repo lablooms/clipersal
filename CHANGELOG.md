@@ -6,7 +6,17 @@ full design rationale behind each entry.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project
 does not yet follow strict semantic versioning (still pre-1.0).
 
-## [0.1.1-beta] — Unreleased
+## [0.1.2-beta] — Unreleased
+
+### Fixed
+
+- **UI polish**: labels no longer paint a visible background box behind their
+  text. The global stylesheet's blanket `QWidget` background is replaced by
+  backgrounds scoped to the containers that own a surface (the main window,
+  dialogs, menus, cards, inputs) — text now sits cleanly on its card in both
+  light and dark mode. The first-run wizard's dead bottom space is gone too.
+
+## [0.1.1-beta] — 2026-07-20
 
 ### Added
 

@@ -105,6 +105,10 @@ def test_build_stylesheet_reads_the_current_palette() -> None:
 
 def _themed_window() -> QWidget:
     window = QWidget()
+    # Backgrounds are scoped, not blanket-painted: only containers that opt in
+    # (object name or class) own a surface. "mainWindow" is the app's
+    # top-level opt-in (see MainWindow.__init__ and theme.py).
+    window.setObjectName("mainWindow")
     window.resize(120, 90)
     layout = QVBoxLayout(window)
     card = QFrame(window)
@@ -162,3 +166,46 @@ def test_custom_painted_toggle_switch_repaints_against_new_tokens(qapp) -> None:
 
     assert light_track.name() == theme.LIGHT_TOKENS["TRACK"].lower()
     assert dark_track.name() == theme.DARK_TOKENS["TRACK"].lower()
+
+
+def test_label_inside_a_card_shows_the_card_surface_not_a_background_box(qapp) -> None:
+    # The regression pin for the scoped-background architecture: a blanket
+    # QWidget background used to paint a visible BACKGROUND-colored rectangle
+    # behind every label sitting on a SURFACE card.
+    from PySide6.QtWidgets import QLabel
+
+    window = _themed_window()
+    card = window.findChild(QFrame, "card")
+    label = QLabel("X", card)
+    label.setGeometry(5, 5, 85, 20)
+    qapp.setStyleSheet(theme.build_stylesheet())
+    window.show()
+    # (80, 12) is inside the label's rect, clear of its left-aligned ink.
+    light_pixel = window.grab().toImage().pixelColor(80, 12)
+
+    theme.apply_theme(True)
+    qapp.setStyleSheet(theme.build_stylesheet())
+    dark_pixel = window.grab().toImage().pixelColor(80, 12)
+    window.close()
+
+    assert light_pixel.name() == theme.LIGHT_TOKENS["SURFACE"].lower()
+    assert dark_pixel.name() == theme.DARK_TOKENS["SURFACE"].lower()
+    # ...and specifically NOT the window background that used to box it.
+    assert light_pixel.name() != theme.LIGHT_TOKENS["BACKGROUND"].lower()
+
+
+def test_value_badge_keeps_its_raised_track_background(qapp) -> None:
+    # The transparency rule is for plain labels -- object-name opt-ins like
+    # the value badge keep their intended raised background.
+    from PySide6.QtWidgets import QLabel
+
+    window = _themed_window()
+    badge = QLabel("60s", window)
+    badge.setObjectName("valueBadge")
+    badge.setGeometry(10, 60, 50, 20)
+    qapp.setStyleSheet(theme.build_stylesheet())
+    window.show()
+    pixel = window.grab().toImage().pixelColor(20, 70)
+    window.close()
+
+    assert pixel.name() == theme.LIGHT_TOKENS["TRACK"].lower()
