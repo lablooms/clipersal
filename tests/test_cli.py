@@ -103,7 +103,9 @@ def _install_headless_startup_fakes(monkeypatch, tmp_path):
         clips_dir=tmp_path / "clips",
         filename_template="clip-test",
         clip_retention_days=0,
+        dark_mode=False,
     )
+    fakes.config = fake_config
 
     monkeypatch.setattr(cli, "_configure_logging", lambda: tmp_path / "clipersal.log")
     monkeypatch.setattr(cli, "_ensure_qapplication", lambda: None)
@@ -306,6 +308,7 @@ def _settings_values(config, **overrides):
         "clip_retention_days": config.clip_retention_days,
         "launch_on_startup": config.launch_on_startup,
         "check_for_updates": config.check_for_updates,
+        "dark_mode": config.dark_mode,
     }
     values.update(overrides)
     return values
@@ -314,7 +317,7 @@ def _settings_values(config, **overrides):
 def _install_apply_settings_fakes(monkeypatch, tmp_path, hotkey_enabled=False):
     calls = []
     fakes = SimpleNamespace(
-        server=None, calls=calls, on_apply=None, saved_overrides=[], hotkey_events=[], config=None
+        server=None, calls=calls, on_apply=None, saved_overrides=[], hotkey_events=[], config=None, app=None
     )
     quit_event = threading.Event()
 
@@ -339,13 +342,26 @@ def _install_apply_settings_fakes(monkeypatch, tmp_path, hotkey_enabled=False):
             self.save_failed = FakeSignal()
             self.toast_requested = FakeSignal()
             self.update_available = FakeSignal()
+            self.theme_changed = FakeSignal()
 
     class FakeApp:
+        def __init__(self):
+            self.stylesheets = []
+            fakes.app = self
+
         def quit(self):
             quit_event.set()
 
         def exec(self):
             quit_event.wait(10)
+
+        def setStyleSheet(self, sheet):
+            # Records instead of applying -- apply_settings' live theme flip
+            # is asserted against what lands here.
+            self.stylesheets.append(sheet)
+
+        def topLevelWidgets(self):
+            return []
 
     class FakeMainWindow:
         def __init__(self, **kwargs):
@@ -615,6 +631,84 @@ def test_rebind_hotkey_constructs_new_binding_before_stopping_old_listener(monke
         ("stop", "<ctrl>+<alt>+r"),  # ... before the old one is dropped
     ]
     assert fakes.saved_overrides[0]["hotkey_combo"] == "<ctrl>+<shift>+s"
+
+    _stop_main(fakes, thread, result)
+
+
+def test_main_applies_configured_theme_before_building_the_app_stylesheet(monkeypatch, tmp_path) -> None:
+    # A dark-mode launch must never flash light: theme.apply_theme() has to
+    # run BEFORE _ensure_qapplication() constructs the QApplication and its
+    # global stylesheet. Both are faked to record order only -- the real
+    # apply_theme would flip process-global token state for no benefit here.
+    fakes = _install_headless_startup_fakes(monkeypatch, tmp_path)
+    fakes.config.dark_mode = True
+
+    order = []
+    monkeypatch.setattr(cli.theme, "apply_theme", lambda dark: order.append(("apply_theme", dark)))
+    monkeypatch.setattr(cli, "_ensure_qapplication", lambda: order.append("ensure_qapplication") or None)
+
+    result = {}
+
+    def run() -> None:
+        result["rc"] = cli.main([])
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if fakes.server is not None and "QUIT" in fakes.server.handlers:
+            break
+        time.sleep(0.01)
+    assert fakes.server is not None and "QUIT" in fakes.server.handlers
+
+    fakes.server.handlers["QUIT"]()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert result["rc"] == 0
+    assert order[:2] == [("apply_theme", True), "ensure_qapplication"]
+
+
+def test_apply_settings_dark_mode_is_live_applied_without_capture_restart(monkeypatch, tmp_path) -> None:
+    from clipersal import theme
+
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    thread, result = _start_main(fakes)
+
+    try:
+        error = fakes.on_apply(_settings_values(fakes.config, dark_mode=True))
+
+        assert error is None
+        assert fakes.config.dark_mode is True
+        # Live-mutated class (like buffer_seconds), NOT capture-restart class:
+        # no re-resolution, no session swap -- the theme has nothing to do
+        # with the ffmpeg command line.
+        resolve_calls = [c for c in fakes.calls if isinstance(c, tuple) and c[0] == "resolve_setup"]
+        assert len(resolve_calls) == 1  # startup only
+        assert fakes.calls.count("session_stop") == 0
+        assert fakes.calls.count("session_construct") == 1
+        # The tokens actually flipped and the theme_changed slot rebuilt the
+        # app's stylesheet from them.
+        assert theme.current_theme() == "dark"
+        assert fakes.app is not None and fakes.app.stylesheets
+        assert theme.DARK_TOKENS["BACKGROUND"] in fakes.app.stylesheets[-1]
+        assert fakes.saved_overrides[0]["dark_mode"] is True
+    finally:
+        # apply_settings really ran apply_theme -- don't leak the dark
+        # palette into the rest of the suite.
+        theme.apply_theme(False)
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_unchanged_dark_mode_does_not_retheme(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, buffer_seconds=90))
+
+    assert error is None
+    assert fakes.config.dark_mode is False
+    assert fakes.app.stylesheets == []
 
     _stop_main(fakes, thread, result)
 

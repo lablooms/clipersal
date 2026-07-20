@@ -2,19 +2,29 @@
 app (settings_window_qt.py, gallery_window_qt.py, toast_qt.py, main_window_qt.py,
 first_run_qt.py, qt_widgets.py) so there's exactly one place to change colors.
 
-Light-only as of the pre-v0.1.0-beta polish pass: dark mode (and the
-sidebar's dark/light toggle) was removed at the user's request. Every
-constant used to be a `(light, dark)` tuple -- see ARCHITECTURE.md's "PySide6
-migration"/"Visual design" sections for that history -- and is now just the
-light value, kept as a flat hex string.
+Dark mode lives here as two full palettes behind the same flat module-level
+constants. History: the constants used to be `(light, dark)` tuples, then
+collapsed to light-only flat strings in the pre-v0.1.0-beta polish pass
+(see ARCHITECTURE.md's "PySide6 migration"/"Visual design" sections), and
+dark mode is now back -- this time as `LIGHT_TOKENS`/`DARK_TOKENS` dicts
+with `apply_theme()` rewriting the module-level attributes in place, so
+every existing `theme.ACCENT`-style read keeps working unchanged. The one
+import shape that does NOT follow a theme switch is a by-value import
+(`from clipersal.theme import ACCENT`): that binds the string at import
+time, so any module reading tokens must import the module itself
+(`from clipersal import theme`) and read attributes at call time --
+main_window_qt.py's GOOD/LIVE/NEUTRAL status-dot reads are the canonical
+example.
 
 Palette: Pollen Gold -- a warm gold/amber accent over a cream/parchment
 background, matching Clipersal's "seed dispersal" identity (the phase after
 a flower blooms -- see the app's tagline). Replaces the original Sakura
-Pastel pink. Semantic status colors (GOOD/LIVE/NEUTRAL) are deliberately
-their own palette, kept far enough from the gold hue that
-"recording"/"saving" states don't blur into the accent color -- see
-ARCHITECTURE.md.
+Pastel pink. The dark palette is a true Pollen Gold dark variant, not a
+generic blue-grey dark theme: warm dark-brown backgrounds, cream text, the
+same gold accent family brightened for dark-surface contrast. Semantic
+status colors (GOOD/LIVE/NEUTRAL) are deliberately their own palette in
+both modes, kept far enough from the gold hue that "recording"/"saving"
+states don't blur into the accent color -- see ARCHITECTURE.md.
 """
 
 from __future__ import annotations
@@ -24,19 +34,73 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from PySide6.QtGui import QFont
 
-BACKGROUND = "#FFFBF0"
-SURFACE = "#FFFFFF"
-SURFACE_RAISED = "#FFF3D6"
-BORDER = "#F0DFA8"
-TEXT = "#2E2410"
-TEXT_MUTED = "#8A7550"
-ACCENT = "#C8960C"
-ACCENT_HOVER = "#A67908"
-GOOD = "#4CAF50"  # recording, steady -- growth green, calm next to gold
-LIVE = "#E67E22"  # actively saving/busy, pulses briefly -- bursting-seed-pod orange
-NEUTRAL = "#A69374"  # paused -- warm taupe-grey, tinted toward the gold family
-TRACK = "#F7E9C0"
-ON_ACCENT_TEXT = "#FFFFFF"  # text/icon color sitting directly on an ACCENT-filled surface
+# The light values are exactly the flat constants the app shipped with when
+# it was light-only -- they are the source of truth for the light theme and
+# must stay pixel-identical, so don't "improve" them here.
+LIGHT_TOKENS = {
+    "BACKGROUND": "#FFFBF0",
+    "SURFACE": "#FFFFFF",
+    "SURFACE_RAISED": "#FFF3D6",
+    "BORDER": "#F0DFA8",
+    "TEXT": "#2E2410",
+    "TEXT_MUTED": "#8A7550",
+    "ACCENT": "#C8960C",
+    "ACCENT_HOVER": "#A67908",
+    "GOOD": "#4CAF50",  # recording, steady -- growth green, calm next to gold
+    "LIVE": "#E67E22",  # actively saving/busy, pulses briefly -- bursting-seed-pod orange
+    "NEUTRAL": "#A69374",  # paused -- warm taupe-grey, tinted toward the gold family
+    "TRACK": "#F7E9C0",
+    "ON_ACCENT_TEXT": "#FFFFFF",  # text/icon color sitting directly on an ACCENT-filled surface
+}
+
+# Pollen Gold after dark: the light palette's roles mapped onto a warm
+# espresso-bronze scale (never a blue-grey), with the gold accent brightened
+# ~20% so it keeps its contrast against dark surfaces, and hover going
+# LIGHTER instead of darker (dark-theme convention). GOOD/LIVE/NEUTRAL are
+# lifted and LIVE is pushed further toward red-orange, because the brighter
+# accent would otherwise sit closer to LIVE's hue than the light mode's
+# pairing did. ON_ACCENT_TEXT inverts: dark brown text on the bright gold
+# reads better than white on a lighter accent.
+DARK_TOKENS = {
+    "BACKGROUND": "#1B1409",  # deep espresso brown -- warm, not charcoal-blue
+    "SURFACE": "#271E0E",  # card brown, one step above the background
+    "SURFACE_RAISED": "#3A2C14",  # hover/fill bronze-brown
+    "BORDER": "#5A4626",  # muted bronze edge, visible against both surface tones
+    "TEXT": "#F4E9CD",  # the light palette's own cream, inverted into the text role
+    "TEXT_MUTED": "#B39B6E",  # warm tan -- muted but readable on dark surfaces
+    "ACCENT": "#E3B52E",  # the same gold family as light's #C8960C, brightened for dark
+    "ACCENT_HOVER": "#F2CB4D",  # lighter on hover (dark-theme convention, not light's deepen)
+    "GOOD": "#63BD6B",  # growth green lifted for dark, still far from the gold hue
+    "LIVE": "#EF7633",  # red-shifted orange, keeping its hue distance from the brighter gold
+    "NEUTRAL": "#9C8B6D",  # warm taupe, same family as light's NEUTRAL, readable on dark
+    "TRACK": "#4A3A1D",  # dark bronze groove / off-toggle track, visible on SURFACE
+    "ON_ACCENT_TEXT": "#2A1F07",  # dark brown on the bright gold -- inverts the light pairing
+}
+
+_ACTIVE_THEME = "light"
+
+
+def current_theme() -> str:
+    """Which palette the module-level constants currently hold: "light" | "dark"."""
+    return _ACTIVE_THEME
+
+
+def apply_theme(dark: bool) -> None:
+    """Rewrite the module-level token constants (BACKGROUND, ACCENT, ...)
+    from the chosen palette, in place.
+
+    Called once at startup BEFORE the QApplication's global stylesheet is
+    first built (so a configured dark mode never flashes light), and again
+    on every live Settings theme flip -- after which cli.py re-applies
+    `build_stylesheet()` and emits `theme_changed` so QSS-styled widgets
+    re-polish and custom-painted widgets repaint against the new values.
+    """
+    global _ACTIVE_THEME
+    globals().update(DARK_TOKENS if dark else LIGHT_TOKENS)
+    _ACTIVE_THEME = "dark" if dark else "light"
+
+
+apply_theme(False)  # establish the module-level constants at import time
 
 MONO_FONT = ("Cascadia Code", "Consolas", "Courier New")
 
@@ -56,7 +120,10 @@ def qfont(size: int = 12, weight: str = "bold", mono: bool = False) -> "QFont":
 
 
 def build_stylesheet() -> str:
-    """QSS applied once, globally, via `QApplication.setStyleSheet(build_stylesheet())`.
+    """QSS applied globally via `QApplication.setStyleSheet(build_stylesheet())`
+    -- once at startup, then again on every live theme switch. Reads the
+    module-level constants at call time, so it always renders whichever
+    palette `apply_theme()` last installed.
 
     Deliberately doesn't try to cover *every* pixel: the Home tab's status
     dot (imperative GOOD/LIVE/NEUTRAL recoloring + pulse animation) and the

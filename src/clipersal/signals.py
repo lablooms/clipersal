@@ -57,3 +57,4 @@ class AppSignals(QObject):
     save_failed = Signal(str)  # a save attempt failed -- arg is the error detail, shown in the Home tab's status card (success already pops a toast via toast_requested, so only failure needs a client-side signal)
     quit_requested = Signal()  # ask the GUI thread to call QApplication.quit() -- see docstring above
     update_available = Signal(str, str)  # version, url -- a newer GitHub release was found; url opens in the browser via the Home tab's dismissible banner
+    theme_changed = Signal()  # theme.apply_theme() already rewrote the tokens -- re-apply the global stylesheet and repaint (emitted from the GUI thread by apply_settings, so queued delivery isn't the point here; keeping it a signal just keeps every UI-affecting event on this one bridge)

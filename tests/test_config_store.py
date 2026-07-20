@@ -79,6 +79,18 @@ def test_persisted_keys_include_audio_volumes() -> None:
     assert "mic_volume" in PERSISTED_KEYS
 
 
+def test_persisted_keys_include_dark_mode() -> None:
+    assert "dark_mode" in PERSISTED_KEYS
+
+
+def test_save_then_load_round_trips_dark_mode(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+
+    save_overrides({"dark_mode": True}, path)
+
+    assert load_overrides(path) == {"dark_mode": True}
+
+
 def test_save_then_load_round_trips_audio_volumes(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
 

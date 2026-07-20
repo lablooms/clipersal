@@ -1,7 +1,7 @@
 """Settings tab -- the biggest single tab. Cards are laid out in a
 two-column split (via two QVBoxLayouts inside a QHBoxLayout) -- Capture +
-Save & hotkey on the left, Encoder + Clip management on the right -- for a
-roughly-16:9 panel shape.
+Save & hotkey on the left, Encoder + Clip management + Appearance on the
+right -- for a roughly-16:9 panel shape.
 
 The Monitor/Window sub-panels under "Capture target" and the bitrate slider
 under "Quality preset" are shown/hidden with plain `.setVisible(bool)`; Qt's
@@ -155,6 +155,7 @@ class SettingsFrame(QWidget):
         self._build_save_hotkey_card(left_layout, config)
         self._build_encoder_card(right_layout, config, current_encoder)
         self._build_clip_management_card(right_layout, config)
+        self._build_appearance_card(right_layout, config)
 
         left_layout.addStretch()
         right_layout.addStretch()
@@ -546,6 +547,32 @@ class SettingsFrame(QWidget):
         clips_layout.addWidget(self.retention_slider)
         self._hint(clips_layout, "0 = keep forever; older clips are deleted automatically otherwise", card)
 
+    # ---- Appearance card ---------------------------------------------------
+
+    def _build_appearance_card(self, right_layout: QVBoxLayout, config: Config) -> None:
+        appearance_layout = self._make_card(right_layout, "Appearance")
+        card = appearance_layout.parentWidget()
+
+        # Same row shape as the launch-on-startup / check-for-updates toggles
+        # in the Save & hotkey card. Applying the flip live (no app restart)
+        # is cli.py's apply_settings job via theme.apply_theme + the
+        # theme_changed signal -- from this widget's side it's just another
+        # field in the Save payload.
+        dark_row = QHBoxLayout()
+        appearance_layout.addLayout(dark_row)
+        dark_text_col = QVBoxLayout()
+        dark_row.addLayout(dark_text_col, 1)
+        dark_text_col.addWidget(self._bold_label("Dark mode", card))
+        dark_desc = QLabel("Warm dark variant of the gold theme", card)
+        dark_desc.setObjectName("hint")
+        # Word-wrap like the encoder card's description: an unwrapped hint
+        # this long inflates the right column's minimum width past the
+        # scroll viewport and pushes the switch itself out of view.
+        dark_desc.setWordWrap(True)
+        dark_text_col.addWidget(dark_desc)
+        self.dark_mode_switch = ToggleSwitch(card, checked=config.dark_mode)
+        dark_row.addWidget(self.dark_mode_switch)
+
     # ---- save ---------------------------------------------------------------
 
     def _set_status(self, text: str, state: str) -> None:
@@ -623,6 +650,7 @@ class SettingsFrame(QWidget):
                 "clip_retention_days": self.retention_slider.value(),
                 "launch_on_startup": self.launch_on_startup_switch.isChecked(),
                 "check_for_updates": self.check_for_updates_switch.isChecked(),
+                "dark_mode": self.dark_mode_switch.isChecked(),
             }
         )
         if error:

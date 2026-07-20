@@ -42,13 +42,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from clipersal import __version__, ipc_client, thumbnails, update_check
+from clipersal import __version__, ipc_client, theme, thumbnails, update_check
 from clipersal.brand import BrandMark, SprigAccent
 from clipersal.config import Config
 from clipersal.gallery_window_qt import ThumbnailWorker, build_gallery_frame
 from clipersal.settings_window_qt import build_settings_frame
 from clipersal.status_dot import StatusDot
-from clipersal.theme import GOOD, LIVE, NEUTRAL
 from clipersal.theme import qfont as _qfont
 from clipersal.tray import open_folder
 
@@ -264,7 +263,11 @@ class MainWindow(QWidget):
         status_row = QHBoxLayout(status_card)
         status_row.setContentsMargins(20, 18, 20, 18)
 
-        self._status_dot = StatusDot(size=36, dot_diameter=14, color=GOOD, parent=status_card)
+        # Read the status colors through the theme module at call time, never
+        # a by-value `from theme import GOOD`: apply_theme() rewrites the
+        # module attributes on a theme switch, and a by-value import would
+        # keep handing the dot the OLD palette's hex strings forever.
+        self._status_dot = StatusDot(size=36, dot_diameter=14, color=theme.GOOD, parent=status_card)
         status_row.addWidget(self._status_dot)
 
         status_text_col = QVBoxLayout()
@@ -474,22 +477,22 @@ class MainWindow(QWidget):
         if response is None:
             return
         if "CRASHED" in response:
-            self._set_status_dot(LIVE)
+            self._set_status_dot(theme.LIVE)
             self._status_label.setText("Capture stopped -- see Logs")
             self._pause_button.setText("Resume")
         elif "PAUSED" in response:
-            self._set_status_dot(NEUTRAL)
+            self._set_status_dot(theme.NEUTRAL)
             self._status_label.setText("Paused")
             self._pause_button.setText("Resume")
         else:
-            self._set_status_dot(GOOD)
+            self._set_status_dot(theme.GOOD)
             self._status_label.setText("Recording")
             self._pause_button.setText("Pause")
 
     def _run_pulse(self, step: int = 0) -> None:
         if step >= _PULSE_STEPS:
             self._pulsing = False
-            self._set_status_dot(GOOD)
+            self._set_status_dot(theme.GOOD)
             self._status_label.setText("Recording")
             return
         if step == 0:
@@ -497,8 +500,8 @@ class MainWindow(QWidget):
             # the old repeated color-toggle loop -- the "seed dispersal"
             # motion itself now carries the pulse's visual interest across
             # the remaining steps' wait, not a flickering color swap.
-            self._set_status_dot(LIVE)
-            self._status_dot.pulse(LIVE)
+            self._set_status_dot(theme.LIVE)
+            self._status_dot.pulse(theme.LIVE)
         QTimer.singleShot(_PULSE_STEP_MS, lambda: self._run_pulse(step + 1))
 
     def on_save_completed(self) -> None:

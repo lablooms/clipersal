@@ -57,6 +57,7 @@ class Config:
     clip_retention_days: int = 0  # 0 = keep saved clips forever
     launch_on_startup: bool = False
     check_for_updates: bool = True
+    dark_mode: bool = False  # False = the original light Pollen Gold theme (pre-dark-mode behavior)
 
     def __post_init__(self) -> None:
         self.clips_dir = Path(self.clips_dir).expanduser()
@@ -210,6 +211,12 @@ def build_arg_parser(persisted: dict[str, Any] | None = None) -> argparse.Argume
         default=persisted.get("check_for_updates", True),
         help="Check GitHub Releases for a newer version at startup and show a notice if found (default: %(default)s)",
     )
+    parser.add_argument(
+        "--dark-mode",
+        action=argparse.BooleanOptionalAction,
+        default=persisted.get("dark_mode", False),
+        help="Use the dark Pollen Gold theme instead of the light one (default: %(default)s)",
+    )
     return parser
 
 
@@ -235,6 +242,7 @@ def config_from_args(args: argparse.Namespace) -> Config:
         clip_retention_days=args.clip_retention_days,
         launch_on_startup=args.launch_on_startup,
         check_for_updates=args.check_for_updates,
+        dark_mode=args.dark_mode,
     )
     if args.buffer_dir is not None:
         kwargs["buffer_dir"] = args.buffer_dir

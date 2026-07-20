@@ -61,6 +61,16 @@ def test_quit_requested_takes_no_arguments() -> None:
     assert call_count["n"] == 1
 
 
+def test_theme_changed_takes_no_arguments() -> None:
+    signals = AppSignals()
+    call_count = {"n": 0}
+    signals.theme_changed.connect(lambda: call_count.__setitem__("n", call_count["n"] + 1))
+
+    signals.theme_changed.emit()
+
+    assert call_count["n"] == 1
+
+
 def test_update_available_carries_version_and_url() -> None:
     signals = AppSignals()
     received = []

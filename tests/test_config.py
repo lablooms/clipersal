@@ -101,6 +101,34 @@ def test_check_for_updates_cli_flag_overrides_persisted() -> None:
     assert config.check_for_updates is False
 
 
+def test_dark_mode_defaults_false() -> None:
+    # False = today's light theme, so an old config file (no dark_mode key)
+    # keeps producing the pre-dark-mode UI -- the Phase 8 default rule.
+    args = build_arg_parser(persisted={}).parse_args([])
+    config = config_from_args(args)
+
+    assert config.dark_mode is False
+
+
+def test_dark_mode_persisted_value_used() -> None:
+    args = build_arg_parser(persisted={"dark_mode": True}).parse_args([])
+    config = config_from_args(args)
+
+    assert config.dark_mode is True
+
+
+def test_dark_mode_cli_flag_overrides_persisted() -> None:
+    args = build_arg_parser(persisted={"dark_mode": False}).parse_args(["--dark-mode"])
+    config = config_from_args(args)
+
+    assert config.dark_mode is True
+
+    args = build_arg_parser(persisted={"dark_mode": True}).parse_args(["--no-dark-mode"])
+    config = config_from_args(args)
+
+    assert config.dark_mode is False
+
+
 def test_quality_preset_persisted_value_used() -> None:
     args = build_arg_parser(persisted={"quality_preset": "quality"}).parse_args([])
     config = config_from_args(args)

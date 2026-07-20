@@ -34,6 +34,7 @@ from clipersal import (
     ipc,
     ipc_client,
     platform_detect,
+    theme,
     thumbnails,
     update_check,
 )
@@ -95,16 +96,15 @@ def _configure_logging() -> Path:
 
 def _ensure_qapplication():
     """Returns the shared QApplication instance, constructing it (and
-    applying the app's stylesheet) the first time this is called. None if
-    PySide6 isn't installed.
+    applying the app's stylesheet, built from theme.py's CURRENT tokens --
+    main() applies the configured mode before the first call here) the
+    first time this is called. None if PySide6 isn't installed.
     """
     if QApplication is None:
         return None
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
-        from clipersal import theme
-
         app.setStyleSheet(theme.build_stylesheet())
     return app
 
@@ -177,10 +177,17 @@ class _AppState:
 
 def main(argv: list[str] | None = None) -> int:
     log_path = _configure_logging()
-    app = _ensure_qapplication()
 
     args = build_arg_parser().parse_args(argv)
     config = config_from_args(args)
+
+    # The palette must be settled BEFORE the shared QApplication exists:
+    # _ensure_qapplication builds the global stylesheet from theme.py's
+    # current tokens the first time it constructs the app, so applying the
+    # configured mode up here means a dark-mode launch never flashes light.
+    # theme.py imports no Qt at runtime, so this is safe headless too.
+    theme.apply_theme(config.dark_mode)
+    app = _ensure_qapplication()
 
     if _another_instance_running(config.ipc_port):
         _show_already_running_message(config.ipc_port)
@@ -256,6 +263,21 @@ def main(argv: list[str] | None = None) -> int:
     app_signals = AppSignals() if app is not None else None
     if app_signals is not None:
         app_signals.quit_requested.connect(app.quit)
+
+        def _on_theme_changed() -> None:
+            # Rebuild the global stylesheet from the tokens apply_theme()
+            # just rewrote: Qt re-polishes every widget on setStyleSheet(),
+            # so all objectName/property selectors pick up the new palette
+            # in place. The explicit update() sweep covers the
+            # custom-painted widgets (ToggleSwitch, BrandMark, SprigAccent,
+            # StatusDot) whose paintEvents read theme tokens directly --
+            # with no QSS rules of their own there is nothing to re-polish,
+            # so schedule their repaint by hand.
+            app.setStyleSheet(theme.build_stylesheet())
+            for top_level in app.topLevelWidgets():
+                top_level.update()
+
+        app_signals.theme_changed.connect(_on_theme_changed)
 
     def handle_save(arg: str | None = None) -> str:
         # arg, if given, is a "save just the last N seconds" trim request
@@ -441,6 +463,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         needs_hotkey_rebind = new_values["hotkey_combo"] != config.hotkey_combo
         needs_autostart_change = new_values["launch_on_startup"] != config.launch_on_startup
+        needs_theme_change = new_values["dark_mode"] != config.dark_mode
 
         # Resolve the new capture setup BEFORE mutating config or stopping
         # the running session. Resolution is where a bad capture setting
@@ -484,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
         config.clip_retention_days = new_values["clip_retention_days"]
         config.launch_on_startup = new_values["launch_on_startup"]
         config.check_for_updates = new_values["check_for_updates"]
+        config.dark_mode = new_values["dark_mode"]
 
         if needs_autostart_change and autostart.is_supported(os_):
             try:
@@ -503,6 +527,17 @@ def main(argv: list[str] | None = None) -> int:
 
         if needs_hotkey_rebind:
             rebind_hotkey()
+
+        if needs_theme_change:
+            # A pure-GUI setting -- nothing in the ffmpeg command line -- so
+            # it takes the live-mutate path (like buffer_seconds), never a
+            # capture restart. apply_theme() rewrites theme.py's token
+            # constants in place; the _on_theme_changed slot connected in
+            # main() then rebuilds the global stylesheet and repaints, so
+            # the whole app switches without a relaunch.
+            theme.apply_theme(config.dark_mode)
+            if app_signals is not None:
+                app_signals.theme_changed.emit()
 
         concat.enforce_clip_retention(config.clips_dir, config.clip_retention_days)
 
@@ -524,6 +559,7 @@ def main(argv: list[str] | None = None) -> int:
                 "clip_retention_days": config.clip_retention_days,
                 "launch_on_startup": config.launch_on_startup,
                 "check_for_updates": config.check_for_updates,
+                "dark_mode": config.dark_mode,
             }
         )
         return None

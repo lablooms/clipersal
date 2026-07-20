@@ -441,6 +441,22 @@ def test_save_payload_check_for_updates_reflects_switch(tmp_path: Path) -> None:
     assert captured["check_for_updates"] is True
 
 
+# ---- appearance (dark mode) ---------------------------------------------------
+
+
+def test_dark_mode_switch_reflects_config(tmp_path: Path) -> None:
+    assert _build(tmp_path).dark_mode_switch.isChecked() is False
+    assert _build(tmp_path, dark_mode=True).dark_mode_switch.isChecked() is True
+
+
+def test_save_payload_dark_mode_reflects_switch(tmp_path: Path) -> None:
+    captured = {}
+    frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None)
+    frame.dark_mode_switch.click()
+    frame._on_save()
+    assert captured["dark_mode"] is True
+
+
 # ---- saving while the hotkey recorder is mid-capture ------------------------
 
 

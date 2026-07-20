@@ -2,8 +2,8 @@
 
 Only the settings exposed in the Settings window are persisted: buffer
 length, clips folder, hotkey combo, video bitrate, quality preset, encoder
-override, filename template, clip retention (days), launch-on-startup, and
-check-for-updates.
+override, filename template, clip retention (days), launch-on-startup,
+check-for-updates, and dark mode.
 `config.py`
 loads this once at import time to seed argparse defaults (so precedence is
 CLI flag > config file > hardcoded default), and the Settings window writes
@@ -37,6 +37,7 @@ PERSISTED_KEYS = (
     "clip_retention_days",
     "launch_on_startup",
     "check_for_updates",
+    "dark_mode",
 )
 
 
