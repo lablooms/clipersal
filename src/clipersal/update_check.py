@@ -210,13 +210,22 @@ def check_for_update_once(
             return _cached_result(cache, current_version)
 
         release = fetch_latest_release(repo, fetch=fetch)
+        if release is None:
+            # The fetch failed (or the repo genuinely has no releases yet --
+            # either way nothing new is known). Two things must NOT happen
+            # here: last_checked must not be stamped, or one transient
+            # network error would suppress retries for a full 24h; and any
+            # previously cached, still-undismissed update must not be
+            # dropped, or its banner flickers off for exactly this one
+            # launch. Serving the cache again handles both.
+            return _cached_result(cache, current_version)
+
         cache["last_checked"] = now_ts
-        if release is not None:
-            cache["available_version"] = release.version
-            cache["available_url"] = release.url
+        cache["available_version"] = release.version
+        cache["available_url"] = release.url
         save_cache(cache, cache_path)
 
-        return _cached_result(cache, current_version) if release is not None else None
+        return _cached_result(cache, current_version)
     except Exception:  # noqa: BLE001 -- a background update check must never crash or hang startup
         log.exception("Update check failed")
         return None

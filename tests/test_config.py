@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from clipersal.config import build_arg_parser, config_from_args
+from clipersal.config_store import load_overrides
 
 
 def test_hardcoded_defaults_used_when_nothing_persisted_and_no_cli_flags() -> None:
@@ -188,3 +189,18 @@ def test_user_supplied_buffer_dir_is_not_marked_for_cleanup(tmp_path: Path) -> N
 
     assert config.buffer_dir == tmp_path / "buf"
     assert config.buffer_dir_is_temp is False
+
+
+def test_wrong_typed_persisted_config_does_not_crash_startup_parsing(tmp_path: Path) -> None:
+    # The reported bug: wrong-typed values in a hand-edited config used to
+    # kill startup -- argparse SystemExit on {"buffer_seconds": "abc"} (a str
+    # default converted through type=int), TypeError on {"clips_dir": 123} in
+    # Path(). load_overrides now drops those values, so parsing falls back to
+    # the hardcoded defaults, same as a corrupt-JSON config.
+    path = tmp_path / "config.json"
+    path.write_text('{"buffer_seconds": "abc", "clips_dir": 123}', encoding="utf-8")
+
+    args = build_arg_parser(persisted=load_overrides(path)).parse_args([])
+
+    assert args.buffer_seconds == 60
+    assert args.clips_dir == Path.home() / "Videos" / "Clipersal"

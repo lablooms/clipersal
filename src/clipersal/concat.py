@@ -26,6 +26,13 @@ log = logging.getLogger(__name__)
 _CONCAT_TIMEOUT = 60  # seconds; generous since this is a fast stream copy
 _TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{(date|time|datetime)\}")
 _INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*]')
+# Windows reserves these device basenames in EVERY folder, case-insensitively
+# and ignoring any extension: "NUL.mp4" opens the null device, not a file. A
+# template rendering to one of these would make ffmpeg "succeed" while writing
+# nothing -- a save that reports OK yet no clip exists anywhere.
+_RESERVED_DEVICE_BASENAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+)
 
 
 class EmptyBufferError(RuntimeError):
@@ -44,9 +51,10 @@ def render_filename(template: str, now: datetime | None = None) -> str:
     """Render a clip filename (without extension) from a template like
     "clip-{date}-{time}" -- the default reproduces the original hardcoded
     "clip-YYYYMMDD-HHMMSS" name exactly, so existing configs/scripts see no
-    behavior change. Falls back to "clip" for a template that renders empty
-    or to nothing but dots/invalid characters, rather than producing an
-    unusable filename from a bad hand-edited config.
+    behavior change. Falls back to "clip" for a template that renders empty,
+    to nothing but dots/invalid characters, or to a Windows reserved device
+    name, rather than producing an unusable filename from a bad hand-edited
+    config.
     """
     now = now or datetime.now()
     values = {
@@ -56,6 +64,11 @@ def render_filename(template: str, now: datetime | None = None) -> str:
     }
     name = _TEMPLATE_PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], template)
     name = _INVALID_FILENAME_CHARS_RE.sub("_", name).strip().strip(".")
+    # Windows matches reserved device names on the stem alone ("nul",
+    # "NUL.txt", "com1" all hit the device -- see _RESERVED_DEVICE_BASENAMES),
+    # so compare uppercased with anything from the first dot on stripped off.
+    if name.upper().split(".")[0] in _RESERVED_DEVICE_BASENAMES:
+        name = ""
     return name or "clip"
 
 
@@ -164,10 +177,19 @@ def save_clip(
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=_CONCAT_TIMEOUT, **NO_WINDOW_KWARGS)
+    except subprocess.TimeoutExpired:
+        # ffmpeg creates the output file up front (-y), so a failed or
+        # timed-out remux leaves a partial .mp4 behind: it shows up in the
+        # gallery as a clip that won't play, and it holds the base name, so
+        # the next successful save gets a pointless -1 suffix. Delete it on
+        # every failure path.
+        output_path.unlink(missing_ok=True)
+        raise
     finally:
         list_file.unlink(missing_ok=True)
 
     if result.returncode != 0:
+        output_path.unlink(missing_ok=True)
         raise ConcatFailedError(f"ffmpeg concat failed:\n{result.stderr.strip()[-1000:]}")
 
     log.info("Saved clip: %s (%d segments)", output_path, len(finalized))
@@ -236,8 +258,16 @@ def trim_clip(
         str(output_path),
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=_CONCAT_TIMEOUT, **NO_WINDOW_KWARGS)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_CONCAT_TIMEOUT, **NO_WINDOW_KWARGS)
+    except subprocess.TimeoutExpired:
+        # Same partial-output leak as save_clip: ffmpeg has already created
+        # the output file by the time it can fail, so a broken "-trimmed.mp4"
+        # would otherwise be left in clips_dir looking like a real clip.
+        output_path.unlink(missing_ok=True)
+        raise
     if result.returncode != 0:
+        output_path.unlink(missing_ok=True)
         raise ConcatFailedError(f"ffmpeg trim failed:\n{result.stderr.strip()[-1000:]}")
 
     log.info("Saved trimmed clip: %s (%.3fs-%.3fs of %s)", output_path, start_seconds, end_seconds, clip_path.name)

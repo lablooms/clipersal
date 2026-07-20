@@ -356,6 +356,67 @@ def test_check_for_update_once_never_raises_when_fetch_raises(tmp_path: Path) ->
     assert result is None
 
 
+def test_check_for_update_once_does_not_stamp_last_checked_when_fetch_fails(tmp_path: Path) -> None:
+    # A failed fetch must not count as a completed check -- otherwise one
+    # transient network error would suppress retries for a full 24h.
+    cache_path = tmp_path / "cache.json"
+
+    def failing_fetch(url: str) -> bytes:
+        raise OSError("network down")
+
+    result = update_check.check_for_update_once(
+        repo="lablooms/clipersal", current_version="0.1.0", now=1000.0, cache_path=cache_path, fetch=failing_fetch
+    )
+
+    assert result is None
+    assert "last_checked" not in update_check.load_cache(cache_path)
+
+    # ...so the very next launch really does retry the network instead of
+    # being throttled by a phantom stamp.
+    calls = []
+
+    def working_fetch(url: str) -> bytes:
+        calls.append(url)
+        return b'[{"tag_name": "v0.2.0", "html_url": "https://example.invalid/v0.2.0"}]'
+
+    result = update_check.check_for_update_once(
+        repo="lablooms/clipersal", current_version="0.1.0", now=1000.0 + 60, cache_path=cache_path, fetch=working_fetch
+    )
+
+    assert calls != []
+    assert result == ("v0.2.0", "https://example.invalid/v0.2.0")
+
+
+def test_check_for_update_once_serves_cached_update_when_fetch_fails(tmp_path: Path) -> None:
+    # A non-throttled check whose fetch fails must fall back to the cached,
+    # still-undismissed update -- otherwise the banner flickers off for
+    # exactly one launch on every transient network error.
+    cache_path = tmp_path / "cache.json"
+    update_check.save_cache(
+        {"last_checked": 1000.0, "available_version": "v0.2.0", "available_url": "https://example.invalid/v0.2.0"},
+        cache_path,
+    )
+    calls = []
+
+    def failing_fetch(url: str) -> bytes:
+        calls.append(url)
+        raise OSError("network down")
+
+    result = update_check.check_for_update_once(
+        repo="lablooms/clipersal",
+        current_version="0.1.0",
+        now=1000.0 + update_check._CHECK_INTERVAL_SECONDS + 1,  # past the throttle: fetch really is attempted
+        cache_path=cache_path,
+        fetch=failing_fetch,
+    )
+
+    assert calls != []
+    assert result == ("v0.2.0", "https://example.invalid/v0.2.0")
+    # The failed attempt was not a completed check: last_checked keeps its old
+    # value so the next launch retries the fetch.
+    assert update_check.load_cache(cache_path)["last_checked"] == 1000.0
+
+
 def test_check_for_update_once_never_raises_when_cache_path_unwritable(tmp_path: Path) -> None:
     # A directory where a file is expected -- save_cache's open() call raises,
     # which check_for_update_once's top-level try/except must swallow.

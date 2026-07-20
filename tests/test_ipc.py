@@ -1,5 +1,6 @@
 import socket
 import sys
+import threading
 
 import pytest
 
@@ -62,6 +63,56 @@ def test_handler_exception_returns_error_not_crash(running_server: IpcServer) ->
     # Server must still be alive and answering after a handler raised.
     running_server.register("PING", lambda arg: "PONG")
     assert send_command("PING", port=running_server.port) == "OK PONG"
+
+
+def test_error_response_with_embedded_newlines_arrives_as_one_line(running_server: IpcServer) -> None:
+    # ConcatFailedError carries ffmpeg's stderr, newlines and all. The
+    # protocol is one response per line and the client does a single
+    # readline(), so the server must collapse them -- otherwise the client
+    # gets only "ERROR <first line>" and the actual cause is silently dropped.
+    def boom(arg) -> str:
+        raise RuntimeError("first line\nsecond line\r\nthird line")
+
+    running_server.register("SAVE", boom)
+
+    response = send_command("SAVE", port=running_server.port)
+
+    assert response == "ERROR first line | second line | third line"
+
+
+def test_ok_response_with_embedded_newlines_arrives_as_one_line(running_server: IpcServer) -> None:
+    running_server.register("SAVE", lambda arg: "C:/clips/clip.mp4\nextra detail")
+
+    response = send_command("SAVE", port=running_server.port)
+
+    assert response == "OK C:/clips/clip.mp4 | extra detail"
+
+
+def test_client_tolerates_non_utf8_response_bytes() -> None:
+    # A foreign service answering on the port with non-UTF-8 bytes must not
+    # crash the client with UnicodeDecodeError -- cli.py's
+    # _another_instance_running only catches IpcClientError, so that would
+    # kill startup. The garbled line simply isn't an "OK ...".
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def serve_once() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            conn.recv(1024)
+            conn.sendall(b"\xff\xfe binary garbage\n")
+
+    thread = threading.Thread(target=serve_once, daemon=True)
+    thread.start()
+    try:
+        response = send_command("PING", port=port)
+    finally:
+        listener.close()
+    thread.join(timeout=5)
+
+    assert not response.startswith("OK")
 
 
 def test_command_is_case_insensitive(running_server: IpcServer) -> None:

@@ -40,7 +40,12 @@ def send_command(
     try:
         with socket.create_connection((host, port), timeout=timeout) as sock:
             sock.sendall(f"{line}\n".encode("utf-8"))
-            response = sock.makefile("r", encoding="utf-8").readline()
+            # errors="replace": a foreign process answering on the port with
+            # non-UTF-8 bytes must not raise UnicodeDecodeError out of here --
+            # cli.py's _another_instance_running only catches IpcClientError,
+            # so a decode error would crash startup. The garbled replacement
+            # line simply isn't an "OK ..." and the port reads as not-ours.
+            response = sock.makefile("r", encoding="utf-8", errors="replace").readline()
     except OSError as exc:
         raise IpcClientError(
             f"Could not reach clipersal's IPC server at {host}:{port}: {exc}. Is clipersal running?"

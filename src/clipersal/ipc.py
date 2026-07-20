@@ -36,6 +36,16 @@ class IpcServerBindError(RuntimeError):
     pass
 
 
+def _one_line(text: object) -> str:
+    """Collapse a possibly multi-line message into a single line. The protocol
+    is one response per line and the client does a single readline(), so an
+    exception carrying ffmpeg's stderr (ConcatFailedError) would otherwise
+    arrive truncated at its first newline -- the client would report a bare
+    "ERROR ffmpeg concat failed:" with the actual cause silently dropped.
+    """
+    return " | ".join(str(text).splitlines())
+
+
 class _Handler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         raw = self.rfile.readline()
@@ -55,9 +65,9 @@ class _Handler(socketserver.StreamRequestHandler):
             result = handler(arg)
         except Exception as exc:  # noqa: BLE001 -- report to the client, don't crash the server
             log.warning("IPC handler for %s raised: %s", command, exc)
-            self.wfile.write(f"ERROR {exc}\n".encode("utf-8"))
+            self.wfile.write(f"ERROR {_one_line(exc)}\n".encode("utf-8"))
             return
-        line = f"OK {result}\n" if result else "OK\n"
+        line = f"OK {_one_line(result)}\n" if result else "OK\n"
         self.wfile.write(line.encode("utf-8"))
 
 

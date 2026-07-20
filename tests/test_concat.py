@@ -242,6 +242,20 @@ def test_render_filename_falls_back_to_clip_when_template_renders_empty() -> Non
     assert render_filename("...") == "clip"
 
 
+def test_render_filename_falls_back_to_clip_for_windows_reserved_device_names() -> None:
+    # A template rendering to a reserved device basename would make ffmpeg
+    # "succeed" writing to the device instead of a file -- the save reports
+    # OK but no clip exists. Case-insensitive, with or without an extension.
+    for reserved in ("NUL", "nul", "CON", "con", "PRN", "AUX", "COM1", "com5", "LPT1", "lpt9", "NUL.txt"):
+        assert render_filename(reserved) == "clip", reserved
+
+
+def test_render_filename_keeps_names_that_merely_start_with_a_reserved_word() -> None:
+    assert render_filename("nully") == "nully"
+    assert render_filename("console") == "console"
+    assert render_filename("com10") == "com10"
+
+
 def test_unique_output_path_appends_counter_on_collision(tmp_path: Path) -> None:
     (tmp_path / "clip-test.mp4").write_bytes(b"existing")
 
@@ -458,3 +472,105 @@ def test_trim_clip_raises_concat_failed_with_truncated_stderr(tmp_path: Path, mo
     assert message.startswith("ffmpeg trim failed:")
     assert "x" * 1000 in message
     assert "x" * 1001 not in message
+
+
+# ---- partial-output cleanup on failure --------------------------------------
+
+
+def _fake_run_creating_partial_output(returncode: int = 0, stderr: str = "", hang: bool = False):
+    """Stand-in for subprocess.run mimicking ffmpeg's real failure shape:
+    with -y it creates the output file up front, so a failed or timed-out
+    remux leaves a partial .mp4 behind unless the caller deletes it."""
+
+    def fake_run(cmd, **kwargs):
+        Path(cmd[-1]).write_bytes(b"partial ffmpeg output")
+        if hang:
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+        return SimpleNamespace(returncode=returncode, stderr=stderr)
+
+    return fake_run
+
+
+def _save_dirs_with_two_finalized_segments(tmp_path: Path) -> tuple[Path, Path]:
+    buffer_dir = tmp_path / "buffer"
+    clips_dir = tmp_path / "clips"
+    buffer_dir.mkdir()
+    clips_dir.mkdir()
+    _touch(buffer_dir / "seg-20260101-000100.ts")
+    _touch(buffer_dir / "seg-20260101-000200.ts")
+    _touch(buffer_dir / "seg-20260101-000300.ts")  # newest -- excluded from the save
+    return buffer_dir, clips_dir
+
+
+def test_save_clip_deletes_partial_output_when_ffmpeg_fails(tmp_path: Path, monkeypatch) -> None:
+    buffer_dir, clips_dir = _save_dirs_with_two_finalized_segments(tmp_path)
+    monkeypatch.setattr(
+        concat_module.subprocess, "run", _fake_run_creating_partial_output(returncode=1, stderr="boom")
+    )
+
+    with pytest.raises(ConcatFailedError):
+        save_clip("ffmpeg", buffer_dir, clips_dir)
+
+    assert list(clips_dir.iterdir()) == []
+
+
+def test_save_clip_deletes_partial_output_when_ffmpeg_times_out(tmp_path: Path, monkeypatch) -> None:
+    buffer_dir, clips_dir = _save_dirs_with_two_finalized_segments(tmp_path)
+    monkeypatch.setattr(concat_module.subprocess, "run", _fake_run_creating_partial_output(hang=True))
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        save_clip("ffmpeg", buffer_dir, clips_dir)
+
+    assert list(clips_dir.iterdir()) == []
+
+
+def test_save_clip_keeps_output_on_success(tmp_path: Path, monkeypatch) -> None:
+    buffer_dir, clips_dir = _save_dirs_with_two_finalized_segments(tmp_path)
+    monkeypatch.setattr(concat_module.subprocess, "run", _fake_run_creating_partial_output())
+
+    output_path = save_clip("ffmpeg", buffer_dir, clips_dir)
+
+    assert output_path.exists()
+    assert output_path.read_bytes() == b"partial ffmpeg output"
+
+
+def test_trim_clip_deletes_partial_output_when_ffmpeg_fails(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake mp4 data")
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    monkeypatch.setattr(
+        concat_module.subprocess, "run", _fake_run_creating_partial_output(returncode=1, stderr="boom")
+    )
+
+    with pytest.raises(ConcatFailedError):
+        trim_clip("ffmpeg", clip, 1.0, 2.0, clips_dir, duration_seconds=60.0)
+
+    assert list(clips_dir.iterdir()) == []
+    assert clip.exists()  # the original clip is never touched
+
+
+def test_trim_clip_deletes_partial_output_when_ffmpeg_times_out(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake mp4 data")
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    monkeypatch.setattr(concat_module.subprocess, "run", _fake_run_creating_partial_output(hang=True))
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        trim_clip("ffmpeg", clip, 1.0, 2.0, clips_dir, duration_seconds=60.0)
+
+    assert list(clips_dir.iterdir()) == []
+
+
+def test_trim_clip_keeps_output_on_success(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake mp4 data")
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    monkeypatch.setattr(concat_module.subprocess, "run", _fake_run_creating_partial_output())
+
+    output_path = trim_clip("ffmpeg", clip, 1.0, 2.0, clips_dir, duration_seconds=60.0)
+
+    assert output_path.exists()
+    assert output_path.read_bytes() == b"partial ffmpeg output"
