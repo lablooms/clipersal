@@ -509,6 +509,7 @@ def main(argv: list[str] | None = None) -> int:
         config.check_for_updates = new_values["check_for_updates"]
         config.dark_mode = new_values["dark_mode"]
 
+        autostart_error = None
         if needs_autostart_change and autostart.is_supported(os_):
             try:
                 if config.launch_on_startup:
@@ -516,7 +517,16 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     autostart.disable(os_)
             except OSError as exc:
-                log.warning("Could not update launch-on-startup registration: %s", exc)
+                # Registration failed, so the OS won't do what the toggle
+                # says. Revert the config field to its previous (real)
+                # state before it's persisted below -- otherwise the file
+                # would record intent as fact, the Settings toggle would
+                # keep showing "on" (see SettingsFrame's build-time
+                # reconciliation against autostart.is_enabled), and
+                # needs_autostart_change would never fire again to retry.
+                config.launch_on_startup = not config.launch_on_startup
+                autostart_error = f"Could not update launch-on-startup registration: {exc}"
+                log.warning("%s", autostart_error)
 
         if needs_capture_restart:
             # new_setup was resolved above, before config was mutated -- it
@@ -562,7 +572,10 @@ def main(argv: list[str] | None = None) -> int:
                 "dark_mode": config.dark_mode,
             }
         )
-        return None
+        # Everything else applied cleanly; a failed autostart registration
+        # still surfaces as an error so the Settings tab doesn't show a
+        # hollow "Settings saved." over a toggle that didn't take effect.
+        return autostart_error
 
     # The main window is built once, eagerly, right here -- Clipersal is a
     # real, always-present app window (like OBS), so its whole UI

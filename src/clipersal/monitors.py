@@ -1,10 +1,15 @@
 """Monitor enumeration for multi-monitor capture.
 
-`list_monitors` returns physical displays in an order that lines up with
-ffmpeg_utils' `monitor_index` -- index 0 is whatever Windows/X11 itself
-considers monitor 0 (usually, but not guaranteed to be, the primary
-display), same as ddagrab's own `output_idx` numbering. That's deliberate:
-it means `Config.monitor_index = 0` (the default) needs zero new code in
+`list_monitors` returns physical displays in the order the OS hands them
+over, and ffmpeg_utils' `monitor_index` indexes into exactly that order --
+index 0 is whatever Windows/X11 itself considers monitor 0 (usually, but
+not guaranteed to be, the primary display). On Windows this order USUALLY
+lines up with the `output_idx` numbering ddagrab captures by, but
+"usually" is the honest word: EnumDisplayMonitors' order is unspecified by
+the OS, and it is a different enumeration from the DXGI EnumOutputs one
+ddagrab numbers by, so nothing here may rely on the two matching. Either
+way the common cases stay right: a single monitor, or
+`Config.monitor_index = 0` (the default), needs zero new code in
 ffmpeg_utils' capture-source builders to keep behaving exactly as it did
 before monitor selection existed.
 
@@ -21,6 +26,7 @@ import ctypes
 import logging
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 
 from clipersal.platform_detect import OS
@@ -41,6 +47,53 @@ class MonitorInfo:
     is_primary: bool
 
 
+class _RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+class _MONITORINFOEX(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("rcMonitor", _RECT),
+        ("rcWork", _RECT),
+        ("dwFlags", ctypes.c_ulong),
+        ("szDevice", ctypes.c_wchar * 32),
+    ]
+
+
+_MONITORINFOF_PRIMARY = 0x1
+
+# ctypes defaults every undeclared argument to C int, which TRUNCATES 64-bit
+# handles: an HMONITOR that doesn't fit in 32 bits would arrive mangled back
+# into GetMonitorInfoW, and the resulting ctypes.ArgumentError inside the
+# enum callback is printed and swallowed by ctypes' foreign-callback
+# machinery -- the enumeration silently stops early. Declaring argtypes /
+# restype once, with the real handle types, keeps 64-bit values intact end
+# to end. With today's small handle values nothing changes; this only
+# matters where a handle exceeds 32 bits. (Guarded: ctypes.windll and
+# WINFUNCTYPE only exist on Windows, and this module imports fine on Linux.)
+if sys.platform == "win32":
+    from ctypes import wintypes
+
+    _MonitorEnumProc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(_RECT), wintypes.LPARAM
+    )
+    ctypes.windll.user32.EnumDisplayMonitors.argtypes = [
+        wintypes.HDC,
+        ctypes.POINTER(_RECT),
+        _MonitorEnumProc,
+        wintypes.LPARAM,
+    ]
+    ctypes.windll.user32.EnumDisplayMonitors.restype = wintypes.BOOL
+    ctypes.windll.user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(_MONITORINFOEX)]
+    ctypes.windll.user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+
 def list_monitors(os_: OS) -> list[MonitorInfo]:
     if os_ == OS.WINDOWS:
         return _list_windows_monitors()
@@ -51,28 +104,6 @@ def list_monitors(os_: OS) -> list[MonitorInfo]:
 
 def _list_windows_monitors() -> list[MonitorInfo]:
     monitors: list[MonitorInfo] = []
-
-    class _RECT(ctypes.Structure):
-        _fields_ = [
-            ("left", ctypes.c_long),
-            ("top", ctypes.c_long),
-            ("right", ctypes.c_long),
-            ("bottom", ctypes.c_long),
-        ]
-
-    class _MONITORINFOEX(ctypes.Structure):
-        _fields_ = [
-            ("cbSize", ctypes.c_ulong),
-            ("rcMonitor", _RECT),
-            ("rcWork", _RECT),
-            ("dwFlags", ctypes.c_ulong),
-            ("szDevice", ctypes.c_wchar * 32),
-        ]
-
-    _MONITORINFOF_PRIMARY = 0x1
-    _MonitorEnumProc = ctypes.WINFUNCTYPE(
-        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(_RECT), ctypes.c_ssize_t
-    )
 
     def _callback(hmonitor, _hdc, _lprect, _lparam) -> int:
         info = _MONITORINFOEX()
@@ -93,7 +124,9 @@ def _list_windows_monitors() -> list[MonitorInfo]:
         return 1  # continue enumeration
 
     try:
-        ctypes.windll.user32.EnumDisplayMonitors(0, 0, _MonitorEnumProc(_callback), 0)
+        # None for the HDC and clip-rect args: the declared argtypes turn
+        # them into the NULL values the old bare 0s produced.
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, _MonitorEnumProc(_callback), 0)
     except (AttributeError, OSError) as exc:
         log.warning("Could not enumerate monitors via EnumDisplayMonitors: %s", exc)
         return []
@@ -105,8 +138,19 @@ _XRANDR_LINE_RE = re.compile(r"^(\S+) connected (primary )?(\d+)x(\d+)\+(\d+)\+(
 
 def _list_linux_monitors() -> list[MonitorInfo]:
     try:
+        # encoding/errors, not bare text=True: that decodes with the LOCALE
+        # encoding under strict errors, so a non-ASCII output name under a
+        # C/POSIX locale would raise UnicodeDecodeError -- escaping this
+        # module's never-raises contract. xrandr emits UTF-8 on modern
+        # systems; "replace" keeps a stray byte from ever becoming an
+        # exception.
         result = subprocess.run(
-            ["xrandr", "--query"], capture_output=True, text=True, timeout=_XRANDR_TIMEOUT
+            ["xrandr", "--query"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_XRANDR_TIMEOUT,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.warning("Could not list monitors via xrandr: %s", exc)

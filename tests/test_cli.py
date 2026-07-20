@@ -616,6 +616,61 @@ def test_apply_settings_invalid_hotkey_is_rejected_before_touching_anything(monk
     _stop_main(fakes, thread, result)
 
 
+def test_apply_settings_failed_autostart_registration_reverts_toggle_and_reports_error(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    enable_calls = []
+
+    def failing_enable(os_):
+        enable_calls.append(os_)
+        raise OSError("access denied (fake)")
+
+    monkeypatch.setattr(cli.autostart, "is_supported", lambda os_: True)
+    monkeypatch.setattr(cli.autostart, "enable", failing_enable)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, launch_on_startup=True))
+
+    # The failure surfaces as an apply error -- no hollow "Settings saved."
+    # over a toggle that didn't take effect.
+    assert error is not None and "launch-on-startup" in error
+    # Belief reverts to reality: the field (and what gets persisted) says
+    # off, because the OS registration never happened.
+    assert fakes.config.launch_on_startup is False
+    assert fakes.saved_overrides[-1]["launch_on_startup"] is False
+
+    # Diffing against the REAL config means a second Save with the same
+    # intent retries the registration instead of silently no-op'ing.
+    assert fakes.on_apply(_settings_values(fakes.config, launch_on_startup=True)) == error
+    assert len(enable_calls) == 2
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_successful_autostart_registration_persists_and_deregisters(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(cli.autostart, "is_supported", lambda os_: True)
+    monkeypatch.setattr(cli.autostart, "enable", lambda os_: calls.append("enable"))
+    monkeypatch.setattr(cli.autostart, "disable", lambda os_: calls.append("disable"))
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, launch_on_startup=True))
+    assert error is None
+    assert calls == ["enable"]
+    assert fakes.config.launch_on_startup is True
+    assert fakes.saved_overrides[-1]["launch_on_startup"] is True
+
+    # Toggling back off deregisters, and a no-change Save after that touches
+    # nothing -- config tracking reality is what makes the diff honest.
+    assert fakes.on_apply(_settings_values(fakes.config, launch_on_startup=False)) is None
+    assert calls == ["enable", "disable"]
+    assert fakes.config.launch_on_startup is False
+    assert fakes.on_apply(_settings_values(fakes.config, launch_on_startup=False)) is None
+    assert calls == ["enable", "disable"]
+
+    _stop_main(fakes, thread, result)
+
+
 def test_rebind_hotkey_constructs_new_binding_before_stopping_old_listener(monkeypatch, tmp_path) -> None:
     fakes = _install_apply_settings_fakes(monkeypatch, tmp_path, hotkey_enabled=True)
     thread, result = _start_main(fakes)

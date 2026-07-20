@@ -48,7 +48,11 @@ def launch_command() -> list[str]:
 
 
 def _autostart_desktop_path() -> Path:
-    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    # "or"-fallback, not os.environ.get(key, default): the XDG spec says an
+    # EMPTY XDG_CONFIG_HOME means "unset" -- treating "" as a real path
+    # would resolve to a relative "autostart/clipersal.desktop" inside
+    # whatever the cwd happens to be at login.
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
     return base / "autostart" / "clipersal.desktop"
 
 

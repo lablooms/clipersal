@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -37,6 +38,21 @@ def test_disable_raises_on_unsupported_platform() -> None:
 
 def test_is_enabled_false_on_unsupported_platform() -> None:
     assert autostart.is_enabled(OS.MACOS) is False
+
+
+def test_empty_xdg_config_home_falls_back_to_dot_config(monkeypatch) -> None:
+    # The XDG spec says an EMPTY XDG_CONFIG_HOME means "unset" -- treating
+    # "" as a real path would resolve to a relative "autostart/..." under
+    # whatever the cwd happens to be at login.
+    monkeypatch.setenv("XDG_CONFIG_HOME", "")
+
+    assert autostart._autostart_desktop_path() == Path.home() / ".config" / "autostart" / "clipersal.desktop"
+
+
+def test_xdg_config_home_is_honored_when_set(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
+    assert autostart._autostart_desktop_path() == tmp_path / "autostart" / "clipersal.desktop"
 
 
 def test_linux_enable_disable_round_trip(tmp_path, monkeypatch) -> None:

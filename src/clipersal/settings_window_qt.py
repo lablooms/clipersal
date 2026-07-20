@@ -92,6 +92,17 @@ def _format_retention_label(days: int) -> str:
     return "Forever" if days <= 0 else f"{days}d"
 
 
+def _clamped(value: int, bounds: tuple[int, int]) -> int:
+    """What's shown must be what's saved: an out-of-range config value
+    (e.g. --buffer-seconds 600 against the slider's 10-300) is clamped
+    HERE, for the value label and the slider alike -- not left for Qt's
+    setValue to clamp only the slider, which would display the original
+    number while the next Save silently persists the clamp.
+    """
+    low, high = bounds
+    return max(low, min(high, value))
+
+
 class SettingsFrame(QWidget):
     """on_apply(new_values) is called with the validated field values on
     Save; it should live-apply what it can, persist to the config file, and
@@ -225,10 +236,11 @@ class SettingsFrame(QWidget):
         capture_layout = self._make_card(left_layout, "Capture")
         card = capture_layout.parentWidget()
 
-        self.buffer_value_label = self._field_row(capture_layout, "Buffer length", f"{config.buffer_seconds}s", card)
+        initial_buffer = _clamped(config.buffer_seconds, _BUFFER_RANGE)
+        self.buffer_value_label = self._field_row(capture_layout, "Buffer length", f"{initial_buffer}s", card)
         self.buffer_slider = QSlider(Qt.Orientation.Horizontal, card)
         self.buffer_slider.setRange(*_BUFFER_RANGE)
-        self.buffer_slider.setValue(config.buffer_seconds)
+        self.buffer_slider.setValue(initial_buffer)
         self.buffer_slider.valueChanged.connect(lambda v: self.buffer_value_label.setText(f"{v}s"))
         capture_layout.addWidget(self.buffer_slider)
         self._hint(capture_layout, "How much history stays in the rolling buffer (10s–300s)", card)
@@ -341,12 +353,13 @@ class SettingsFrame(QWidget):
             self._hint(capture_layout, "Mixed in alongside system audio, if a loopback source is available", card)
 
     def _build_volume_controls(self, capture_layout: QVBoxLayout, config: Config, ffmpeg_path: str, card: QWidget) -> None:
+        initial_desktop_volume = _clamped(config.desktop_volume, _VOLUME_RANGE_PERCENT)
         self.desktop_volume_value_label = self._field_row(
-            capture_layout, "Desktop volume", f"{config.desktop_volume}%", card
+            capture_layout, "Desktop volume", f"{initial_desktop_volume}%", card
         )
         self.desktop_volume_slider = QSlider(Qt.Orientation.Horizontal, card)
         self.desktop_volume_slider.setRange(*_VOLUME_RANGE_PERCENT)
-        self.desktop_volume_slider.setValue(config.desktop_volume)
+        self.desktop_volume_slider.setValue(initial_desktop_volume)
         self.desktop_volume_slider.valueChanged.connect(
             lambda v: self.desktop_volume_value_label.setText(f"{v}%")
         )
@@ -362,12 +375,13 @@ class SettingsFrame(QWidget):
         else:
             self._hint(capture_layout, "Loudness of the captured system audio (100% = unchanged)", card)
 
+        initial_mic_volume = _clamped(config.mic_volume, _VOLUME_RANGE_PERCENT)
         self.mic_volume_value_label = self._field_row(
-            capture_layout, "Microphone volume", f"{config.mic_volume}%", card
+            capture_layout, "Microphone volume", f"{initial_mic_volume}%", card
         )
         self.mic_volume_slider = QSlider(Qt.Orientation.Horizontal, card)
         self.mic_volume_slider.setRange(*_VOLUME_RANGE_PERCENT)
-        self.mic_volume_slider.setValue(config.mic_volume)
+        self.mic_volume_slider.setValue(initial_mic_volume)
         self.mic_volume_slider.valueChanged.connect(
             lambda v: self.mic_volume_value_label.setText(f"{v}%")
         )
@@ -458,6 +472,20 @@ class SettingsFrame(QWidget):
         )
 
         startup_supported = autostart.is_supported(self._os)
+        startup_checked = config.launch_on_startup
+        if startup_supported:
+            try:
+                # Reconcile the toggle with reality at build time: the OS
+                # registration is the source of truth, so a Run value /
+                # .desktop file deleted outside the app (or a registration
+                # that failed last Save) doesn't leave the toggle
+                # permanently showing what we merely BELIEVE -- and an
+                # unchanged toggle position never re-triggers registration.
+                startup_checked = autostart.is_enabled(self._os)
+            except Exception as exc:  # noqa: BLE001 -- a probe hiccup must never break the Settings tab
+                # Best-effort like every other probe in this codebase: fall
+                # back to the persisted value when the OS can't answer.
+                log.warning("Could not probe launch-on-startup registration (%s); using the configured value", exc)
         startup_row = QHBoxLayout()
         save_layout.addLayout(startup_row)
         startup_text_col = QVBoxLayout()
@@ -468,7 +496,7 @@ class SettingsFrame(QWidget):
         )
         startup_desc.setObjectName("hint")
         startup_text_col.addWidget(startup_desc)
-        self.launch_on_startup_switch = ToggleSwitch(card, checked=(startup_supported and config.launch_on_startup))
+        self.launch_on_startup_switch = ToggleSwitch(card, checked=(startup_supported and startup_checked))
         startup_row.addWidget(self.launch_on_startup_switch)
         if not startup_supported:
             self.launch_on_startup_switch.setEnabled(False)
@@ -535,12 +563,13 @@ class SettingsFrame(QWidget):
         clips_layout.addWidget(self.filename_template_edit)
         self._hint(clips_layout, "Placeholders: {date}, {time}, {datetime}", card)
 
+        initial_retention = _clamped(config.clip_retention_days, _RETENTION_RANGE_DAYS)
         self.retention_value_label = self._field_row(
-            clips_layout, "Keep clips for", _format_retention_label(config.clip_retention_days), card
+            clips_layout, "Keep clips for", _format_retention_label(initial_retention), card
         )
         self.retention_slider = QSlider(Qt.Orientation.Horizontal, card)
         self.retention_slider.setRange(*_RETENTION_RANGE_DAYS)
-        self.retention_slider.setValue(config.clip_retention_days)
+        self.retention_slider.setValue(initial_retention)
         self.retention_slider.valueChanged.connect(
             lambda v: self.retention_value_label.setText(_format_retention_label(v))
         )

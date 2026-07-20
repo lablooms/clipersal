@@ -36,6 +36,10 @@ def single_monitor_no_mic(monkeypatch):
     monkeypatch.setattr(settings_window_qt.ffmpeg_utils, "list_microphones", lambda ffmpeg_path, os_: [])
     monkeypatch.setattr(settings_window_qt.ffmpeg_utils, "find_audio_source", lambda ffmpeg_path, os_: None)
     monkeypatch.setattr(settings_window_qt.window_capture, "list_windows", lambda os_: [])
+    # Hermetic launch-on-startup probe: the real is_enabled reads the
+    # registry / ~/.config/autostart, which would leak the machine's actual
+    # registration state into the toggle tests.
+    monkeypatch.setattr(settings_window_qt.autostart, "is_enabled", lambda os_: False)
     yield
 
 
@@ -107,6 +111,30 @@ def test_monitor_picker_hidden_with_only_one_monitor(tmp_path: Path) -> None:
     frame = _build(tmp_path)
     assert "Monitor" not in frame.target_control._buttons
     assert frame.monitor_combo is None
+
+
+# ---- out-of-range config values clamp consistently ------------------------------
+
+
+def test_out_of_range_config_values_show_the_same_clamped_number_everywhere(tmp_path: Path) -> None:
+    # What's shown is what's saved: label and slider must agree on the SAME
+    # clamped number -- not label=original while Qt clamps only the slider.
+    frame = _build(tmp_path, buffer_seconds=600, desktop_volume=300, mic_volume=-10, clip_retention_days=120)
+    assert frame.buffer_slider.value() == 300
+    assert frame.buffer_value_label.text() == "300s"
+    assert frame.desktop_volume_slider.value() == 200
+    assert frame.desktop_volume_value_label.text() == "200%"
+    assert frame.mic_volume_slider.value() == 0
+    assert frame.mic_volume_value_label.text() == "0%"
+    assert frame.retention_slider.value() == 90
+    assert frame.retention_value_label.text() == "90d"
+
+
+def test_save_persists_the_clamped_displayed_value(tmp_path: Path) -> None:
+    captured = {}
+    frame = _build(tmp_path, buffer_seconds=600, on_apply=lambda values: captured.update(values) or None)
+    frame._on_save()
+    assert captured["buffer_seconds"] == 300
 
 
 def test_monitor_picker_shown_with_multiple_monitors(tmp_path: Path, monkeypatch) -> None:
@@ -431,6 +459,44 @@ def test_save_payload_launch_on_startup_reflects_switch(tmp_path: Path, monkeypa
     frame.launch_on_startup_switch.click()
     frame._on_save()
     assert captured["launch_on_startup"] is True
+
+
+# ---- launch-on-startup toggle reconciles with real registration -------------------
+
+
+def test_startup_switch_initializes_from_real_registration_state(tmp_path: Path, monkeypatch) -> None:
+    # Registered at the OS level even though the config file says off --
+    # the OS registration is the source of truth, not the persisted belief.
+    monkeypatch.setattr(settings_window_qt.autostart, "is_supported", lambda os_: True)
+    monkeypatch.setattr(settings_window_qt.autostart, "is_enabled", lambda os_: True)
+    frame = _build(tmp_path, launch_on_startup=False)
+    assert frame.launch_on_startup_switch.isChecked() is True
+
+
+def test_startup_switch_initializes_unchecked_when_registration_was_removed_externally(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The config file believes "on", but the Run value / .desktop file is
+    # gone (deleted outside the app, or the registration failed last Save)
+    # -- the toggle must not keep showing the stale belief, or it would
+    # never diff and re-register.
+    monkeypatch.setattr(settings_window_qt.autostart, "is_supported", lambda os_: True)
+    # (the autouse fixture's is_enabled already returns False)
+    frame = _build(tmp_path, launch_on_startup=True)
+    assert frame.launch_on_startup_switch.isChecked() is False
+
+
+def test_startup_switch_falls_back_to_config_when_probe_fails(tmp_path: Path, monkeypatch) -> None:
+    # Best-effort, like every other probe in the codebase: a registration
+    # probe that itself fails must not break the Settings tab -- fall back
+    # to the persisted value.
+    def boom(os_):
+        raise OSError("registry unavailable (fake)")
+
+    monkeypatch.setattr(settings_window_qt.autostart, "is_supported", lambda os_: True)
+    monkeypatch.setattr(settings_window_qt.autostart, "is_enabled", boom)
+    assert _build(tmp_path, launch_on_startup=True).launch_on_startup_switch.isChecked() is True
+    assert _build(tmp_path, launch_on_startup=False).launch_on_startup_switch.isChecked() is False
 
 
 def test_save_payload_check_for_updates_reflects_switch(tmp_path: Path) -> None:
