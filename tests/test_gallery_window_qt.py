@@ -53,9 +53,14 @@ def _make_gallery(clips_dir: Path) -> GalleryFrame:
 
 
 def _process_events(condition, timeout=2.0) -> None:
+    # sendPostedEvents, not processEvents: queued cross-thread signal
+    # deliveries are what the workers need pumped, and processEvents also
+    # fires TIMERS -- leftover windows from earlier tests have STATUS timers
+    # that each do a real (refused, slow) socket connect, which can blow the
+    # 2 s deadline and read as a flake when several files run in one process.
     deadline = time.monotonic() + timeout
     while not condition() and time.monotonic() < deadline:
-        QApplication.processEvents()
+        QApplication.sendPostedEvents()
 
 
 def test_format_size_formats_across_units() -> None:
