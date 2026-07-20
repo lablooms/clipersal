@@ -117,6 +117,32 @@ def test_quality_preset_cli_flag_overrides_persisted() -> None:
     assert config.quality_preset == "performance"
 
 
+def test_audio_volumes_default_to_100() -> None:
+    args = build_arg_parser(persisted={}).parse_args([])
+    config = config_from_args(args)
+
+    assert config.desktop_volume == 100
+    assert config.mic_volume == 100
+
+
+def test_audio_volumes_persisted_values_used() -> None:
+    args = build_arg_parser(persisted={"desktop_volume": 150, "mic_volume": 50}).parse_args([])
+    config = config_from_args(args)
+
+    assert config.desktop_volume == 150
+    assert config.mic_volume == 50
+
+
+def test_audio_volumes_cli_flags_override_persisted() -> None:
+    args = build_arg_parser(persisted={"desktop_volume": 150, "mic_volume": 50}).parse_args(
+        ["--desktop-volume", "80", "--mic-volume", "120"]
+    )
+    config = config_from_args(args)
+
+    assert config.desktop_volume == 80
+    assert config.mic_volume == 120
+
+
 def test_default_buffer_dir_is_a_fresh_temp_dir_marked_for_cleanup() -> None:
     args = build_arg_parser(persisted={}).parse_args([])
     config = config_from_args(args)

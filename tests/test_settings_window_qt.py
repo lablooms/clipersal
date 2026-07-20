@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog
 
 from clipersal import settings_window_qt
 from clipersal.config import Config
+from clipersal.ffmpeg_utils import AudioSource
 from clipersal.monitors import MonitorInfo
 from clipersal.platform_detect import OS, LinuxSessionType
 from clipersal.settings_window_qt import SettingsFrame, bitrate_string_to_mbps
@@ -29,8 +30,11 @@ def single_monitor_no_mic(monkeypatch):
     # Default environment for most tests: one monitor (no Monitor mode
     # offered), no microphone detected (no mic picker offered) -- matches
     # this dev machine and keeps most tests focused on what they're testing.
+    # No system-audio loopback either, so the desktop volume slider starts
+    # in its disabled state.
     monkeypatch.setattr(settings_window_qt.monitors, "list_monitors", lambda os_: [])
     monkeypatch.setattr(settings_window_qt.ffmpeg_utils, "list_microphones", lambda ffmpeg_path, os_: [])
+    monkeypatch.setattr(settings_window_qt.ffmpeg_utils, "find_audio_source", lambda ffmpeg_path, os_: None)
     monkeypatch.setattr(settings_window_qt.window_capture, "list_windows", lambda os_: [])
     yield
 
@@ -136,6 +140,65 @@ def test_mic_picker_defaults_to_none_when_configured_device_not_found(tmp_path: 
     monkeypatch.setattr(settings_window_qt.ffmpeg_utils, "list_microphones", lambda ffmpeg_path, os_: ["Mic A"])
     frame = _build(tmp_path, mic_device="Unplugged Mic")
     assert frame.mic_combo.currentText() == "None"
+
+
+# ---- volume sliders -----------------------------------------------------------
+
+
+def _fake_loopback(ffmpeg_path, os_):
+    return AudioSource(input_args=["-f", "pulse", "-i", "loop.monitor"], description="loop")
+
+
+def test_volume_sliders_have_percent_range_and_reflect_config(tmp_path: Path) -> None:
+    frame = _build(tmp_path, desktop_volume=150, mic_volume=50)
+    assert frame.desktop_volume_slider.minimum() == 0
+    assert frame.desktop_volume_slider.maximum() == 200
+    assert frame.mic_volume_slider.minimum() == 0
+    assert frame.mic_volume_slider.maximum() == 200
+    assert frame.desktop_volume_slider.value() == 150
+    assert frame.mic_volume_slider.value() == 50
+    assert frame.desktop_volume_value_label.text() == "150%"
+    assert frame.mic_volume_value_label.text() == "50%"
+
+
+def test_desktop_volume_slider_disabled_with_hint_when_no_loopback_detected(tmp_path: Path) -> None:
+    frame = _build(tmp_path)  # fixture: find_audio_source -> None
+    assert frame.desktop_volume_slider.isEnabled() is False
+
+
+def test_desktop_volume_slider_enabled_when_loopback_detected(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(settings_window_qt.ffmpeg_utils, "find_audio_source", _fake_loopback)
+    frame = _build(tmp_path)
+    assert frame.desktop_volume_slider.isEnabled() is True
+
+
+def test_mic_volume_slider_disabled_with_hint_when_no_microphone_detected(tmp_path: Path) -> None:
+    frame = _build(tmp_path)  # fixture: no mics -> no picker
+    assert frame.mic_volume_slider.isEnabled() is False
+    assert "No microphone" in frame.mic_volume_hint.text()
+
+
+def test_mic_volume_slider_follows_the_mic_picker_selection(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(settings_window_qt.ffmpeg_utils, "list_microphones", lambda ffmpeg_path, os_: ["Mic A"])
+    frame = _build(tmp_path)
+    # "None" selected by default: nothing is mixed in, so the slider adjusts nothing.
+    assert frame.mic_volume_slider.isEnabled() is False
+    frame.mic_combo.setCurrentText("Mic A")
+    assert frame.mic_volume_slider.isEnabled() is True
+    frame.mic_combo.setCurrentText("None")
+    assert frame.mic_volume_slider.isEnabled() is False
+
+
+def test_save_payload_collects_both_volumes(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(settings_window_qt.ffmpeg_utils, "list_microphones", lambda ffmpeg_path, os_: ["Mic A"])
+    monkeypatch.setattr(settings_window_qt.ffmpeg_utils, "find_audio_source", _fake_loopback)
+    captured = {}
+    frame = _build(tmp_path, mic_device="Mic A", on_apply=lambda values: captured.update(values) or None)
+    frame.desktop_volume_slider.setValue(150)
+    frame.mic_volume_slider.setValue(50)
+    frame._on_save()
+    assert captured["desktop_volume"] == 150
+    assert captured["mic_volume"] == 50
 
 
 # ---- capture target show/hide ----------------------------------------------

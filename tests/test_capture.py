@@ -12,6 +12,7 @@ from clipersal.capture import (
     _MAX_RESTARTS_PER_WINDOW,
     ResolvedSetup,
     SegmentedCapture,
+    _format_volume,
     delete_stale_segments,
     list_current_segments,
 )
@@ -345,6 +346,110 @@ def test_build_command_loopback_and_mic_are_mixed_via_amix(tmp_path: Path) -> No
     assert "-c:a" in cmd
     # loopback's input args should precede the mic's in the command
     assert cmd.index("loop.monitor") < cmd.index("mic0")
+
+
+# ---- capture volume controls -------------------------------------------------
+
+
+def test_build_command_default_volumes_leave_the_command_byte_identical(tmp_path: Path) -> None:
+    # The Phase 8 rule, restated for the volume controls: both volumes at the
+    # 100 default (what every old config file deserializes to) must produce
+    # EXACTLY the pre-volume-control command -- not one arg more.
+    session = _make_session(tmp_path)
+    session.setup.audio_source = AudioSource(input_args=["-f", "pulse", "-i", "loop.monitor"], description="loop")
+    session.setup.mic_source = AudioSource(input_args=["-f", "pulse", "-i", "mic0"], description="mic")
+
+    cmd = session._build_command()
+
+    assert cmd == [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+        "-f", "lavfi", "-i", "color",
+        "-f", "pulse", "-i", "loop.monitor",
+        "-f", "pulse", "-i", "mic0",
+        "-map", "0:v:0",
+        "-filter_complex", "[1:a][2:a]amix=inputs=2:duration=first:dropout_transition=0[aout]",
+        "-map", "[aout]",
+        "-c:v", "libx264", "-preset", "veryfast", "-b:v", "8M",
+        "-c:a", "aac", "-b:a", "160k",
+        "-force_key_frames", "expr:gte(t,n_forced*2)",
+        "-f", "segment", "-segment_time", "2", "-reset_timestamps", "1", "-strftime", "1",
+        str(tmp_path / "buffer" / "seg-%Y%m%d-%H%M%S.ts"),
+    ]
+
+
+def test_build_command_two_sources_with_volumes_insert_volume_stages_before_amix(tmp_path: Path) -> None:
+    session = _make_session(tmp_path)
+    session.config.desktop_volume = 150
+    session.config.mic_volume = 50
+    session.setup.audio_source = AudioSource(input_args=["-f", "pulse", "-i", "loop.monitor"], description="loop")
+    session.setup.mic_source = AudioSource(input_args=["-f", "pulse", "-i", "mic0"], description="mic")
+
+    cmd = session._build_command()
+
+    filter_arg = cmd[cmd.index("-filter_complex") + 1]
+    assert filter_arg == (
+        "[1:a]volume=1.5[a1];[2:a]volume=0.5[a2];[a1][a2]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+    )
+    assert "[aout]" in cmd
+
+
+def test_build_command_two_sources_desktop_at_100_omits_the_desktop_volume_stage(tmp_path: Path) -> None:
+    session = _make_session(tmp_path)
+    session.config.desktop_volume = 100
+    session.config.mic_volume = 150
+    session.setup.audio_source = AudioSource(input_args=["-f", "pulse", "-i", "loop.monitor"], description="loop")
+    session.setup.mic_source = AudioSource(input_args=["-f", "pulse", "-i", "mic0"], description="mic")
+
+    cmd = session._build_command()
+
+    filter_arg = cmd[cmd.index("-filter_complex") + 1]
+    assert filter_arg == "[2:a]volume=1.5[a2];[1:a][a2]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+
+
+def test_build_command_single_source_with_volume_uses_volume_filter_and_aout(tmp_path: Path) -> None:
+    session = _make_session(tmp_path)
+    session.config.desktop_volume = 150
+    session.setup.audio_source = AudioSource(input_args=["-f", "pulse", "-i", "loop.monitor"], description="loop")
+
+    cmd = session._build_command()
+
+    filter_arg = cmd[cmd.index("-filter_complex") + 1]
+    assert filter_arg == "[1:a]volume=1.5[aout]"
+    assert "[aout]" in cmd
+    assert "1:a:0" not in cmd
+
+
+def test_build_command_mic_only_volume_comes_from_mic_volume_not_desktop_volume(tmp_path: Path) -> None:
+    session = _make_session(tmp_path)
+    session.config.desktop_volume = 150  # irrelevant here: no loopback source
+    session.config.mic_volume = 50
+    session.setup.mic_source = AudioSource(input_args=["-f", "pulse", "-i", "mic0"], description="mic")
+
+    cmd = session._build_command()
+
+    filter_arg = cmd[cmd.index("-filter_complex") + 1]
+    assert filter_arg == "[1:a]volume=0.5[aout]"
+
+
+def test_build_command_single_source_at_100_keeps_the_direct_map(tmp_path: Path) -> None:
+    session = _make_session(tmp_path)
+    session.config.desktop_volume = 100
+    session.config.mic_volume = 150  # no mic source, so this must not leak in either
+    session.setup.audio_source = AudioSource(input_args=["-f", "pulse", "-i", "loop.monitor"], description="loop")
+
+    cmd = session._build_command()
+
+    assert "-filter_complex" not in cmd
+    assert "1:a:0" in cmd
+    assert not any("volume" in arg for arg in cmd)
+
+
+def test_format_volume_renders_clean_decimals_without_float_noise() -> None:
+    # :g formatting -- the exact strings the ffmpeg `volume` filter receives.
+    assert _format_volume(100) == "1"
+    assert _format_volume(150) == "1.5"
+    assert _format_volume(50) == "0.5"
+    assert _format_volume(33) == "0.33"  # not 0.30000000000000004-style noise
 
 
 # ---- Wayland portal capture path --------------------------------------------

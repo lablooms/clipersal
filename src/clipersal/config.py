@@ -36,6 +36,12 @@ class Config:
     quality_preset: str = "custom"  # "performance" | "balanced" | "quality" | "custom" (raw video_bitrate)
     encoder_override: str | None = None
     mic_device: str | None = None  # None = no microphone mixed in (default, unchanged behavior)
+    # Per-source capture loudness, in percent (100 = unity gain). Baked into
+    # the ffmpeg command as a `volume` filter stage; the 100 default omits
+    # that stage entirely so an old config file still produces the exact
+    # pre-volume-control command (the Phase 8 byte-identical rule).
+    desktop_volume: int = 100
+    mic_volume: int = 100
     clips_dir: Path = field(default_factory=_default_clips_dir)
     # None = not supplied -> a fresh temp dir is created in __post_init__ and
     # buffer_dir_is_temp flips True so cli.py's shutdown can delete it again
@@ -147,6 +153,18 @@ def build_arg_parser(persisted: dict[str, Any] | None = None) -> argparse.Argume
         help="Microphone device name to mix in alongside system audio (default: none)",
     )
     parser.add_argument(
+        "--desktop-volume",
+        type=int,
+        default=persisted.get("desktop_volume", 100),
+        help="System-audio capture loudness in percent, 100 = unchanged (default: 100)",
+    )
+    parser.add_argument(
+        "--mic-volume",
+        type=int,
+        default=persisted.get("mic_volume", 100),
+        help="Microphone capture loudness in percent, 100 = unchanged (default: 100)",
+    )
+    parser.add_argument(
         "--ipc-port",
         type=int,
         default=_DEFAULT_IPC_PORT,
@@ -207,6 +225,8 @@ def config_from_args(args: argparse.Namespace) -> Config:
         window_title=args.window_title,
         encoder_override=args.encoder,
         mic_device=args.mic_device,
+        desktop_volume=args.desktop_volume,
+        mic_volume=args.mic_volume,
         ipc_port=args.ipc_port,
         hotkey_combo=args.hotkey,
         hotkey_enabled=not args.no_hotkey,

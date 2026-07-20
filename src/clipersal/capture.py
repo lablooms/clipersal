@@ -36,6 +36,16 @@ _RESTART_WINDOW_SECONDS = 60.0
 SEGMENT_GLOB = "seg-*.ts"
 
 
+def _format_volume(percent: int) -> str:
+    """The ffmpeg `volume` filter value for a percentage slider position.
+
+    `volume` takes a decimal multiplier (1.5 = 150%). Formatting via :g keeps
+    the percent->decimal division clean -- 150 -> "1.5", 33 -> "0.33" -- with
+    none of str(float)'s noise (0.30000000000000004) and no trailing zeros.
+    """
+    return f"{percent / 100:g}"
+
+
 @dataclass
 class ResolvedSetup:
     ffmpeg_path: str
@@ -403,10 +413,33 @@ class SegmentedCapture:
             # output track -- duration=first ties the mix's length to the
             # loopback stream, which (like the video) runs for the life of
             # capture either way.
-            cmd += ["-filter_complex", "[1:a][2:a]amix=inputs=2:duration=first:dropout_transition=0[aout]"]
+            # A per-source volume adjustment rides in front of the mix when
+            # that source isn't at 100%; at 100 the stage is omitted entirely,
+            # so the default command stays byte-identical to the
+            # pre-volume-control one (old config files change nothing -- the
+            # Phase 8 rule).
+            filter_chain = []
+            if cfg.desktop_volume != 100:
+                filter_chain.append(f"[1:a]volume={_format_volume(cfg.desktop_volume)}[a1]")
+                mix_inputs = "[a1]"
+            else:
+                mix_inputs = "[1:a]"
+            if cfg.mic_volume != 100:
+                filter_chain.append(f"[2:a]volume={_format_volume(cfg.mic_volume)}[a2]")
+                mix_inputs += "[a2]"
+            else:
+                mix_inputs += "[2:a]"
+            filter_chain.append(f"{mix_inputs}amix=inputs=2:duration=first:dropout_transition=0[aout]")
+            cmd += ["-filter_complex", ";".join(filter_chain)]
             cmd += ["-map", "[aout]"]
         elif len(audio_sources) == 1:
-            cmd += ["-map", "1:a:0"]
+            # The lone source is the loopback when one was found, else the mic.
+            only_volume = cfg.desktop_volume if setup.audio_source is not None else cfg.mic_volume
+            if only_volume != 100:
+                cmd += ["-filter_complex", f"[1:a]volume={_format_volume(only_volume)}[aout]"]
+                cmd += ["-map", "[aout]"]
+            else:
+                cmd += ["-map", "1:a:0"]
 
         bitrate, speed = ffmpeg_utils.resolve_quality_preset(cfg.quality_preset, setup.encoder, cfg.video_bitrate)
         cmd += ffmpeg_utils.encoder_output_args(setup.encoder, bitrate, speed)

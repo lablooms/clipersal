@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from clipersal.config_store import load_overrides, save_overrides
+from clipersal.config_store import PERSISTED_KEYS, load_overrides, save_overrides
 
 
 def test_load_overrides_returns_empty_dict_when_file_missing(tmp_path: Path) -> None:
@@ -72,3 +72,16 @@ def test_save_overrides_encoder_override_none_round_trips(tmp_path: Path) -> Non
     save_overrides({"encoder_override": None}, path)
 
     assert load_overrides(path) == {"encoder_override": None}
+
+
+def test_persisted_keys_include_audio_volumes() -> None:
+    assert "desktop_volume" in PERSISTED_KEYS
+    assert "mic_volume" in PERSISTED_KEYS
+
+
+def test_save_then_load_round_trips_audio_volumes(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+
+    save_overrides({"desktop_volume": 150, "mic_volume": 50}, path)
+
+    assert load_overrides(path) == {"desktop_volume": 150, "mic_volume": 50}

@@ -31,6 +31,8 @@ PERSISTED_KEYS = (
     "window_title",
     "encoder_override",
     "mic_device",
+    "desktop_volume",
+    "mic_volume",
     "filename_template",
     "clip_retention_days",
     "launch_on_startup",

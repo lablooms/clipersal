@@ -299,6 +299,8 @@ def _settings_values(config, **overrides):
         "monitor_index": config.monitor_index,
         "window_title": config.window_title,
         "mic_device": config.mic_device,
+        "desktop_volume": config.desktop_volume,
+        "mic_volume": config.mic_volume,
         "encoder_override": config.encoder_override,
         "filename_template": config.filename_template,
         "clip_retention_days": config.clip_retention_days,
@@ -531,6 +533,53 @@ def test_apply_settings_valid_capture_change_restarts_and_persists(monkeypatch, 
     assert stop_idx < fakes.calls.index("session_construct", stop_idx)
     assert fakes.calls.count("session_start") == 2
     assert fakes.saved_overrides[0]["video_bitrate"] == "12M"
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_volume_change_is_capture_restart_class(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, desktop_volume=150))
+
+    assert error is None
+    assert fakes.config.desktop_volume == 150
+    # Volumes are baked into the ffmpeg command, so a change re-resolves
+    # against the candidate config and swaps the session -- same class as a
+    # bitrate change. (The candidate only differed in volume, so the fake's
+    # recorded bitrate is still "8M" on both resolves.)
+    resolve_indices = [i for i, c in enumerate(fakes.calls) if c == ("resolve_setup", "8M")]
+    assert len(resolve_indices) == 2  # startup + the apply
+    # Resolve-first: the candidate resolution ran BEFORE the old session was
+    # stopped, so a resolution failure would have left capture untouched.
+    assert resolve_indices[1] < fakes.calls.index("session_stop")
+    assert fakes.calls.count("session_construct") == 2
+    assert fakes.calls.count("session_start") == 2
+    assert fakes.saved_overrides[0]["desktop_volume"] == 150
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_unchanged_volumes_do_not_restart_capture(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    thread, result = _start_main(fakes)
+
+    # Only a live-applied field changes; volumes (and every other
+    # restart-class field) stay at their current values.
+    error = fakes.on_apply(_settings_values(fakes.config, buffer_seconds=90))
+
+    assert error is None
+    assert fakes.config.buffer_seconds == 90
+    assert fakes.config.desktop_volume == 100
+    assert fakes.config.mic_volume == 100
+    # No re-resolution and no session swap -- just the startup resolve.
+    resolve_calls = [c for c in fakes.calls if isinstance(c, tuple) and c[0] == "resolve_setup"]
+    assert len(resolve_calls) == 1
+    assert fakes.calls.count("session_stop") == 0
+    assert fakes.calls.count("session_construct") == 1
+    assert fakes.saved_overrides[0]["desktop_volume"] == 100
+    assert fakes.saved_overrides[0]["mic_volume"] == 100
 
     _stop_main(fakes, thread, result)
 

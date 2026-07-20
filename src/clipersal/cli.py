@@ -391,8 +391,8 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     def restart_capture(new_setup: capture.ResolvedSetup) -> None:
-        """Encoder/bitrate/capture-target/mic changes are baked into the
-        ffmpeg command line, so applying them means swapping in a fresh
+        """Encoder/bitrate/capture-target/mic/volume changes are baked into
+        the ffmpeg command line, so applying them means swapping in a fresh
         SegmentedCapture -- preserving whatever paused/running state was
         already in effect. See ARCHITECTURE.md's "Settings persistence"
         section.
@@ -434,6 +434,8 @@ def main(argv: list[str] | None = None) -> int:
             or new_values["encoder_override"] != config.encoder_override
             or new_values["monitor_index"] != config.monitor_index
             or new_values["mic_device"] != config.mic_device
+            or new_values["desktop_volume"] != config.desktop_volume
+            or new_values["mic_volume"] != config.mic_volume
             or new_values["capture_mode"] != config.capture_mode
             or new_values["window_title"] != config.window_title
         )
@@ -456,6 +458,8 @@ def main(argv: list[str] | None = None) -> int:
                 encoder_override=new_values["encoder_override"],
                 monitor_index=new_values["monitor_index"],
                 mic_device=new_values["mic_device"],
+                desktop_volume=new_values["desktop_volume"],
+                mic_volume=new_values["mic_volume"],
                 capture_mode=new_values["capture_mode"],
                 window_title=new_values["window_title"],
             )
@@ -471,6 +475,8 @@ def main(argv: list[str] | None = None) -> int:
         config.encoder_override = new_values["encoder_override"]
         config.monitor_index = new_values["monitor_index"]
         config.mic_device = new_values["mic_device"]
+        config.desktop_volume = new_values["desktop_volume"]
+        config.mic_volume = new_values["mic_volume"]
         config.capture_mode = new_values["capture_mode"]
         config.window_title = new_values["window_title"]
         config.hotkey_combo = new_values["hotkey_combo"]
@@ -510,6 +516,8 @@ def main(argv: list[str] | None = None) -> int:
                 "encoder_override": config.encoder_override,
                 "monitor_index": config.monitor_index,
                 "mic_device": config.mic_device,
+                "desktop_volume": config.desktop_volume,
+                "mic_volume": config.mic_volume,
                 "capture_mode": config.capture_mode,
                 "window_title": config.window_title,
                 "filename_template": config.filename_template,

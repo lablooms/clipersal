@@ -43,6 +43,7 @@ _ENCODER_CHOICES = [("NVENC", "h264_nvenc"), ("VAAPI", "h264_vaapi"), ("QSV", "h
 _BUFFER_RANGE = (10, 300)
 _BITRATE_RANGE_MBPS = (2, 20)
 _RETENTION_RANGE_DAYS = (0, 90)
+_VOLUME_RANGE_PERCENT = (0, 200)
 _SAVED_MESSAGE_CLEAR_MS = 2500
 
 _QUALITY_PRESET_CHOICES = [
@@ -233,6 +234,7 @@ class SettingsFrame(QWidget):
 
         self._build_capture_target(capture_layout, config, card)
         self._build_microphone_picker(capture_layout, config, ffmpeg_path, card)
+        self._build_volume_controls(capture_layout, config, ffmpeg_path, card)
         self._build_quality_preset(capture_layout, config, card)
 
     def _build_capture_target(self, capture_layout: QVBoxLayout, config: Config, card: QWidget) -> None:
@@ -336,6 +338,56 @@ class SettingsFrame(QWidget):
             self.mic_combo.setCurrentText(initial_mic)
             capture_layout.addWidget(self.mic_combo)
             self._hint(capture_layout, "Mixed in alongside system audio, if a loopback source is available", card)
+
+    def _build_volume_controls(self, capture_layout: QVBoxLayout, config: Config, ffmpeg_path: str, card: QWidget) -> None:
+        self.desktop_volume_value_label = self._field_row(
+            capture_layout, "Desktop volume", f"{config.desktop_volume}%", card
+        )
+        self.desktop_volume_slider = QSlider(Qt.Orientation.Horizontal, card)
+        self.desktop_volume_slider.setRange(*_VOLUME_RANGE_PERCENT)
+        self.desktop_volume_slider.setValue(config.desktop_volume)
+        self.desktop_volume_slider.valueChanged.connect(
+            lambda v: self.desktop_volume_value_label.setText(f"{v}%")
+        )
+        capture_layout.addWidget(self.desktop_volume_slider)
+        if ffmpeg_utils.find_audio_source(ffmpeg_path, self._os) is None:
+            # With no loopback source capture has no desktop audio track at
+            # all, so the slider would adjust nothing -- the same reasoning
+            # that hides the mic picker when no microphone exists.
+            self.desktop_volume_slider.setEnabled(False)
+            self._hint(
+                capture_layout, "No system-audio loopback was detected, so there is no desktop audio to adjust", card
+            )
+        else:
+            self._hint(capture_layout, "Loudness of the captured system audio (100% = unchanged)", card)
+
+        self.mic_volume_value_label = self._field_row(
+            capture_layout, "Microphone volume", f"{config.mic_volume}%", card
+        )
+        self.mic_volume_slider = QSlider(Qt.Orientation.Horizontal, card)
+        self.mic_volume_slider.setRange(*_VOLUME_RANGE_PERCENT)
+        self.mic_volume_slider.setValue(config.mic_volume)
+        self.mic_volume_slider.valueChanged.connect(
+            lambda v: self.mic_volume_value_label.setText(f"{v}%")
+        )
+        capture_layout.addWidget(self.mic_volume_slider)
+        self.mic_volume_hint = self._hint(capture_layout, "", card)
+        if self.mic_combo is not None:
+            self.mic_combo.currentTextChanged.connect(self._on_mic_volume_state_change)
+        self._on_mic_volume_state_change()
+
+    def _on_mic_volume_state_change(self, _text: str | None = None) -> None:
+        # A mic volume only means something when a microphone is actually
+        # mixed in, so the slider tracks the mic picker's availability.
+        if self.mic_combo is None:
+            self.mic_volume_slider.setEnabled(False)
+            self.mic_volume_hint.setText("No microphone was detected on this machine.")
+        elif self.mic_combo.currentText() == "None":
+            self.mic_volume_slider.setEnabled(False)
+            self.mic_volume_hint.setText("Pick a microphone above to adjust its loudness.")
+        else:
+            self.mic_volume_slider.setEnabled(True)
+            self.mic_volume_hint.setText("Loudness of the microphone mixed into the recording (100% = unchanged).")
 
     def _build_quality_preset(self, capture_layout: QVBoxLayout, config: Config, card: QWidget) -> None:
         capture_layout.addWidget(self._bold_label("Quality preset", card))
@@ -564,6 +616,8 @@ class SettingsFrame(QWidget):
                 "monitor_index": monitor_index_value,
                 "window_title": window_title_value,
                 "mic_device": mic_device_value,
+                "desktop_volume": self.desktop_volume_slider.value(),
+                "mic_volume": self.mic_volume_slider.value(),
                 "encoder_override": encoder_override,
                 "filename_template": filename_template_text,
                 "clip_retention_days": self.retention_slider.value(),
