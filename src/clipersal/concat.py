@@ -3,6 +3,9 @@
 This is a stream-copy remux (-c copy), not a re-encode -- the actual encode
 already happened once, continuously, while segments were being written. See
 ARCHITECTURE.md ("Why concat is a stream copy, not a re-encode").
+
+Also home to trim_clip: cutting a *saved* clip down to a sub-range -- the
+same stream-copy trade-off in miniature.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from clipersal import thumbnails
 from clipersal.capture import list_current_segments
 from clipersal.subprocess_utils import NO_WINDOW_KWARGS
 
@@ -29,6 +33,10 @@ class EmptyBufferError(RuntimeError):
 
 
 class ConcatFailedError(RuntimeError):
+    pass
+
+
+class TrimRangeError(RuntimeError):
     pass
 
 
@@ -163,6 +171,76 @@ def save_clip(
         raise ConcatFailedError(f"ffmpeg concat failed:\n{result.stderr.strip()[-1000:]}")
 
     log.info("Saved clip: %s (%d segments)", output_path, len(finalized))
+    return output_path
+
+
+def trim_clip(
+    ffmpeg_path: str,
+    clip_path: Path,
+    start_seconds: float,
+    end_seconds: float,
+    clips_dir: Path,
+    duration_seconds: float | None = None,
+) -> Path:
+    """Write the [start_seconds, end_seconds] range of clip_path to a new
+    "<stem>-trimmed.mp4" in clips_dir (counter-suffixed on collision, same
+    as save_clip) and return its path. The original clip is never modified
+    or deleted.
+
+    This is a stream copy (-c copy), not a re-encode -- the same trade-off
+    as save_clip in miniature: zero quality loss and effectively instant
+    even for a long clip, but the cut points snap to the nearest keyframe.
+    Since -force_key_frames pins a keyframe to every segment boundary
+    (capture._build_command), that's at most ~segment_seconds (2s by
+    default) of slack at each end; frame-exact cuts would need a re-encode,
+    which is a documented deferral.
+
+    The range is validated as 0 <= start < end <= duration before ffmpeg is
+    ever spawned. duration_seconds comes from the caller when it already
+    knows it (the trim dialog probes it up front); when None it's probed
+    here via thumbnails' ffprobe helper. Raises TrimRangeError for an
+    invalid range or an undeterminable duration, ConcatFailedError if
+    ffmpeg itself fails.
+    """
+    if duration_seconds is None:
+        ffprobe_path = thumbnails.find_ffprobe(ffmpeg_path)
+        if ffprobe_path is not None:
+            duration_seconds = thumbnails.get_duration_seconds(ffprobe_path, clip_path)
+        if duration_seconds is None:
+            raise TrimRangeError(
+                f"Could not determine the duration of {clip_path.name} -- is ffprobe installed next to ffmpeg?"
+            )
+
+    if start_seconds < 0:
+        raise TrimRangeError(f"Trim start must be >= 0, got {start_seconds:g}s.")
+    if end_seconds > duration_seconds:
+        raise TrimRangeError(f"Trim end ({end_seconds:g}s) is past the clip's duration ({duration_seconds:g}s).")
+    if start_seconds >= end_seconds:
+        raise TrimRangeError(f"Trim start ({start_seconds:g}s) must be before trim end ({end_seconds:g}s).")
+
+    output_path = _unique_output_path(clips_dir, f"{clip_path.stem}-trimmed")
+    cmd = [
+        ffmpeg_path,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-ss",
+        f"{start_seconds:g}",
+        "-to",
+        f"{end_seconds:g}",
+        "-i",
+        str(clip_path),
+        "-c",
+        "copy",
+        str(output_path),
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=_CONCAT_TIMEOUT, **NO_WINDOW_KWARGS)
+    if result.returncode != 0:
+        raise ConcatFailedError(f"ffmpeg trim failed:\n{result.stderr.strip()[-1000:]}")
+
+    log.info("Saved trimmed clip: %s (%.3fs-%.3fs of %s)", output_path, start_seconds, end_seconds, clip_path.name)
     return output_path
 
 

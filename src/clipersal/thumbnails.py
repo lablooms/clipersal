@@ -1,4 +1,5 @@
-"""Clip thumbnail + duration helpers, used by the clip gallery.
+"""Clip thumbnail + duration helpers, used by the clip gallery (and the
+trim dialog's frame previews).
 
 Thumbnails are generated once per clip via a single ffmpeg frame-grab and
 cached in clips_dir/.thumbnails, keyed by the clip's filename + mtime so a
@@ -41,6 +42,45 @@ def thumbnail_path_for(clip_path: Path, cache_dir: Path) -> Path:
     return cache_dir / f"{clip_path.stem}.{mtime_ns}.jpg"
 
 
+def grab_frame_at(
+    ffmpeg_path: str, clip_path: Path, offset_seconds: float, target_path: Path, size: int = THUMBNAIL_SIZE
+) -> Path | None:
+    """Single ffmpeg frame-grab at an arbitrary timestamp -- the mechanism
+    behind ensure_thumbnail's fixed seeks, exposed for the trim dialog's
+    Start/End previews. Unlike ensure_thumbnail there's no cache lookup and
+    no fallback seek: the caller picks both the exact offset and the target
+    path. Returns target_path on success, None (not an exception) on
+    failure -- the same degrade-don't-crash rule as ensure_thumbnail.
+    """
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        ffmpeg_path,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{offset_seconds:.3f}",
+        "-i",
+        str(clip_path),
+        "-frames:v",
+        "1",
+        "-vf",
+        f"scale={size}:-1",
+        "-update",
+        "1",
+        str(target_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_THUMBNAIL_TIMEOUT, **NO_WINDOW_KWARGS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("Frame grab at %.3fs for %s raised: %s", offset_seconds, clip_path, exc)
+        return None
+    if result.returncode == 0 and target_path.exists():
+        return target_path
+    return None
+
+
 def ensure_thumbnail(ffmpeg_path: str, clip_path: Path, cache_dir: Path, size: int = THUMBNAIL_SIZE) -> Path | None:
     """Return a cached thumbnail path for clip_path, generating it via a
     single ffmpeg frame-grab if not already cached. Returns None (not an
@@ -55,31 +95,8 @@ def ensure_thumbnail(ffmpeg_path: str, clip_path: Path, cache_dir: Path, size: i
     # Try grabbing a frame half a second in (more representative than frame
     # zero for most clips); fall back to frame zero for very short clips
     # where 0.5s might be past the end.
-    for seek in ("0.5", "0"):
-        cmd = [
-            ffmpeg_path,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-ss",
-            seek,
-            "-i",
-            str(clip_path),
-            "-frames:v",
-            "1",
-            "-vf",
-            f"scale={size}:-1",
-            "-update",
-            "1",
-            str(target),
-        ]
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=_THUMBNAIL_TIMEOUT, **NO_WINDOW_KWARGS)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            log.warning("Thumbnail generation for %s raised: %s", clip_path, exc)
-            return None
-        if result.returncode == 0 and target.exists():
+    for seek in (0.5, 0.0):
+        if grab_frame_at(ffmpeg_path, clip_path, seek, target, size=size) is not None:
             return target
 
     log.warning("Could not generate a thumbnail for %s", clip_path)

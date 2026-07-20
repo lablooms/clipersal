@@ -12,12 +12,15 @@ import clipersal.concat as concat_module
 from clipersal.concat import (
     ConcatFailedError,
     EmptyBufferError,
+    TrimRangeError,
     _finalized_segments,
     _unique_output_path,
     enforce_clip_retention,
     render_filename,
     save_clip,
+    trim_clip,
 )
+from clipersal.subprocess_utils import NO_WINDOW_KWARGS
 
 FFMPEG_PATH = shutil.which("ffmpeg")
 
@@ -305,3 +308,153 @@ def test_enforce_clip_retention_ignores_non_mp4_files(tmp_path: Path) -> None:
 
     assert deleted == []
     assert old_thumbnail.exists()
+
+
+# ---- trim_clip ------------------------------------------------------------
+
+
+def _fake_run_recording(recorded: dict, returncode: int = 0, stderr: str = ""):
+    """Stand-in for subprocess.run that just captures argv/kwargs."""
+
+    def fake_run(cmd, **kwargs):
+        recorded["cmd"] = cmd
+        recorded["kwargs"] = kwargs
+        return SimpleNamespace(returncode=returncode, stderr=stderr)
+
+    return fake_run
+
+
+def test_trim_clip_builds_exact_ffmpeg_command(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake mp4 data")
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    recorded: dict = {}
+    monkeypatch.setattr(concat_module.subprocess, "run", _fake_run_recording(recorded))
+
+    output_path = trim_clip("ffmpeg", clip, 12.5, 40.0, clips_dir, duration_seconds=60.0)
+
+    assert recorded["cmd"] == [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-ss",
+        "12.5",
+        "-to",
+        "40",
+        "-i",
+        str(clip),
+        "-c",
+        "copy",
+        str(clips_dir / "clip-trimmed.mp4"),
+    ]
+    assert output_path == clips_dir / "clip-trimmed.mp4"
+    assert recorded["kwargs"]["capture_output"] is True
+    assert recorded["kwargs"]["text"] is True
+    assert recorded["kwargs"]["timeout"] == concat_module._CONCAT_TIMEOUT
+    for key, value in NO_WINDOW_KWARGS.items():
+        assert recorded["kwargs"][key] == value
+    assert clip.exists()  # the original clip is never deleted
+
+
+def test_trim_clip_appends_counter_when_trimmed_name_exists(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake mp4 data")
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    (clips_dir / "clip-trimmed.mp4").write_bytes(b"previous trim")
+    recorded: dict = {}
+    monkeypatch.setattr(concat_module.subprocess, "run", _fake_run_recording(recorded))
+
+    first = trim_clip("ffmpeg", clip, 0.0, 10.0, clips_dir, duration_seconds=60.0)
+    assert first == clips_dir / "clip-trimmed-1.mp4"
+
+    (clips_dir / "clip-trimmed-1.mp4").write_bytes(b"previous trim")
+    second = trim_clip("ffmpeg", clip, 0.0, 10.0, clips_dir, duration_seconds=60.0)
+    assert second == clips_dir / "clip-trimmed-2.mp4"
+
+
+def test_trim_clip_rejects_start_at_or_after_end(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake mp4 data")
+    run_calls = []
+    monkeypatch.setattr(concat_module.subprocess, "run", lambda *a, **k: run_calls.append(True))
+
+    with pytest.raises(TrimRangeError):
+        trim_clip("ffmpeg", clip, 10.0, 10.0, tmp_path, duration_seconds=60.0)
+    with pytest.raises(TrimRangeError):
+        trim_clip("ffmpeg", clip, 11.0, 10.0, tmp_path, duration_seconds=60.0)
+
+    assert run_calls == []  # validation happens before ffmpeg is ever spawned
+
+
+def test_trim_clip_rejects_end_beyond_duration(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake mp4 data")
+    recorded: dict = {}
+    monkeypatch.setattr(concat_module.subprocess, "run", _fake_run_recording(recorded))
+
+    with pytest.raises(TrimRangeError):
+        trim_clip("ffmpeg", clip, 10.0, 60.5, tmp_path, duration_seconds=60.0)
+    assert "cmd" not in recorded
+
+    # ...while an end exactly AT the duration is the allowed boundary.
+    trim_clip("ffmpeg", clip, 0.0, 60.0, tmp_path, duration_seconds=60.0)
+    assert "cmd" in recorded
+
+
+def test_trim_clip_rejects_negative_start(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake mp4 data")
+    run_calls = []
+    monkeypatch.setattr(concat_module.subprocess, "run", lambda *a, **k: run_calls.append(True))
+
+    with pytest.raises(TrimRangeError):
+        trim_clip("ffmpeg", clip, -0.5, 10.0, tmp_path, duration_seconds=60.0)
+
+    assert run_calls == []
+
+
+def test_trim_clip_probes_duration_when_not_provided(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake mp4 data")
+    monkeypatch.setattr(concat_module.thumbnails, "find_ffprobe", lambda ffmpeg_path: "/fake/ffprobe")
+    monkeypatch.setattr(concat_module.thumbnails, "get_duration_seconds", lambda ffprobe, path: 30.0)
+    recorded: dict = {}
+    monkeypatch.setattr(concat_module.subprocess, "run", _fake_run_recording(recorded))
+
+    # 40s is beyond the probed 30s duration -- validation uses the probe.
+    with pytest.raises(TrimRangeError):
+        trim_clip("ffmpeg", clip, 10.0, 40.0, tmp_path, duration_seconds=None)
+
+    output_path = trim_clip("ffmpeg", clip, 10.0, 20.0, tmp_path)
+    assert output_path == tmp_path / "clip-trimmed.mp4"
+
+
+def test_trim_clip_raises_when_duration_probe_fails(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake mp4 data")
+    monkeypatch.setattr(concat_module.thumbnails, "find_ffprobe", lambda ffmpeg_path: None)
+    run_calls = []
+    monkeypatch.setattr(concat_module.subprocess, "run", lambda *a, **k: run_calls.append(True))
+
+    with pytest.raises(TrimRangeError, match="duration"):
+        trim_clip("ffmpeg", clip, 1.0, 2.0, tmp_path)
+
+    assert run_calls == []
+
+
+def test_trim_clip_raises_concat_failed_with_truncated_stderr(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake mp4 data")
+    monkeypatch.setattr(concat_module.subprocess, "run", _fake_run_recording({}, returncode=1, stderr="x" * 2000))
+
+    with pytest.raises(ConcatFailedError) as excinfo:
+        trim_clip("ffmpeg", clip, 1.0, 2.0, tmp_path, duration_seconds=60.0)
+
+    message = str(excinfo.value)
+    assert message.startswith("ffmpeg trim failed:")
+    assert "x" * 1000 in message
+    assert "x" * 1001 not in message
