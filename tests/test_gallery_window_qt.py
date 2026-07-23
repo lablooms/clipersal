@@ -462,26 +462,61 @@ def test_selection_mode_toggles_checkboxes_and_leaving_clears_selection(tmp_path
     gallery = _make_gallery(clips_dir)
     row = gallery._rows[clip_path]
     assert row.select_checkbox.isHidden() is True
-    assert gallery._selection_bar.isHidden() is True
+    # Outside selection mode the footer shows its normal stats line.
+    assert gallery._footer_stack.currentWidget() is gallery._footer_normal_page
 
     gallery.select_button.click()
     assert gallery._selection_mode is True
+    assert gallery.select_button.isChecked() is True
     assert row.select_checkbox.isHidden() is False
-    assert gallery._selection_bar.isHidden() is False
-    assert gallery.select_button.text() == "Done"
+    # ...and in selection mode the footer swaps to the action bar -- the
+    # strip itself never moves or resizes (its height is pinned).
+    assert gallery._footer_stack.currentWidget() is gallery._selection_bar
+    assert gallery.select_button.text() == "Select"
 
     row.select_checkbox.setChecked(True)
     assert gallery._selected == {clip_path}
+    assert gallery._selected_count_label.text() == "1 selected"
     assert gallery.delete_selected_button.text() == "Delete selected (1)"
     assert gallery.delete_selected_button.isEnabled() is True
 
     gallery.select_button.click()  # leave selection mode
     assert gallery._selection_mode is False
+    assert gallery.select_button.isChecked() is False
     assert row.select_checkbox.isHidden() is True
     assert gallery._selected == set()
+    assert gallery._selected_count_label.text() == "0 selected"
     assert gallery.delete_selected_button.text() == "Delete selected (0)"
     assert gallery.delete_selected_button.isEnabled() is False
     assert gallery.select_button.text() == "Select"
+    assert gallery._footer_stack.currentWidget() is gallery._footer_normal_page
+
+
+def test_selection_mode_footer_height_is_pinned_so_the_list_never_moves(tmp_path: Path) -> None:
+    clips_dir = tmp_path / "clips"
+    _make_clip(clips_dir, "clip.mp4", mtime=1000)
+    gallery = _make_gallery(clips_dir)
+    # A fixed min==max height is what guarantees the content swap (stats
+    # line <-> action bar) can never push the clip list up or down.
+    assert gallery._footer_stack.minimumHeight() == gallery._footer_stack.maximumHeight()
+    gallery.select_button.click()
+    assert gallery._footer_stack.minimumHeight() == gallery._footer_stack.maximumHeight()
+
+
+def test_selection_bar_done_button_exits_selection_mode(tmp_path: Path) -> None:
+    clips_dir = tmp_path / "clips"
+    clip_path = _make_clip(clips_dir, "clip.mp4", mtime=1000)
+    gallery = _make_gallery(clips_dir)
+    gallery.select_button.click()
+    gallery._rows[clip_path].select_checkbox.setChecked(True)
+    assert gallery._selection_mode is True
+
+    gallery.done_selecting_button.click()
+
+    assert gallery._selection_mode is False
+    assert gallery.select_button.isChecked() is False
+    assert gallery._selected == set()
+    assert gallery._footer_stack.currentWidget() is gallery._footer_normal_page
 
 
 def test_select_all_selects_only_visible_rows(tmp_path: Path) -> None:
@@ -824,10 +859,11 @@ class _FakePlayerDialog:
 
     instances = []
 
-    def __init__(self, clip_path, ffmpeg_path=None, parent=None):
+    def __init__(self, clip_path, ffmpeg_path=None, parent=None, autoplay=True):
         self.clip_path = clip_path
         self.ffmpeg_path = ffmpeg_path
         self.parent_widget = parent
+        self.autoplay = autoplay
         self.trim_exported = _FakeSignal()
         self.destroyed = _FakeSignal()
         self.delete_on_close = False
@@ -930,6 +966,20 @@ def test_context_menu_trim_action_opens_the_in_app_player(tmp_path: Path, fake_p
 
     assert len(fake_player.instances) == 1
     assert fake_player.instances[0].clip_path == clip_path
+    # Trim opens PAUSED (autoplay=False): a moving playhead makes marks
+    # impossible to land, and autoplay made Trim feel like "just a player".
+    assert fake_player.instances[0].autoplay is False
+
+
+def test_play_actions_open_the_player_with_autoplay(tmp_path: Path, fake_player) -> None:
+    clips_dir = tmp_path / "clips"
+    clip_path = _make_clip(clips_dir, "clip.mp4", mtime=1000)
+    gallery = _make_gallery(clips_dir)
+
+    menu = gallery._build_context_menu(clip_path)
+    next(a for a in _menu_actions(menu) if a.text() == "Play").trigger()
+
+    assert fake_player.instances[0].autoplay is True
 
 
 # ---- row layout: Play + heart + "⋯" ----------------------------------------------

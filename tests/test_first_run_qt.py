@@ -100,6 +100,40 @@ def test_get_started_reports_error_for_unwritable_clips_folder(tmp_path: Path, m
     assert dialog.result() != _FirstRunDialog.DialogCode.Accepted
 
 
+def test_get_started_reports_error_when_persist_fails(tmp_path: Path, monkeypatch) -> None:
+    # config_store.save_overrides can fail (read-only config dir, full
+    # disk): the error belongs on the wizard's error label, not as an
+    # uncaught exception out of the button slot.
+    config = _make_config(tmp_path)
+    dialog = _FirstRunDialog(config)
+
+    def boom(values):
+        raise OSError("disk full (fake)")
+
+    monkeypatch.setattr(first_run_qt.config_store, "save_overrides", boom)
+
+    dialog._get_started()
+
+    assert "disk full" in dialog._error_label.text()
+    assert dialog.result() != _FirstRunDialog.DialogCode.Accepted
+
+
+def test_skip_survives_a_failed_persist(tmp_path: Path, monkeypatch) -> None:
+    # "Skip for now" closes regardless of the write -- the wizard simply
+    # reappears next launch (no config file was written); it must not raise.
+    config = _make_config(tmp_path)
+    dialog = _FirstRunDialog(config)
+
+    def boom(values):
+        raise OSError("disk full (fake)")
+
+    monkeypatch.setattr(first_run_qt.config_store, "save_overrides", boom)
+
+    dialog._skip()
+
+    assert dialog.result() == _FirstRunDialog.DialogCode.Accepted
+
+
 def test_browse_updates_clips_dir_field(tmp_path: Path, monkeypatch) -> None:
     chosen = str(tmp_path / "browsed")
     monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: chosen))

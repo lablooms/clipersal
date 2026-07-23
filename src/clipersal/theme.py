@@ -106,9 +106,30 @@ MONO_FONT = ("Cascadia Code", "Consolas", "Courier New")
 
 # Typography scale (point sizes) -- the ONLY sizes widgets should use, so a
 # rogue ad-hoc `pointSize()+N` or a bare "size 10 here, 13 there" can't creep
-# back in. H1 = tab/page headers ("Home", "Clips"), H2 = section emphasis
-# (the Home status word), BODY = the default reading size, HINT = secondary
-# text, MONO = code-ish readouts (log tail, value badges, status meta).
+# back in. The rules (enforced by the audit below, kept by hand afterwards):
+#
+#   H1 (18, bold)  -- page titles: the Home/Clips/Settings tab headers, the
+#                     About card's app name, dialog main titles (the first-run
+#                     wizard's welcome line).
+#   H2 (14)        -- card/section titles: the #cardTitle style (settings
+#                     cards, the Home "RECENT CLIPS" section, the player's
+#                     "TRIM" card) and the banner/toast titles
+#                     (#crashTitle/#bannerTitle/#toastTitle); also the Home
+#                     status word ("Recording") and the sidebar wordmark.
+#   BODY (12)      -- everything interactive or read as prose: buttons,
+#                     combos, inputs, menu items, tab labels, field labels.
+#                     This is the QApplication default font (cli.py installs
+#                     it), so plain widgets need no setFont call at all.
+#   HINT (11)      -- secondary text: hints, meta lines, footers, empty
+#                     states (the #hint QSS rule pins the size).
+#   MONO (11)      -- code-ish readouts: the Logs textbox, the status card's
+#                     meta/stats lines, the settings value badges.
+#
+# Weight: bold is reserved for page titles, card/section titles, the status
+# word, clip names (gallery faces + details/export dialogs), and #primary
+# buttons -- nothing else, not even nav buttons or the checked segment of a
+# SegmentedControl. Card titles are authored in LITERAL caps (Qt QSS has no
+# text-transform), matching the settings cards that established the look.
 FONT_H1 = 18
 FONT_H2 = 14
 FONT_BODY = 12
@@ -212,15 +233,18 @@ def build_stylesheet() -> str:
 
     QLabel#cardTitle {{
         color: {text_muted};
+        font-size: {FONT_H2}pt;
         font-weight: bold;
     }}
 
     QLabel#hint {{
         color: {text_muted};
+        font-size: {FONT_HINT}pt;
     }}
 
     QLabel#toastTitle {{
         color: {accent};
+        font-size: {FONT_H2}pt;
         font-weight: bold;
     }}
     QLabel#thumbPlaceholder {{
@@ -247,10 +271,12 @@ def build_stylesheet() -> str:
        gold for the low-disk warning. */
     QLabel#crashTitle {{
         color: {live};
+        font-size: {FONT_H2}pt;
         font-weight: bold;
     }}
     QLabel#bannerTitle {{
         color: {accent};
+        font-size: {FONT_H2}pt;
         font-weight: bold;
     }}
 
@@ -265,7 +291,6 @@ def build_stylesheet() -> str:
         text-align: left;
         padding: 8px 12px;
         border-radius: 8px;
-        font-weight: bold;
     }}
     QPushButton#navButton:hover {{
         background-color: {surface_raised};
@@ -285,7 +310,6 @@ def build_stylesheet() -> str:
         text-align: left;
         padding: 8px 12px;
         border-radius: 8px;
-        font-weight: bold;
     }}
     QPushButton#supportButton:hover {{
         background-color: {surface_raised};
@@ -327,7 +351,6 @@ def build_stylesheet() -> str:
         background-color: {live};
         color: {on_accent};
         border: none;
-        font-weight: bold;
     }}
     QPushButton#danger:hover {{
         background-color: {live};
@@ -365,7 +388,6 @@ def build_stylesheet() -> str:
         padding: 0 0 4px 0;  /* ⋯ sits high in the line box -- push it to optical center */
         min-height: 0;
         font-size: 15px;  /* icon glyph (⋯), intentionally px-sized */
-        font-weight: bold;
     }}
 
     QPushButton#recordButton[recording="true"] {{
@@ -396,17 +418,16 @@ def build_stylesheet() -> str:
     QPushButton#segmentedButton:checked {{
         background-color: {accent};
         color: {on_accent};
-        font-weight: bold;
     }}
 
-    QLineEdit, QPlainTextEdit, QComboBox, QSpinBox {{
+    QLineEdit, QPlainTextEdit, QComboBox {{
         background-color: {surface_raised};
         color: {text};
         border: 1px solid {border};
         border-radius: 8px;
         padding: 4px 8px;
     }}
-    QLineEdit:disabled, QPlainTextEdit:disabled, QComboBox:disabled, QSpinBox:disabled {{
+    QLineEdit:disabled, QPlainTextEdit:disabled, QComboBox:disabled {{
         /* The platform style's own disabled paint can be an unthemed grey
            box; pin it to the palette and just mute the text. */
         background-color: {surface_raised};
@@ -428,22 +449,29 @@ def build_stylesheet() -> str:
         selection-color: {on_accent};
     }}
 
-    /* Spinbox steppers: the native grey up/down column clashed with the
-       themed input it sits inside of ("the turning up and down button" the
-       user flagged in the export dialogs). The arrow glyphs themselves are
-       drawn by Qt in the spinbox's text color, which the QLineEdit-style
-       rule above already points at the TEXT token. */
-    QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {{
+    /* StepperSpinBox's stacked ▲/▼ buttons (qt_widgets.py): two small glyph
+       buttons in a TRACK column beside the themed line edit, replacing the
+       native spinbox's up/down chrome (tiny platform triangles on a grey
+       strip) that QSS could never restyle far enough. Exempt from the
+       QPushButton legibility floor: the pair shares one line-edit height. */
+    QPushButton#stepButton {{
         background-color: {track};
-        border: none;
-        border-left: 1px solid {border};
-        width: 18px;
+        color: {text};
+        border: 1px solid {border};
+        border-radius: 4px;
+        padding: 0;
+        min-height: 0;
+        font-size: 9px;  /* ▲/▼ icon glyphs, intentionally px-sized */
     }}
-    QAbstractSpinBox::up-button:hover, QAbstractSpinBox::down-button:hover {{
+    QPushButton#stepButton:hover {{
         background-color: {surface_raised};
     }}
-    QAbstractSpinBox::up-button:pressed, QAbstractSpinBox::down-button:pressed {{
+    QPushButton#stepButton:pressed {{
         background-color: {accent};
+        color: {on_accent};
+    }}
+    QPushButton#stepButton:disabled {{
+        color: {text_muted};
     }}
 
     /* Checkbox indicator (gallery selection mode): a themed rounded square,
@@ -528,33 +556,58 @@ def build_stylesheet() -> str:
         border: none;
         background: transparent;
     }}
+    /* Modern minimal scrollbar, both orientations symmetric: a fully
+       transparent track (no BACKGROUND-colored strip), no add/sub-line
+       buttons, no page-step fill, and an inset handle that reads as a
+       floating pill rather than a strip filling the gutter. */
     QScrollBar:vertical {{
-        background: {bg};
-        width: 10px;
+        background: transparent;
+        width: 8px;
         margin: 0;
     }}
     QScrollBar::handle:vertical {{
         background: {border};
-        border-radius: 5px;
+        border-radius: 4px;
         min-height: 24px;
+        margin: 1px;  /* the inset that makes it a pill, not a strip */
+    }}
+    QScrollBar::handle:vertical:hover {{
+        background: {text_muted};
+    }}
+    QScrollBar::handle:vertical:pressed {{
+        background: {accent};
     }}
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
         height: 0;
     }}
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+        background: none;
+    }}
 
-    /* Horizontal twin (the Logs textbox, wide pages): left unthemed it
-       painted a platform-default white/grey strip, glaring in dark mode. */
+    /* Horizontal twin (the Logs textbox's NoWrap box, wide pages): left
+       unthemed it painted a platform-default white/grey strip, glaring in
+       dark mode. */
     QScrollBar:horizontal {{
-        background: {bg};
-        height: 10px;
+        background: transparent;
+        height: 8px;
         margin: 0;
     }}
     QScrollBar::handle:horizontal {{
         background: {border};
-        border-radius: 5px;
+        border-radius: 4px;
         min-width: 24px;
+        margin: 1px;
+    }}
+    QScrollBar::handle:horizontal:hover {{
+        background: {text_muted};
+    }}
+    QScrollBar::handle:horizontal:pressed {{
+        background: {accent};
     }}
     QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
         width: 0;
+    }}
+    QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+        background: none;
     }}
     """

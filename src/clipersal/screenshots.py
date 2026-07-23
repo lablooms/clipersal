@@ -97,9 +97,14 @@ def save_screenshot(ffmpeg_path: str, buffer_dir: Path, clips_dir: Path) -> Path
             # leaves a partial PNG behind -- same cleanup rule as concat's.
             output_path.unlink(missing_ok=True)
             raise
-        if result.returncode == 0:
+        if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
             log.info("Saved screenshot: %s (from %s)", output_path, segment.name)
             return output_path
+        # ffmpeg can exit 0 WITHOUT writing a frame -- -sseof past the last
+        # decodable frame (seen on QSV-encoded segments) decodes nothing yet
+        # reports success. A missing/empty output is a failed grab: fall
+        # through to the next seek strategy instead of returning a ghost path.
+        output_path.unlink(missing_ok=True)
 
     output_path.unlink(missing_ok=True)
     raise ScreenshotError(f"ffmpeg screenshot grab failed:\n{result.stderr.strip()[-1000:]}")

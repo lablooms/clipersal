@@ -6,11 +6,17 @@ pytest.importorskip("PySide6")
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, QPointF, Qt
-from PySide6.QtGui import QWheelEvent
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtGui import QKeyEvent, QWheelEvent
 from PySide6.QtWidgets import QApplication, QComboBox, QPushButton, QSlider, QSpinBox
 
-from clipersal.qt_widgets import SegmentedControl, ToggleSwitch, WheelGuard
+from clipersal.qt_widgets import (
+    SegmentedControl,
+    StepperDoubleSpinBox,
+    StepperSpinBox,
+    ToggleSwitch,
+    WheelGuard,
+)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -261,3 +267,249 @@ def test_elided_label_reelides_on_resize_and_set_text() -> None:
     label.resize(600, 20)
     assert QLabel.text(label) == "y" * 40  # widened -> full again
     label.close()
+
+
+# ---- StepperSpinBox / StepperDoubleSpinBox ----------------------------------
+#
+# The themed re-skin of the native spinboxes: a QLineEdit plus two stacked
+# ▲/▼ step buttons. These tests pin the Qt-spinbox API subset the call sites
+# use (settings' quick-save seconds, the GIF dialog's fields) and the commit
+# semantics (typed text clamps/reverts on editingFinished; valueChanged only
+# on an actual change, so the Settings rollback's blocked setValue can't
+# re-schedule the autosave it undoes).
+
+
+def _int_spin(minimum: int = 5, maximum: int = 300, value: int = 30) -> StepperSpinBox:
+    spin = StepperSpinBox()
+    spin.setRange(minimum, maximum)
+    spin.setValue(value)
+    return spin
+
+
+def test_stepper_spin_set_value_clamps_into_the_range() -> None:
+    spin = _int_spin()
+    assert spin.value() == 30
+    spin.setValue(999)
+    assert spin.value() == 300
+    spin.setValue(1)
+    assert spin.value() == 5
+
+
+def test_stepper_spin_range_and_suffix_accessors() -> None:
+    spin = StepperSpinBox()
+    spin.setRange(5, 300)
+    spin.setSuffix(" s")
+    assert spin.minimum() == 5
+    assert spin.maximum() == 300
+    assert spin.suffix() == " s"
+    spin.setMinimum(10)
+    spin.setMaximum(200)
+    assert (spin.minimum(), spin.maximum()) == (10, 200)
+
+
+def test_stepper_spin_text_shows_the_formatted_value_and_suffix() -> None:
+    spin = _int_spin(value=45)
+    spin.setSuffix(" s")
+    assert spin._edit.text() == "45 s"
+
+
+def test_stepper_spin_set_value_emits_value_changed_only_on_an_actual_change() -> None:
+    spin = _int_spin()
+    received = []
+    spin.valueChanged.connect(received.append)
+    spin.setValue(30)  # already the value -- silent (the rollback path relies on this)
+    assert received == []
+    spin.setValue(60)
+    assert received == [60]
+
+
+def test_stepper_spin_set_range_pulls_an_out_of_range_value_back_inside() -> None:
+    spin = _int_spin(minimum=0, maximum=100, value=50)
+    received = []
+    spin.valueChanged.connect(received.append)
+    spin.setRange(0, 40)
+    assert spin.value() == 40
+    assert received == [40]
+
+
+def test_stepper_spin_step_buttons_step_and_emit() -> None:
+    spin = _int_spin()
+    received = []
+    spin.valueChanged.connect(received.append)
+    spin._up_button.click()
+    assert spin.value() == 31
+    spin._down_button.click()
+    spin._down_button.click()
+    assert spin.value() == 29
+    assert received == [31, 30, 29]
+    # The display tracks every step.
+    assert spin._edit.text() == "29"
+
+
+def test_stepper_spin_step_buttons_clamp_at_the_range_edges() -> None:
+    spin = _int_spin(minimum=5, maximum=6, value=6)
+    received = []
+    spin.valueChanged.connect(received.append)
+    spin._up_button.click()  # already at max -- no change, no signal
+    assert spin.value() == 6
+    spin._down_button.click()
+    spin._down_button.click()  # clamps at min
+    assert spin.value() == 5
+    assert received == [5]
+
+
+def test_stepper_spin_single_step_override() -> None:
+    spin = StepperSpinBox()
+    spin.setRange(200, 1920)
+    spin.setSingleStep(20)
+    spin.setValue(480)
+    spin._up_button.click()
+    assert spin.value() == 500
+    spin._down_button.click()
+    assert spin.value() == 480
+
+
+def test_stepper_spin_typed_value_commits_on_editing_finished() -> None:
+    spin = _int_spin()
+    values, finished = [], []
+    spin.valueChanged.connect(values.append)
+    spin.editingFinished.connect(lambda: finished.append(True))
+    spin._edit.setText("72")
+    spin._edit.editingFinished.emit()
+    assert spin.value() == 72
+    assert values == [72]
+    assert finished == [True]
+
+
+def test_stepper_spin_out_of_range_typed_text_clamps_on_commit() -> None:
+    # A programmatic setText bypasses the bounded validator (interactive
+    # typing can't produce this) -- the commit still clamps.
+    spin = _int_spin()
+    spin._edit.setText("9999")
+    spin._edit.editingFinished.emit()
+    assert spin.value() == 300
+    assert spin._edit.text() == "300"
+    spin._edit.setText("1")
+    spin._edit.editingFinished.emit()
+    assert spin.value() == 5
+
+
+def test_stepper_spin_unparseable_text_reverts_to_the_current_value() -> None:
+    spin = _int_spin(value=45)
+    spin.setSuffix(" s")
+    spin._edit.setText("abc")
+    spin._edit.editingFinished.emit()
+    assert spin.value() == 45
+    assert spin._edit.text() == "45 s"  # reverted AND reformatted
+
+
+def test_stepper_spin_suffix_is_stripped_when_parsing_a_commit() -> None:
+    spin = _int_spin(value=30)
+    spin.setSuffix(" s")
+    spin._edit.setText("72 s")
+    spin._edit.editingFinished.emit()
+    assert spin.value() == 72
+    assert spin._edit.text() == "72 s"
+    # A bare number commits too, and picks the suffix up in the reformat.
+    spin._edit.setText("45")
+    spin._edit.editingFinished.emit()
+    assert spin.value() == 45
+    assert spin._edit.text() == "45 s"
+
+
+def test_stepper_spin_plain_focus_out_emits_editing_finished_without_value_changed() -> None:
+    spin = _int_spin()
+    values, finished = [], []
+    spin.valueChanged.connect(values.append)
+    spin.editingFinished.connect(lambda: finished.append(True))
+    spin._edit.editingFinished.emit()  # no edit happened
+    assert values == []
+    assert finished == [True]
+
+
+def test_stepper_spin_arrow_keys_step() -> None:
+    spin = _int_spin()
+    up = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Up, Qt.KeyboardModifier.NoModifier)
+    down = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Down, Qt.KeyboardModifier.NoModifier)
+    QApplication.sendEvent(spin._edit, up)
+    assert spin.value() == 31
+    QApplication.sendEvent(spin._edit, down)
+    QApplication.sendEvent(spin._edit, down)
+    assert spin.value() == 29
+
+
+def test_stepper_spin_wheel_is_a_no_op_not_a_step(qapp) -> None:
+    # The widget is NOT a QAbstractSpinBox, so the app-wide WheelGuard leaves
+    # its wheel events alone -- they must bubble up to scroll the page, and
+    # the line edit itself must never step on them.
+    spin = _int_spin()
+    guard = WheelGuard()
+    assert guard.eventFilter(spin._edit, _wheel_event()) is False  # page scroll stays possible
+    QApplication.sendEvent(spin._edit, _wheel_event())
+    assert spin.value() == 30
+
+
+def test_stepper_spin_disabled_state_propagates_to_the_children() -> None:
+    spin = _int_spin()
+    spin.setEnabled(False)
+    assert spin._edit.isEnabled() is False
+    assert spin._up_button.isEnabled() is False
+    assert spin._down_button.isEnabled() is False
+    spin.setEnabled(True)
+    assert spin._edit.isEnabled() is True
+    assert spin._up_button.isEnabled() is True
+
+
+def _double_spin(minimum: float = 0.5, maximum: float = 30.0, value: float = 3.0) -> StepperDoubleSpinBox:
+    spin = StepperDoubleSpinBox()
+    spin.setRange(minimum, maximum)
+    spin.setDecimals(1)
+    spin.setValue(value)
+    return spin
+
+
+def test_stepper_double_formats_with_decimals_and_suffix() -> None:
+    spin = _double_spin()
+    spin.setSuffix(" s")
+    assert spin.value() == 3.0
+    assert spin._edit.text() == "3.0 s"
+
+
+def test_stepper_double_default_step_is_a_half() -> None:
+    spin = _double_spin()
+    received = []
+    spin.valueChanged.connect(received.append)
+    spin._up_button.click()
+    assert spin.value() == 3.5
+    spin._down_button.click()
+    assert spin.value() == 3.0
+    assert received == [3.5, 3.0]
+
+
+def test_stepper_double_typed_value_commits_clamped_and_reformatted() -> None:
+    spin = _double_spin()
+    spin.setSuffix(" s")
+    spin._edit.setText("99.9")
+    spin._edit.editingFinished.emit()
+    assert spin.value() == 30.0
+    assert spin._edit.text() == "30.0 s"
+    spin._edit.setText("7.25 s")
+    spin._edit.editingFinished.emit()
+    assert spin.value() == 7.2 or spin.value() == 7.3  # rounded to the display precision
+    assert spin._edit.text().endswith(" s")
+
+
+def test_stepper_double_unparseable_and_non_finite_text_reverts() -> None:
+    spin = _double_spin(value=1.5)
+    for bad_text in ("abc", "nan", "inf", ""):
+        spin._edit.setText(bad_text)
+        spin._edit.editingFinished.emit()
+        assert spin.value() == 1.5
+        assert spin._edit.text() == "1.5"
+
+
+def test_stepper_double_arrow_keys_step_by_the_half_step() -> None:
+    spin = _double_spin(value=1.0)
+    up = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Up, Qt.KeyboardModifier.NoModifier)
+    QApplication.sendEvent(spin._edit, up)
+    assert spin.value() == 1.5

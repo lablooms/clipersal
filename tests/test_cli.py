@@ -525,6 +525,48 @@ def _stop_main(fakes, thread, result) -> None:
     assert result["rc"] == 0
 
 
+def test_ipc_handlers_answer_before_the_main_window_exists(monkeypatch, tmp_path) -> None:
+    # The command handlers are registered before MainWindow is constructed,
+    # and the hotkey listener starts inside that window -- so a command can
+    # genuinely arrive while `main_window` is still an unassigned closure
+    # cell. Reading it must produce the intended "main window unavailable"
+    # RuntimeError, not a NameError from the unbound cell.
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+
+    early: dict = {}
+
+    class EarlyInvokeServer:
+        """Invokes SHOW synchronously at registration time -- i.e. before
+        cli.py gets anywhere near its MainWindow construction."""
+
+        def __init__(self, host="127.0.0.1", port=51525):
+            self.port = port
+            self.handlers = {}
+            fakes.server = self
+
+        def register(self, command, handler):
+            self.handlers[command] = handler
+            if command == "SHOW":
+                try:
+                    handler()
+                except Exception as exc:  # noqa: BLE001 -- capture it; registration must continue
+                    early["SHOW"] = exc
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(cli.ipc, "IpcServer", EarlyInvokeServer)
+    thread, result = _start_main(fakes)
+
+    assert isinstance(early.get("SHOW"), RuntimeError)
+    assert "main window unavailable" in str(early["SHOW"])
+
+    _stop_main(fakes, thread, result)
+
+
 def test_apply_settings_bogus_encoder_keeps_old_capture_running_and_untouched(monkeypatch, tmp_path) -> None:
     fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
     thread, result = _start_main(fakes)
@@ -637,7 +679,33 @@ def test_apply_settings_invalid_hotkey_is_rejected_before_touching_anything(monk
     _stop_main(fakes, thread, result)
 
 
-def test_apply_settings_failed_autostart_registration_reverts_toggle_and_reports_error(monkeypatch, tmp_path) -> None:
+def test_apply_settings_failed_autostart_registration_blocks_the_whole_apply(monkeypatch, tmp_path) -> None:
+    # The launch-on-startup registration is a pre-flight gate like every
+    # other validation in apply_settings: when it fails, NOTHING else in the
+    # payload may apply or persist either. It used to run after all other
+    # fields applied and persisted, and the Settings tab's roll-everything-
+    # back response to the error then silently reverted those actually-
+    # applied settings on the next save -- a config/UI/disk divergence.
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli.autostart, "is_supported", lambda os_: True)
+
+    def failing_enable(os_):
+        raise OSError("access denied (fake)")
+
+    monkeypatch.setattr(cli.autostart, "enable", failing_enable)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, launch_on_startup=True, buffer_seconds=90))
+
+    assert error is not None and "launch-on-startup" in error
+    assert fakes.config.launch_on_startup is False
+    assert fakes.config.buffer_seconds == 60  # the unrelated change was blocked too
+    assert fakes.saved_overrides == []
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_failed_autostart_registration_applies_and_persists_nothing(monkeypatch, tmp_path) -> None:
     fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
     enable_calls = []
 
@@ -654,10 +722,12 @@ def test_apply_settings_failed_autostart_registration_reverts_toggle_and_reports
     # The failure surfaces as an apply error -- no hollow "Saved ✓"
     # over a toggle that didn't take effect.
     assert error is not None and "launch-on-startup" in error
-    # Belief reverts to reality: the field (and what gets persisted) says
-    # off, because the OS registration never happened.
+    # Nothing was mutated (the pre-flight gate fires before the mutation
+    # block) and nothing persisted, so the Settings tab's roll-everything-back
+    # response to an error string tells the truth: config, UI, and disk all
+    # still hold the old values.
     assert fakes.config.launch_on_startup is False
-    assert fakes.saved_overrides[-1]["launch_on_startup"] is False
+    assert fakes.saved_overrides == []
 
     # Diffing against the REAL config means a second Save with the same
     # intent retries the registration instead of silently no-op'ing.
@@ -688,6 +758,148 @@ def test_apply_settings_successful_autostart_registration_persists_and_deregiste
     assert fakes.config.launch_on_startup is False
     assert fakes.on_apply(_settings_values(fakes.config, launch_on_startup=False)) is None
     assert calls == ["enable", "disable"]
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_failed_capture_restart_rolls_back_and_revives_old_session(monkeypatch, tmp_path) -> None:
+    # The restart itself (not just resolve_setup) can still fail: the Wayland
+    # portal handshake happens at session.start(), and its share dialog can
+    # be cancelled there. The failure must come back as an error string with
+    # the live config rolled back and the OLD capture running again -- never
+    # an uncaught exception that leaves capture dead while STATUS lies
+    # "RECORDING", the config mutated, and the disk stale.
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+
+    sessions = []
+
+    class FlakySecondSession:
+        def __init__(self, config, setup):
+            sessions.append(self)
+            self.start_attempts = 0
+            self.stop_count = 0
+            self._running = False
+            self._fail_next_start = len(sessions) == 2  # the restart-session's first start fails
+
+        def start(self):
+            self.start_attempts += 1
+            if self._fail_next_start:
+                self._fail_next_start = False
+                raise cli.PortalError("user cancelled the share dialog (fake)")
+            self._running = True
+
+        def stop(self):
+            self.stop_count += 1
+            self._running = False
+
+        def is_running(self):
+            return self._running
+
+        def gave_up_restarting(self):
+            return False
+
+    monkeypatch.setattr(cli.capture, "SegmentedCapture", FlakySecondSession)
+    thread, result = _start_main(fakes)
+
+    # A temp-buffer config must keep its temp marker across the rollback --
+    # otherwise shutdown would stop deleting the auto-created buffer dir.
+    fakes.config.buffer_dir_is_temp = True
+
+    # A capture-restart-class change (bitrate) plus a live-class one
+    # (buffer): the rollback must cover both.
+    error = fakes.on_apply(_settings_values(fakes.config, video_bitrate="12M", buffer_seconds=90))
+
+    assert error is not None and "Could not apply capture settings" in error
+    # The live config rolled all the way back...
+    assert fakes.config.video_bitrate == "8M"
+    assert fakes.config.buffer_seconds == 60
+    assert fakes.config.buffer_dir_is_temp is True
+    # ...nothing persisted...
+    assert fakes.saved_overrides == []
+    # ...and the OLD session was brought back: stopped once for the swap,
+    # then started again by the rollback (its first start was main()'s).
+    assert sessions[0].start_attempts == 2
+    assert sessions[0].stop_count == 1
+    assert sessions[0].is_running() is True
+    assert fakes.server.handlers["STATUS"]() == "RECORDING"
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_capture_change_while_crashed_restarts_capture(monkeypatch, tmp_path) -> None:
+    # Applying a capture-class change while CRASHED must bring capture back
+    # with the new settings. Previously restart_capture only restarted when
+    # the old process was still alive, so an apply after a give-up swapped
+    # in a session that NEVER started -- while STATUS claimed RECORDING.
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+
+    sessions = []
+
+    class CrashingSession:
+        def __init__(self, config, setup):
+            sessions.append(self)
+            self.starts = 0
+            self.stops = 0
+            self._running = False
+            self._gave_up = False
+
+        def start(self):
+            self.starts += 1
+            self._running = True
+            self._gave_up = False
+
+        def stop(self):
+            self.stops += 1
+            self._running = False
+
+        def is_running(self):
+            return self._running
+
+        def gave_up_restarting(self):
+            return self._gave_up
+
+    monkeypatch.setattr(cli.capture, "SegmentedCapture", CrashingSession)
+    thread, result = _start_main(fakes)
+
+    # Simulate the give-up: the startup session's ffmpeg is dead and the
+    # restart budget is exhausted.
+    sessions[0]._running = False
+    sessions[0]._gave_up = True
+    assert fakes.server.handlers["STATUS"]() == "CRASHED"
+
+    error = fakes.on_apply(_settings_values(fakes.config, video_bitrate="12M"))
+
+    assert error is None
+    # The old session was stopped (resource teardown: the stale ffmpeg.log
+    # handle the new start would otherwise trip over) and the NEW session
+    # actually started -- capture is back with the new settings.
+    assert sessions[0].stops == 1
+    assert len(sessions) == 2
+    assert sessions[1]._running is True
+    assert fakes.server.handlers["STATUS"]() == "RECORDING"
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_persist_failure_reports_an_error_instead_of_raising(monkeypatch, tmp_path) -> None:
+    # config_store.save_overrides can fail (a read-only config dir, a full
+    # disk): apply_settings' contract with the Settings tab is "return None
+    # or an error string", so the OSError must surface as the string, never
+    # escape as an uncaught exception out of the autosave slot.
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+
+    def failing_save(overrides):
+        raise OSError("disk full (fake)")
+
+    monkeypatch.setattr(cli.config_store, "save_overrides", failing_save)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, buffer_seconds=90))
+
+    assert error is not None and "Could not save settings" in error
+    # The in-memory apply already happened (the Settings tab's rollback
+    # covers the fields); only the disk write failed.
+    assert fakes.config.buffer_seconds == 90
 
     _stop_main(fakes, thread, result)
 
@@ -1309,8 +1521,29 @@ def test_hotkey_callbacks_send_the_right_ipc_commands(monkeypatch, tmp_path) -> 
     _stop_main(fakes, thread, result)
 
 
+def test_trigger_command_via_ipc_gives_save_commands_the_save_timeout(monkeypatch) -> None:
+    # A hotkey-triggered SAVE/SCREENSHOT goes through the same server-side
+    # remux as a button save (concat's 60s ceiling), so the 5s default
+    # reported slow-but-successful saves as failures in the log. They must
+    # get the same SAVE_TIMEOUT leash the main window and tray use.
+    sent = []
+    monkeypatch.setattr(
+        cli.ipc_client,
+        "send_command",
+        lambda command, port, timeout=5.0: sent.append((command, timeout)) or "OK done",
+    )
 
-# ---- 0.1.4: size-cap sweep on save/apply, save-sound fields, {window} saves ---------
+    cli._trigger_command_via_ipc("SAVE", 51525)
+    cli._trigger_command_via_ipc("SAVE 30", 51525)
+    cli._trigger_command_via_ipc("SCREENSHOT", 51525)
+    cli._trigger_command_via_ipc("STATUS", 51525)
+
+    assert sent == [
+        ("SAVE", cli.ipc_client.SAVE_TIMEOUT),
+        ("SAVE 30", cli.ipc_client.SAVE_TIMEOUT),
+        ("SCREENSHOT", cli.ipc_client.SAVE_TIMEOUT),
+        ("STATUS", 5.0),
+    ]
 
 
 def test_save_handler_runs_size_cap_with_just_saved_clip_protected(monkeypatch, tmp_path) -> None:

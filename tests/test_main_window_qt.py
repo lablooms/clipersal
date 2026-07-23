@@ -43,10 +43,32 @@ def _make_window(
     )
 
 
-def test_all_four_tabs_exist(tmp_path: Path) -> None:
+def test_all_three_tabs_exist(tmp_path: Path) -> None:
+    # Logs is no longer a top-level tab -- it lives inside Settings now.
     win = _make_window(tmp_path)
-    assert set(win._tabs.keys()) == {"home", "clips", "settings", "logs"}
+    assert set(win._tabs.keys()) == {"home", "clips", "settings"}
     assert win._active_tab == "home"
+
+
+def test_select_tab_logs_routes_to_the_settings_logs_subtab(tmp_path: Path) -> None:
+    win = _make_window(tmp_path)
+    win.select_tab("logs")
+    assert win._active_tab == "settings"
+    assert win._content_stack.currentWidget() is win._tabs["settings"]
+    assert win._nav_buttons["settings"].isChecked() is True
+    settings = win._tabs["settings"]
+    assert settings.tabs.currentWidget() is settings.logs_tab
+
+
+def test_select_settings_subtab_selects_settings_and_the_named_subtab(tmp_path: Path) -> None:
+    win = _make_window(tmp_path)
+    win.select_settings_subtab("logs")
+    assert win._active_tab == "settings"
+    settings = win._tabs["settings"]
+    assert settings.tabs.currentWidget() is settings.logs_tab
+    # A field sub-tab is equally selectable by name (case-insensitive).
+    win.select_settings_subtab("About")
+    assert settings.tabs.currentIndex() == [settings.tabs.tabText(i) for i in range(settings.tabs.count())].index("About")
 
 
 def test_select_tab_switches_stack_and_nav_checked_state(tmp_path: Path) -> None:
@@ -198,7 +220,7 @@ def test_poll_status_crashed(tmp_path: Path) -> None:
     try:
         win = _make_window(tmp_path, ipc_port=server.port)
         win._poll_status()
-        assert win._status_label.text() == "Capture stopped -- see Logs"
+        assert win._status_label.text() == "Capture stopped -- see Settings→Logs"
         assert win._pause_button.text() == "Resume capture"
         assert win.windowTitle() == "Clipersal — Capture stopped"
     finally:
@@ -333,13 +355,15 @@ def test_crash_banner_restart_button_sends_resume(tmp_path: Path) -> None:
         server.stop()
 
 
-def test_crash_banner_view_logs_button_selects_logs_tab(tmp_path: Path) -> None:
+def test_crash_banner_view_logs_button_selects_settings_logs_subtab(tmp_path: Path) -> None:
     win = _make_window(tmp_path)
     win._crash_banner.setVisible(True)
     buttons = win._crash_banner.findChildren(type(win._crash_restart_button))
     view_logs = next(b for b in buttons if b.text() == "View logs")
     view_logs.click()
-    assert win._active_tab == "logs"
+    assert win._active_tab == "settings"
+    settings = win._tabs["settings"]
+    assert settings.tabs.currentWidget() is settings.logs_tab
 
 
 # ---- crash-report prompt -----------------------------------------------------
@@ -863,10 +887,11 @@ class _FakePlayerDialog:
 
     instances = []
 
-    def __init__(self, clip_path, ffmpeg_path=None, parent=None):
+    def __init__(self, clip_path, ffmpeg_path=None, parent=None, autoplay=True):
         self.clip_path = clip_path
         self.ffmpeg_path = ffmpeg_path
         self.parent_widget = parent
+        self.autoplay = autoplay
         self.trim_exported = _FakeSignal()
         self.destroyed = _FakeSignal()
         self.delete_on_close = False
@@ -1068,8 +1093,11 @@ def test_tab_shortcuts_switch_tabs(tmp_path: Path) -> None:
     assert win._active_tab == "clips"
     shortcuts["Ctrl+3"].activated.emit()
     assert win._active_tab == "settings"
+    # Ctrl+4 jumps straight to the logs -- now the Settings→Logs sub-tab.
     shortcuts["Ctrl+4"].activated.emit()
-    assert win._active_tab == "logs"
+    assert win._active_tab == "settings"
+    settings = win._tabs["settings"]
+    assert settings.tabs.currentWidget() is settings.logs_tab
     shortcuts["Ctrl+1"].activated.emit()
     assert win._active_tab == "home"
     shortcuts["Ctrl+,"].activated.emit()
@@ -1114,147 +1142,9 @@ def test_f5_shortcut_refreshes_the_gallery(tmp_path: Path, monkeypatch) -> None:
     assert called == [True]
 
 
-# ---- logs tab: search / level filter / copy ----------------------------------
-
-
-def _write_log(log_path: Path) -> None:
-    log_path.write_text(
-        "2026-07-22 01:00:00,000 INFO clipersal.cli: capture started\n"
-        "2026-07-22 01:00:01,000 WARNING clipersal.capture: ffmpeg restarted\n"
-        "2026-07-22 01:00:02,000 INFO clipersal.cli: save completed\n"
-        "2026-07-22 01:00:03,000 ERROR clipersal.concat: remux failed\n",
-        encoding="utf-8",
-    )
-
-
-def test_logs_tab_search_filters_case_insensitively(tmp_path: Path) -> None:
-    _write_log(tmp_path / "log.txt")
-    win = _make_window(tmp_path)
-    win._log_search_edit.setText("FFMPEG")  # textChanged triggers the refresh
-    content = win._log_textbox.toPlainText()
-    assert "ffmpeg restarted" in content
-    assert "capture started" not in content
-
-
-def test_logs_tab_level_filter_matches_the_level_token(tmp_path: Path) -> None:
-    _write_log(tmp_path / "log.txt")
-    win = _make_window(tmp_path)
-    win._log_level_combo.setCurrentText("ERROR")
-    content = win._log_textbox.toPlainText()
-    assert "remux failed" in content
-    assert "capture started" not in content
-    assert "ffmpeg restarted" not in content
-
-
-def test_logs_tab_search_and_level_combine(tmp_path: Path) -> None:
-    _write_log(tmp_path / "log.txt")
-    win = _make_window(tmp_path)
-    win._log_search_edit.setText("save")
-    win._log_level_combo.setCurrentText("INFO")
-    content = win._log_textbox.toPlainText()
-    assert "save completed" in content
-    assert "capture started" not in content
-
-
-def test_logs_tab_shows_placeholder_when_nothing_matches(tmp_path: Path) -> None:
-    _write_log(tmp_path / "log.txt")
-    win = _make_window(tmp_path)
-    win._log_search_edit.setText("no-such-text-anywhere")
-    assert win._log_textbox.toPlainText() == "(no log lines match)"
-
-
-def test_logs_tab_missing_log_file_message(tmp_path: Path) -> None:
-    win = _make_window(tmp_path)  # no log.txt written
-    win._refresh_log_tail()
-    assert "log file not found" in win._log_textbox.toPlainText()
-
-
-def test_logs_tab_copy_puts_the_filtered_text_on_the_clipboard(tmp_path: Path) -> None:
-    _write_log(tmp_path / "log.txt")
-    win = _make_window(tmp_path)
-    win._log_level_combo.setCurrentText("WARNING")
-    win._on_copy_logs()
-    from PySide6.QtGui import QGuiApplication
-
-    assert QGuiApplication.clipboard().text() == win._log_textbox.toPlainText()
-    assert "ffmpeg restarted" in QGuiApplication.clipboard().text()
-
-
-def test_logs_tab_autoscroll_off_keeps_scroll_position(tmp_path: Path) -> None:
-    _write_log(tmp_path / "log.txt")
-    win = _make_window(tmp_path)
-    win._log_autoscroll_switch.setChecked(False)
-    scrollbar = win._log_textbox.verticalScrollBar()
-    scrollbar.setValue(0)
-    win._refresh_log_tail()
-    assert scrollbar.value() == 0
-
-
-# ---- logs tab: export diagnostics --------------------------------------------
-
-
-def test_export_diagnostics_writes_zip_and_reports_success(tmp_path: Path, monkeypatch) -> None:
-    from PySide6.QtWidgets import QFileDialog
-
-    (tmp_path / "log.txt").write_text("log line\n", encoding="utf-8")
-    target = tmp_path / "diag.zip"
-    monkeypatch.setattr(
-        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(target), "Zip files (*.zip)"))
-    )
-
-    win = _make_window(tmp_path, diagnostics_facts_provider=lambda: {"os": "test-os"})
-    win._on_export_diagnostics()
-
-    assert target.exists()
-    assert win._diagnostics_status_label.property("state") == "success"
-    assert str(target) in win._diagnostics_status_label.text()
-
-
-def test_export_diagnostics_reports_failure(tmp_path: Path, monkeypatch) -> None:
-    from PySide6.QtWidgets import QFileDialog
-
-    (tmp_path / "log.txt").write_text("log line\n", encoding="utf-8")
-    # A directory where the zip should go -> export_diagnostics_zip fails.
-    monkeypatch.setattr(
-        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(tmp_path), "Zip files (*.zip)"))
-    )
-
-    win = _make_window(tmp_path, diagnostics_facts_provider=lambda: {})
-    win._on_export_diagnostics()
-
-    assert win._diagnostics_status_label.property("state") == "error"
-    assert "Export failed" in win._diagnostics_status_label.text()
-
-
-def test_export_diagnostics_cancelled_dialog_does_nothing(tmp_path: Path, monkeypatch) -> None:
-    from PySide6.QtWidgets import QFileDialog
-
-    monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: ("", "")))
-
-    win = _make_window(tmp_path)
-    win._on_export_diagnostics()
-
-    assert win._diagnostics_status_label.text() == ""
-
-
-
-def test_export_diagnostics_survives_a_failing_facts_provider(tmp_path: Path, monkeypatch) -> None:
-    from PySide6.QtWidgets import QFileDialog
-
-    (tmp_path / "log.txt").write_text("log line\n", encoding="utf-8")
-    target = tmp_path / "diag.zip"
-    monkeypatch.setattr(
-        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(target), "Zip files (*.zip)"))
-    )
-
-    def boom():
-        raise RuntimeError("facts unavailable (fake)")
-
-    win = _make_window(tmp_path, diagnostics_facts_provider=boom)
-    win._on_export_diagnostics()  # must not raise -- facts are best-effort
-
-    assert target.exists()
-    assert win._diagnostics_status_label.property("state") == "success"
+# The log-viewer tests (search/level filters, copy, auto-scroll, export
+# diagnostics) moved to test_settings_window_qt.py along with the Logs page
+# itself, which is now the Settings tab's last sub-tab.
 
 
 # ---- sidebar footer: Lablooms identity + Support ------------------------------

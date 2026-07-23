@@ -15,6 +15,7 @@ been written at all counts as "first run".
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -30,26 +31,38 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from clipersal import config_store
+from clipersal import config_store, theme
 from clipersal.brand import BrandMark, SprigAccent
 from clipersal.config import Config
 from clipersal.hotkey import is_valid_combo
 from clipersal.hotkey_widget_qt import HotkeyField
 
+log = logging.getLogger(__name__)
 
-def _persist(config: Config) -> None:
-    config_store.save_overrides(
-        {
-            "buffer_seconds": config.buffer_seconds,
-            "clips_dir": str(config.clips_dir),
-            "hotkey_combo": config.hotkey_combo,
-            "video_bitrate": config.video_bitrate,
-            "encoder_override": config.encoder_override,
-            "filename_template": config.filename_template,
-            "clip_retention_days": config.clip_retention_days,
-            "launch_on_startup": config.launch_on_startup,
-        }
-    )
+
+def _persist(config: Config) -> str | None:
+    """Persist the (possibly edited) config, returning an error string when
+    the write fails (a read-only config dir, a full disk) instead of raising
+    out of a button slot: "Get Started" surfaces it on the error label,
+    "Skip" just closes (no config file means the wizard reappears next
+    launch, which is honest enough)."""
+    try:
+        config_store.save_overrides(
+            {
+                "buffer_seconds": config.buffer_seconds,
+                "clips_dir": str(config.clips_dir),
+                "hotkey_combo": config.hotkey_combo,
+                "video_bitrate": config.video_bitrate,
+                "encoder_override": config.encoder_override,
+                "filename_template": config.filename_template,
+                "clip_retention_days": config.clip_retention_days,
+                "launch_on_startup": config.launch_on_startup,
+            }
+        )
+    except OSError as exc:
+        log.warning("Could not save settings from the first-run wizard: %s", exc)
+        return str(exc)
+    return None
 
 
 class _FirstRunDialog(QDialog):
@@ -70,13 +83,16 @@ class _FirstRunDialog(QDialog):
         header.addWidget(brand_mark)
         title_col = QVBoxLayout()
         header.addLayout(title_col, 1)
+        # The wizard's one-line page title -- H1 like the main window's page
+        # headers (theme.py's typography rules).
         title_label = QLabel("Welcome to Clipersal!", self)
-        title_font = title_label.font()
-        title_font.setBold(True)
-        title_label.setFont(title_font)
+        title_label.setFont(theme.qfont(size=theme.FONT_H1))
         title_col.addWidget(title_label)
         subtitle = QLabel("Let's get you set up -- takes a few seconds.", self)
         subtitle.setObjectName("hint")
+        # Word-wrap: the dialog is a fixed 440px, and at the HINT size an
+        # unwrapped one-liner can overflow past the right edge.
+        subtitle.setWordWrap(True)
         title_col.addWidget(subtitle)
         header.addWidget(SprigAccent(size=34, parent=self))
 
@@ -85,7 +101,7 @@ class _FirstRunDialog(QDialog):
         layout.addWidget(card)
         card_layout = QVBoxLayout(card)
 
-        card_layout.addWidget(self._bold_label("Clips folder", card))
+        card_layout.addWidget(self._field_label("Clips folder", card))
         clips_row = QHBoxLayout()
         card_layout.addLayout(clips_row)
         self._clips_dir_edit = QLineEdit(str(config.clips_dir), card)
@@ -94,7 +110,7 @@ class _FirstRunDialog(QDialog):
         browse_button.clicked.connect(self._browse_clips_dir)
         clips_row.addWidget(browse_button)
 
-        card_layout.addWidget(self._bold_label("Save hotkey", card))
+        card_layout.addWidget(self._field_label("Save hotkey", card))
         self._hotkey_field = HotkeyField(config.hotkey_combo, card)
         card_layout.addWidget(self._hotkey_field)
         hint_label = QLabel(
@@ -122,12 +138,10 @@ class _FirstRunDialog(QDialog):
         get_started_button.clicked.connect(self._get_started)
         footer.addWidget(get_started_button)
 
-    def _bold_label(self, text: str, parent: QWidget) -> QLabel:
-        label = QLabel(text, parent)
-        font = label.font()
-        font.setBold(True)
-        label.setFont(font)
-        return label
+    def _field_label(self, text: str, parent: QWidget) -> QLabel:
+        """A field name label -- plain BODY text (theme.py's typography
+        rules: bold is reserved for titles and clip names)."""
+        return QLabel(text, parent)
 
     def _browse_clips_dir(self) -> None:
         chosen = QFileDialog.getExistingDirectory(
@@ -182,7 +196,10 @@ class _FirstRunDialog(QDialog):
 
         self._config.clips_dir = new_clips_dir
         self._config.hotkey_combo = hotkey_text
-        _persist(self._config)
+        error = _persist(self._config)
+        if error is not None:
+            self._set_error(f"Could not save settings: {error}")
+            return
         self.accept()
 
     def closeEvent(self, event) -> None:  # noqa: N802 -- the ✕ button behaves like "Skip for now"

@@ -104,20 +104,72 @@ def test_pause_label_toggles_after_successful_pause_and_resume() -> None:
         assert tray._pause_label() == "Pause capture"
 
         tray._on_toggle_pause()
-        assert tray._paused is True
+        # The send runs on a worker thread now; the state flips when its
+        # response lands via the queued _pause_responded signal.
+        assert _drain_until(lambda: tray._paused is True)
         assert tray._pause_label() == "Resume capture"
         assert tray._pause_action.text() == "Resume capture"
 
         tray._on_toggle_pause()
-        assert tray._paused is False
+        assert _drain_until(lambda: tray._paused is False)
         assert tray._pause_action.text() == "Pause capture"
     finally:
+        server.stop()
+
+
+def test_pause_toggle_sends_off_the_gui_thread(monkeypatch) -> None:
+    # PAUSE's server-side session stop can take seconds -- the send must not
+    # run on the tray's (the app's) GUI thread.
+    sent = []
+
+    def fake_send(command, arg=None, host="127.0.0.1", port=51525, timeout=5.0):
+        sent.append({"command": command, "thread": threading.current_thread()})
+        return "OK paused"
+
+    monkeypatch.setattr(tray_qt.ipc_client, "send_command", fake_send)
+    tray = TrayIcon(ipc_port=12345, clips_dir_provider=lambda: Path("/tmp/clips"))
+
+    tray._on_toggle_pause()
+
+    assert _drain_until(lambda: len(sent) == 1 and tray._paused is True)
+    assert sent[0]["command"] == "PAUSE"
+    assert sent[0]["thread"] is not threading.current_thread()
+
+
+def test_pause_click_while_in_flight_is_ignored() -> None:
+    # A second click before the first response lands must not send a second
+    # command -- two interleaved toggles could invert each other's state.
+    gate = threading.Event()
+    calls = []
+    server = IpcServer(port=0)
+
+    def handle(command):
+        def _handler(arg):
+            calls.append(command)
+            gate.wait(5)
+            return "ok"
+
+        return _handler
+
+    server.register("PAUSE", handle("PAUSE"))
+    server.register("RESUME", handle("RESUME"))
+    server.start()
+    try:
+        tray = TrayIcon(ipc_port=server.port, clips_dir_provider=lambda: Path("/tmp/clips"))
+        tray._on_toggle_pause()  # PAUSE -- the worker blocks on the gate
+        tray._on_toggle_pause()  # still in flight -> ignored
+        gate.set()
+        assert _drain_until(lambda: tray._paused is True)
+        assert calls == ["PAUSE"]
+    finally:
+        gate.set()
         server.stop()
 
 
 def test_pause_state_unchanged_when_ipc_unreachable() -> None:
     tray = TrayIcon(ipc_port=1, clips_dir_provider=lambda: Path("/tmp/clips"))
     tray._on_toggle_pause()
+    assert _drain_until(lambda: not tray._pause_in_flight)
     assert tray._paused is False
 
 
@@ -132,6 +184,7 @@ def test_pause_state_unchanged_on_error_response() -> None:
     try:
         tray = TrayIcon(ipc_port=server.port, clips_dir_provider=lambda: Path("/tmp/clips"))
         tray._on_toggle_pause()
+        assert _drain_until(lambda: not tray._pause_in_flight)
         assert tray._paused is False
     finally:
         server.stop()

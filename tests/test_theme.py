@@ -266,12 +266,69 @@ def test_qfont_defaults_to_body_size() -> None:
     assert theme.qfont().pointSize() == theme.FONT_BODY
 
 
-def test_stylesheet_themes_horizontal_scrollbars_too() -> None:
-    # The Logs textbox's horizontal scrollbar painted a platform-default
-    # white/grey strip in dark mode until it got the vertical rules' twin.
+def test_scrollbars_are_minimal_floating_pills_in_both_orientations() -> None:
+    # The modern minimal scrollbar: transparent track (no BACKGROUND-colored
+    # strip), no add/sub-line buttons, no page-step fill, and an inset BORDER
+    # handle (hover -> TEXT_MUTED, pressed -> ACCENT) reading as a floating
+    # pill. The horizontal orientation is the Logs textbox's NoWrap box --
+    # left unthemed it painted a platform-default white/grey strip in dark mode.
     sheet = theme.build_stylesheet()
-    assert "QScrollBar:horizontal" in sheet
-    assert "QScrollBar::handle:horizontal" in sheet
+
+    vertical_bar = sheet.split("QScrollBar:vertical")[1].split("}")[0]
+    assert "background: transparent;" in vertical_bar
+    assert "width: 8px;" in vertical_bar
+    horizontal_bar = sheet.split("QScrollBar:horizontal")[1].split("}")[0]
+    assert "background: transparent;" in horizontal_bar
+    assert "height: 8px;" in horizontal_bar
+
+    for orientation, extent, min_length in (
+        ("vertical", "min-height", "height"),
+        ("horizontal", "min-width", "width"),
+    ):
+        handle = sheet.split(f"QScrollBar::handle:{orientation}")[1].split("}")[0]
+        assert f"background: {theme.LIGHT_TOKENS['BORDER']};" in handle
+        assert "border-radius: 4px;" in handle
+        assert f"{extent}: 24px;" in handle
+        assert "margin: 1px;" in handle  # the inset that makes it a pill, not a strip
+
+        hover = sheet.split(f"QScrollBar::handle:{orientation}:hover")[1].split("}")[0]
+        assert f"background: {theme.LIGHT_TOKENS['TEXT_MUTED']};" in hover
+        pressed = sheet.split(f"QScrollBar::handle:{orientation}:pressed")[1].split("}")[0]
+        assert f"background: {theme.LIGHT_TOKENS['ACCENT']};" in pressed
+
+        lines = sheet.split(f"QScrollBar::add-line:{orientation}, QScrollBar::sub-line:{orientation}")[1].split("}")[0]
+        assert f"{min_length}: 0;" in lines
+        pages = sheet.split(f"QScrollBar::add-page:{orientation}, QScrollBar::sub-page:{orientation}")[1].split("}")[0]
+        assert "background: none;" in pages
+
+    # The handle recolors follow a live theme switch like everything else.
+    theme.apply_theme(True)
+    dark_sheet = theme.build_stylesheet()
+    dark_pressed = dark_sheet.split("QScrollBar::handle:vertical:pressed")[1].split("}")[0]
+    assert f"background: {theme.DARK_TOKENS['ACCENT']};" in dark_pressed
+
+
+def test_stepper_spin_buttons_have_their_own_compact_rule() -> None:
+    # StepperSpinBox's stacked ▲/▼ buttons (qt_widgets.py): TRACK resting,
+    # SURFACE_RAISED hover, ACCENT pressed -- and exempt from the QPushButton
+    # legibility floor since the pair shares one line-edit height.
+    sheet = theme.build_stylesheet()
+    block = sheet.split("QPushButton#stepButton")[1].split("}")[0]
+    assert f"background-color: {theme.LIGHT_TOKENS['TRACK']};" in block
+    assert f"color: {theme.LIGHT_TOKENS['TEXT']};" in block
+    assert "min-height: 0;" in block
+    hover = sheet.split("QPushButton#stepButton:hover")[1].split("}")[0]
+    assert f"background-color: {theme.LIGHT_TOKENS['SURFACE_RAISED']};" in hover
+    pressed = sheet.split("QPushButton#stepButton:pressed")[1].split("}")[0]
+    assert f"background-color: {theme.LIGHT_TOKENS['ACCENT']};" in pressed
+
+
+def test_native_spinbox_qss_is_gone_with_the_native_spinboxes() -> None:
+    # StepperSpinBox/StepperDoubleSpinBox replaced every QSpinBox/
+    # QDoubleSpinBox in the app, so the old chrome rules would be dead weight.
+    sheet = theme.build_stylesheet()
+    assert "QAbstractSpinBox" not in sheet
+    assert "QSpinBox" not in sheet
 
 
 def test_heart_button_has_no_side_padding_to_clip_its_glyph() -> None:

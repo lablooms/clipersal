@@ -160,7 +160,13 @@ class HotkeyField(QWidget):
         self._restyle_record_button(False)
         if final_combo is not None:
             self.entry.setText(final_combo)
-        elif not self.entry.text().strip() or self.entry.text() == "Press keys...":
+        else:
+            # A cancel restores the pre-record text UNCONDITIONALLY: the entry
+            # can hold a half-captured combo at this point (a key pressed and
+            # still held when the cancel lands), and leaving it there leaks it
+            # to the host's autosave -- a modifier-only fragment like "<ctrl>"
+            # passes pynput's parser, so it would persist as a hotkey that
+            # fires on every bare ctrl press.
             self.entry.setText(self._combo_before_record)
         self.recording_finished.emit()
 

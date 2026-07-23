@@ -5,12 +5,19 @@ ToggleSwitch gets its colors from theme.py's flat hex constants directly,
 not from the global QSS stylesheet -- the same "opt out of blanket theming,
 set this one directly" shape used elsewhere, see theme.build_stylesheet's
 docstring for why.
+
+StepperSpinBox/StepperDoubleSpinBox are the exception to "no native
+equivalent": they re-skin QSpinBox/QDoubleSpinBox (themed line edit + two
+glyph buttons) because the native up/down chrome can't be restyled far
+enough with QSS alone -- see _StepperSpinBase's docstring.
 """
 
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import Property, QEasingCurve, QEvent, QObject, QPropertyAnimation, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFontMetrics, QPainter
+from PySide6.QtGui import QColor, QDoubleValidator, QFontMetrics, QIntValidator, QPainter
 from PySide6.QtWidgets import (
     QAbstractButton,
     QAbstractSpinBox,
@@ -18,9 +25,11 @@ from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QSizePolicy,
     QSlider,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -259,3 +268,271 @@ class SegmentedControl(QWidget):
         if button is not None:
             button.setChecked(True)
             self._current = value
+
+
+class _StepperSpinBase(QWidget):
+    """Shared guts of StepperSpinBox / StepperDoubleSpinBox: a themed
+    QLineEdit plus two small stacked ▲/▼ buttons on the right, replacing a
+    native spinbox's chrome. The QSS-only restyle of QAbstractSpinBox's
+    up/down column kept rendering as tiny platform triangles on a grey strip
+    next to the themed inputs (the recurring "the up and down choice is
+    still bad" complaint), so the chrome is now two plain QPushButtons
+    styled by the QPushButton#stepButton rule in theme.py.
+
+    Deliberately NOT a QAbstractSpinBox subclass: the app-wide WheelGuard
+    only eats wheel events for combo/spinbox/slider ancestry, and this
+    widget must keep plain-QLineEdit wheel behavior -- ignore the wheel and
+    let the event bubble up to scroll the page. Up/Down arrow keys step
+    while the edit has focus; typing commits on Enter/focus-out (the line
+    edit's own editingFinished), with out-of-range text clamped into the
+    range and unparseable text reverted. The API is the subset of the Qt
+    spinbox API the call sites use (settings' quick-save seconds, the GIF
+    export dialog's fields), so those read like they always did.
+    """
+
+    editingFinished = Signal()
+    # valueChanged lives on the subclasses -- its payload type differs
+    # (int vs float), and a Qt signal's signature is fixed per class.
+
+    _BUTTON_COLUMN_WIDTH = 22
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._minimum = self._coerce(0)
+        self._maximum = self._coerce(99)
+        self._step = self._default_step()
+        self._suffix = ""
+        self._value = self._coerce(0)
+
+        self._edit = QLineEdit(self)
+        self._edit.setValidator(self._make_validator())
+
+        self._up_button = QPushButton("▲", self)
+        self._up_button.setObjectName("stepButton")
+        self._down_button = QPushButton("▼", self)
+        self._down_button.setObjectName("stepButton")
+        for button in (self._up_button, self._down_button):
+            button.setFixedWidth(self._BUTTON_COLUMN_WIDTH)
+            # Click-to-step without stealing the line edit's focus, so the
+            # arrow keys keep stepping right after a button click (native
+            # spinbox behavior).
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.setAutoRepeat(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(3)
+        layout.addWidget(self._edit, 1)
+        buttons_column = QVBoxLayout()
+        buttons_column.setContentsMargins(0, 0, 0, 0)
+        buttons_column.setSpacing(2)
+        buttons_column.addWidget(self._up_button)
+        buttons_column.addWidget(self._down_button)
+        layout.addLayout(buttons_column)
+
+        self.setFocusProxy(self._edit)
+        self._up_button.clicked.connect(self.stepUp)
+        self._down_button.clicked.connect(self.stepDown)
+        self._edit.editingFinished.connect(self._commit_edit)
+        self._edit.installEventFilter(self)
+        self._refresh_text()
+
+    # ---- the Qt spinbox API subset the call sites use -------------------------
+
+    def value(self):
+        return self._value
+
+    def setValue(self, value) -> None:
+        # Clamps into the range and only emits on an actual change -- both
+        # deliberate QSpinBox matches (the Settings tab's rollback blocks
+        # signals and re-setValue()s; a no-change emit would re-schedule the
+        # autosave it undoes).
+        clamped = max(self._minimum, min(self._maximum, self._coerce(value)))
+        if clamped == self._value:
+            return
+        self._value = clamped
+        self._refresh_text()
+        self.valueChanged.emit(clamped)
+
+    def minimum(self):
+        return self._minimum
+
+    def maximum(self):
+        return self._maximum
+
+    def setMinimum(self, minimum) -> None:
+        self.setRange(minimum, self._maximum)
+
+    def setMaximum(self, maximum) -> None:
+        self.setRange(self._minimum, maximum)
+
+    def setRange(self, minimum, maximum) -> None:
+        self._minimum = self._coerce(minimum)
+        self._maximum = self._coerce(maximum)
+        self._update_validator_range()
+        # A range change can pull the current value back inside -- the same
+        # clamping (and valueChanged-on-clamp) QSpinBox applies.
+        self.setValue(self._value)
+
+    def singleStep(self):
+        return self._step
+
+    def setSingleStep(self, step) -> None:
+        self._step = self._coerce(step)
+
+    def suffix(self) -> str:
+        return self._suffix
+
+    def setSuffix(self, suffix: str) -> None:
+        self._suffix = suffix
+        self._refresh_text()
+
+    def stepUp(self) -> None:  # noqa: N802 -- Qt's spinbox naming
+        self.setValue(self._value + self._step)
+
+    def stepDown(self) -> None:  # noqa: N802 -- Qt's spinbox naming
+        self.setValue(self._value - self._step)
+
+    def setEnabled(self, enabled: bool) -> None:  # noqa: N802 -- Qt's naming
+        # Propagate explicitly: a disabled container renders its children
+        # disabled anyway, but their own isEnabled() flags (and the QSS
+        # :disabled styling some reads key off) only follow if set directly.
+        super().setEnabled(enabled)
+        self._edit.setEnabled(enabled)
+        self._up_button.setEnabled(enabled)
+        self._down_button.setEnabled(enabled)
+
+    # ---- internals --------------------------------------------------------------
+
+    def eventFilter(self, watched: QObject, event) -> bool:  # noqa: N802 -- Qt's naming
+        # Arrow-key stepping. The filter runs before the line edit's own key
+        # handling, which would ignore Up/Down anyway; every other key falls
+        # through to normal editing.
+        if watched is self._edit and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Up:
+                self.stepUp()
+                return True
+            if event.key() == Qt.Key.Key_Down:
+                self.stepDown()
+                return True
+        return super().eventFilter(watched, event)
+
+    def _commit_edit(self) -> None:
+        parsed = self._parse(self._edit.text())
+        if parsed is not None:
+            self.setValue(parsed)  # clamps; emits valueChanged on change
+        # Reformat no matter what: valid-but-unformatted entry ("45" typed
+        # into a suffixed field) gets its canonical text, unparseable text
+        # reverts to the current value.
+        self._refresh_text()
+        self.editingFinished.emit()
+
+    def _refresh_text(self) -> None:
+        self._edit.setText(f"{self._format(self._value)}{self._suffix}")
+
+    def _strip_suffix(self, text: str) -> str:
+        if self._suffix and text.endswith(self._suffix):
+            text = text[: -len(self._suffix)]
+        return text.strip()
+
+    # Subclass hooks: numeric type, formatting, parsing, validator.
+    def _coerce(self, value):  # pragma: no cover - abstract hook
+        raise NotImplementedError
+
+    def _default_step(self):  # pragma: no cover - abstract hook
+        raise NotImplementedError
+
+    def _make_validator(self):  # pragma: no cover - abstract hook
+        raise NotImplementedError
+
+    def _update_validator_range(self) -> None:  # pragma: no cover - abstract hook
+        raise NotImplementedError
+
+    def _format(self, value) -> str:  # pragma: no cover - abstract hook
+        raise NotImplementedError
+
+    def _parse(self, text: str):  # pragma: no cover - abstract hook
+        raise NotImplementedError
+
+
+class StepperSpinBox(_StepperSpinBase):
+    """Integer stepper field (quick-save seconds, GIF fps/width). Default
+    step 1; the GIF width field's setSingleStep(20) is the one override."""
+
+    valueChanged = Signal(int)
+
+    @staticmethod
+    def _coerce(value) -> int:
+        return int(value)
+
+    @staticmethod
+    def _default_step() -> int:
+        return 1
+
+    def _make_validator(self) -> QIntValidator:
+        # Bounded, so interactive typing can't leave the range at all (a
+        # programmatic setText bypasses validators -- _commit_edit clamps).
+        return QIntValidator(self._minimum, self._maximum, self._edit)
+
+    def _update_validator_range(self) -> None:
+        self._edit.validator().setRange(self._minimum, self._maximum)
+
+    @staticmethod
+    def _format(value: int) -> str:
+        return str(value)
+
+    def _parse(self, text: str) -> int | None:
+        try:
+            return int(self._strip_suffix(text))
+        except ValueError:
+            return None
+
+
+class StepperDoubleSpinBox(_StepperSpinBase):
+    """Float stepper field (GIF start/duration). Default step 0.5: both
+    double call sites run decimals=1 ranges where 0.5 is the useful nudge
+    (and stays exact in binary float, so repeated stepping can't drift)."""
+
+    valueChanged = Signal(float)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        # _decimals must exist before the base __init__ runs _coerce/_format.
+        self._decimals = 2
+        super().__init__(parent)
+
+    def decimals(self) -> int:
+        return self._decimals
+
+    def setDecimals(self, decimals: int) -> None:
+        self._decimals = decimals
+        self._edit.validator().setDecimals(decimals)
+        self._refresh_text()
+
+    def _coerce(self, value) -> float:
+        # Round to the display precision on every ingest, like QDoubleSpinBox
+        # -- value() then always matches what the field shows.
+        return round(float(value), self._decimals)
+
+    @staticmethod
+    def _default_step() -> float:
+        return 0.5
+
+    def _make_validator(self) -> QDoubleValidator:
+        validator = QDoubleValidator(self._minimum, self._maximum, self._decimals, self._edit)
+        validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+        return validator
+
+    def _update_validator_range(self) -> None:
+        self._edit.validator().setRange(self._minimum, self._maximum)
+
+    def _format(self, value: float) -> str:
+        return f"{value:.{self._decimals}f}"
+
+    def _parse(self, text: str) -> float | None:
+        try:
+            parsed = float(self._strip_suffix(text))
+        except ValueError:
+            return None
+        # float() accepts "nan"/"inf", which a bounded field must reject.
+        return parsed if math.isfinite(parsed) else None

@@ -206,6 +206,50 @@ def test_cancel_recording_mid_capture_drops_partial_capture() -> None:
     assert field.combo() == "<ctrl>+<alt>+r"
 
 
+def test_cancel_with_a_key_still_held_restores_the_pre_record_combo() -> None:
+    # The partial-capture leak: press AND HOLD a key, so the entry is showing
+    # the half-captured "<ctrl>", then cancel. The half-captured modifier-only
+    # text is not a recordable combo -- left in the entry, a host's autosave
+    # would persist a bare "<ctrl>" that fires on every ctrl press. A cancel
+    # must always restore the pre-record combo.
+    field = HotkeyField("<ctrl>+<alt>+r")
+    field.record_button.click()
+    field._on_key_press("ctrl")  # held -- the entry now shows "<ctrl>"
+    assert field.entry.text() == "<ctrl>"
+
+    field.record_button.click()  # cancel with the key still held
+
+    assert field.is_recording() is False
+    assert field.combo() == "<ctrl>+<alt>+r"
+
+
+def test_cancel_recording_with_a_key_still_held_restores_the_pre_record_combo() -> None:
+    field = HotkeyField("<ctrl>+<alt>+r")
+    field.record_button.click()
+    field._on_key_press("ctrl")
+    field._on_key_press("alt")
+    assert field.entry.text() == "<ctrl>+<alt>"
+
+    field.cancel_recording()
+
+    assert field.is_recording() is False
+    assert field.combo() == "<ctrl>+<alt>+r"
+
+
+def test_hide_mid_capture_with_a_key_held_restores_and_stops() -> None:
+    # Same cancel path as a tab switch away from Settings mid-record: the
+    # hide must both tear the listener down AND drop the partial capture.
+    field = HotkeyField("<ctrl>+<alt>+r")
+    field.show()
+    field.record_button.click()
+    field._on_key_press("shift")
+
+    field.hide()
+
+    assert field.is_recording() is False
+    assert field.combo() == "<ctrl>+<alt>+r"
+
+
 def test_cancel_recording_is_a_noop_when_idle() -> None:
     field = HotkeyField("<ctrl>+<alt>+r")
     field.cancel_recording()

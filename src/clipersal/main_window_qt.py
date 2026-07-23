@@ -1,8 +1,13 @@
 """Clipersal's main app window.
 
-OBS-style shape: a sidebar (Home / Clips / Settings / Logs) plus one content
+OBS-style shape: a sidebar (Home / Clips / Settings) plus one content
 area, built ONCE at startup, with `QStackedWidget.setCurrentWidget()` used
-for tab switching -- nothing is destroyed or rebuilt on tab switches.
+for tab switching -- nothing is destroyed or rebuilt on tab switches. The
+old top-level Logs page now lives inside Settings as its last sub-tab
+(regular users shouldn't see Logs as a top-level destination); every
+legacy "logs" entry point -- Ctrl+4, the crash banner's "View logs", the
+tray's "View logs" (IPC LOGS), `clipersal-trigger logs` -- is routed to
+Settings→Logs by select_tab/select_settings_subtab.
 
 Cross-thread updates (save events, show/tab-switch requests) are real Qt
 signals (see signals.py) connected directly in cli.py -- MainWindow itself
@@ -30,16 +35,13 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QGuiApplication, QKeySequence, QPixmap, QShortcut, QTextCursor
+from PySide6.QtGui import QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
-    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
     QStackedWidget,
     QVBoxLayout,
@@ -49,8 +51,6 @@ from PySide6.QtWidgets import (
 from clipersal import (
     __version__,
     brand,
-    config_store,
-    diagnostics,
     ipc_client,
     player_qt,
     theme,
@@ -59,21 +59,16 @@ from clipersal import (
 )
 from clipersal.config import Config
 from clipersal.gallery_window_qt import EMPTY_CLIPS_MESSAGE, ThumbnailWorker, build_gallery_frame, clips_newest_first
-from clipersal.qt_widgets import ElidedLabel, ToggleSwitch
+from clipersal.qt_widgets import ElidedLabel
 from clipersal.settings_window_qt import build_settings_frame
 from clipersal.status_dot import StatusDot
 from clipersal.theme import qfont as _qfont
-from clipersal.tray import open_folder
 
 log = logging.getLogger(__name__)
 
 _STATUS_POLL_MS = 1500
 _PULSE_STEP_MS = 280
 _PULSE_STEPS = 5
-_LOG_TAIL_POLL_MS = 2000
-# Higher than the old 200 now that the search/level filters cut the visible
-# volume down -- a filtered view should still reach reasonably far back.
-_LOG_TAIL_LINES = 500
 _RECENT_CLIPS_COUNT = 4
 _RECENT_THUMB_SIZE = (120, 68)
 
@@ -84,9 +79,7 @@ _RECENT_THUMB_SIZE = (120, 68)
 _LOW_DISK_WARN_BYTES = 1 << 30
 _LOW_DISK_CLEAR_BYTES = _LOW_DISK_WARN_BYTES * 3 // 2
 
-_LOG_LEVEL_CHOICES = ("All", "INFO", "WARNING", "ERROR")
-
-_NAV_ITEMS = (("home", "Home"), ("clips", "Clips"), ("settings", "Settings"), ("logs", "Logs"))
+_NAV_ITEMS = (("home", "Home"), ("clips", "Clips"), ("settings", "Settings"))
 
 # Crash-report prompt (#11): on an edge INTO the CRASHED state the user is
 # asked, once per crash episode, whether to send a crash report. Nothing is
@@ -243,8 +236,12 @@ class MainWindow(QWidget):
         self._tabs["settings"] = build_settings_frame(
             None, config, ipc_port, save_events, current_encoder, on_apply, ffmpeg_path,
             on_update_found=self.show_update_banner,
+            # The log viewer lives inside Settings now (its last sub-tab) --
+            # it gets the same live log path and facts provider the old
+            # top-level Logs page used.
+            log_path=log_path,
+            diagnostics_facts_provider=diagnostics_facts_provider,
         )
-        self._tabs["logs"] = self._build_logs_tab()
         for tab in self._tabs.values():
             self._content_stack.addWidget(tab)
         # Gallery edits (delete / rename / trim / compress exports) change
@@ -260,10 +257,6 @@ class MainWindow(QWidget):
         self._status_timer.timeout.connect(self._poll_status)
         self._status_timer.start(_STATUS_POLL_MS)
 
-        self._log_timer = QTimer(self)
-        self._log_timer.timeout.connect(self._refresh_log_tail)
-        self._log_timer.start(_LOG_TAIL_POLL_MS)
-
     # ---- window lifecycle -------------------------------------------------
 
     def show(self) -> None:  # noqa: A003 -- intentionally shadows QWidget.show, see class docstring
@@ -272,6 +265,12 @@ class MainWindow(QWidget):
         self.activateWindow()
 
     def select_tab(self, name: str) -> None:
+        if name == "logs":
+            # Logs is a Settings sub-tab now, not a top-level page -- every
+            # legacy entry point (IPC LOGS / `clipersal-trigger logs`, the
+            # crash banner's "View logs", old callers) lands on Settings→Logs.
+            self.select_settings_subtab("logs")
+            return
         if name not in self._tabs:
             return
         self._active_tab = name
@@ -281,6 +280,13 @@ class MainWindow(QWidget):
             button.setChecked(True)
         if name == "clips":
             self._tabs["clips"].refresh()
+
+    def select_settings_subtab(self, name: str) -> None:
+        """Select the Settings tab AND its `name`d sub-tab (e.g. "logs") --
+        the single routing target for every "show me the logs" entry point
+        now that the log viewer lives inside Settings."""
+        self.select_tab("settings")
+        self._tabs["settings"].select_subtab(name)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._tray_enabled:
@@ -314,7 +320,9 @@ class MainWindow(QWidget):
         bind("Ctrl+1", lambda: self.select_tab("home"))
         bind("Ctrl+2", lambda: self.select_tab("clips"))
         bind("Ctrl+3", lambda: self.select_tab("settings"))
-        bind("Ctrl+4", lambda: self.select_tab("logs"))
+        # Ctrl+4 still jumps straight to the logs -- now the Settings→Logs
+        # sub-tab instead of the old top-level page.
+        bind("Ctrl+4", lambda: self.select_settings_subtab("logs"))
 
     # ---- shell: sidebar + content area -------------------------------------
 
@@ -337,10 +345,10 @@ class MainWindow(QWidget):
         brand_row.addWidget(self._brand_mark)
         name_col = QVBoxLayout()
         brand_row.addLayout(name_col)
+        # The sidebar wordmark -- title-class (H2), a step under the page
+        # titles (theme.py's typography rules).
         name_label = QLabel("Clipersal", sidebar)
-        name_font = name_label.font()
-        name_font.setBold(True)
-        name_label.setFont(name_font)
+        name_label.setFont(_qfont(size=theme.FONT_H2))
         name_col.addWidget(name_label)
         version_label = QLabel(f"v{__version__}", sidebar)
         version_label.setObjectName("hint")
@@ -528,10 +536,10 @@ class MainWindow(QWidget):
 
         recent_header = QHBoxLayout()
         layout.addLayout(recent_header)
-        recent_title = QLabel("Recent clips", frame)
-        recent_title_font = recent_title.font()
-        recent_title_font.setBold(True)
-        recent_title.setFont(recent_title_font)
+        # A section title -- the same #cardTitle style (literal caps, Qt QSS
+        # has no text-transform) the settings cards established.
+        recent_title = QLabel("RECENT CLIPS", frame)
+        recent_title.setObjectName("cardTitle")
         recent_header.addWidget(recent_title)
         recent_header.addStretch()
         view_all_button = QPushButton("View all", frame)
@@ -638,151 +646,16 @@ class MainWindow(QWidget):
         except ValueError:
             pass
 
-    # ---- Logs tab -----------------------------------------------------------
-
-    def _build_logs_tab(self) -> QWidget:
-        frame = QWidget()
-        layout = QVBoxLayout(frame)
-        layout.setContentsMargins(24, 24, 24, 24)
-
-        header = QHBoxLayout()
-        layout.addLayout(header)
-        header_label = QLabel("Logs", frame)
-        header_label.setFont(_qfont(size=theme.FONT_H1))
-        header.addWidget(header_label)
-        header.addStretch()
-        open_log_folder_button = QPushButton("Open log folder", frame)
-        open_log_folder_button.clicked.connect(lambda: open_folder(self._log_path.parent))
-        header.addWidget(open_log_folder_button)
-
-        controls = QHBoxLayout()
-        layout.addLayout(controls)
-        self._log_search_edit = QLineEdit(frame)
-        self._log_search_edit.setPlaceholderText("Search logs...")
-        self._log_search_edit.textChanged.connect(self._refresh_log_tail)
-        controls.addWidget(self._log_search_edit, 1)
-        self._log_level_combo = QComboBox(frame)
-        self._log_level_combo.addItems(_LOG_LEVEL_CHOICES)
-        self._log_level_combo.currentTextChanged.connect(self._refresh_log_tail)
-        controls.addWidget(self._log_level_combo)
-        autoscroll_label = QLabel("Auto-scroll", frame)
-        autoscroll_label.setObjectName("hint")
-        controls.addWidget(autoscroll_label)
-        self._log_autoscroll_switch = ToggleSwitch(frame, checked=True)
-        controls.addWidget(self._log_autoscroll_switch)
-        copy_button = QPushButton("Copy", frame)
-        copy_button.clicked.connect(self._on_copy_logs)
-        controls.addWidget(copy_button)
-        export_button = QPushButton("Export diagnostics...", frame)
-        export_button.clicked.connect(self._on_export_diagnostics)
-        controls.addWidget(export_button)
-
-        self._log_textbox = QPlainTextEdit(frame)
-        self._log_textbox.setReadOnly(True)
-        self._log_textbox.setFont(_qfont(size=theme.FONT_MONO, mono=True))
-        self._log_textbox.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        layout.addWidget(self._log_textbox, 1)
-
-        # Export-diagnostics feedback, same state pattern as the Settings
-        # tab's status label (#statusLabel[state=...]).
-        self._diagnostics_status_label = QLabel("", frame)
-        self._diagnostics_status_label.setObjectName("statusLabel")
-        self._diagnostics_status_label.setWordWrap(True)
-        layout.addWidget(self._diagnostics_status_label)
-
-        self._refresh_log_tail()
-        return frame
-
-    def _log_line_matches(self, line: str, search: str, level: str) -> bool:
-        if level != "All":
-            # Log lines look like "2026-07-22 01:43:36,076 INFO clipersal.cli:
-            # ..." -- the level is the third whitespace-separated token (the
-            # asctime itself contains a space). Lines without one (traceback
-            # continuations) only pass the "All" filter.
-            parts = line.split()
-            if len(parts) < 3 or parts[2] != level:
-                return False
-        if search and search.lower() not in line.lower():
-            return False
-        return True
-
-    def _refresh_log_tail(self) -> None:
-        search = self._log_search_edit.text() if hasattr(self, "_log_search_edit") else ""
-        level = self._log_level_combo.currentText() if hasattr(self, "_log_level_combo") else "All"
-        try:
-            with open(self._log_path, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()[-_LOG_TAIL_LINES:]
-            content = "".join(line for line in lines if self._log_line_matches(line, search, level))
-            if not lines:
-                content = "(log file is empty)"
-            elif not content:
-                content = "(no log lines match)"
-        except OSError:
-            content = f"(log file not found yet: {self._log_path})"
-        scrollbar = self._log_textbox.verticalScrollBar()
-        previous_value = scrollbar.value()
-        self._log_textbox.setPlainText(content)
-        if self._log_autoscroll_switch.isChecked():
-            cursor = self._log_textbox.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            self._log_textbox.setTextCursor(cursor)
-        else:
-            # With auto-scroll off a refresh must not yank the view back to
-            # wherever the new content's cursor landed -- keep the position.
-            scrollbar.setValue(previous_value)
-
-    def _on_copy_logs(self) -> None:
-        # The textbox already holds exactly the filtered view, so copying it
-        # copies what the user actually sees.
-        QGuiApplication.clipboard().setText(self._log_textbox.toPlainText())
-
-    def _set_diagnostics_status(self, text: str, state: str) -> None:
-        self._diagnostics_status_label.setText(text)
-        self._diagnostics_status_label.setProperty("state", state)
-        style = self._diagnostics_status_label.style()
-        style.unpolish(self._diagnostics_status_label)
-        style.polish(self._diagnostics_status_label)
+    # ---- diagnostics export (shared with the crash-report prompt) ----------
 
     def _export_diagnostics_with_dialog(self) -> Path | None:
-        """Save-dialog + zip export, shared by the Logs tab's "Export
-        diagnostics..." button and the crash-report prompt's "Export zip"
-        button so the flow lives in exactly one place. The outcome is
-        reported on the Logs tab's status label either way. Returns the
-        exported path, or None when the user cancelled or the export failed.
+        """Save-dialog + zip export. The flow itself lives on the Settings
+        Logs sub-tab now (where the user-facing "Export diagnostics..."
+        button is); the crash-report prompt's "Export zip" button routes
+        through here so both entry points still share exactly one
+        implementation. Returns the exported path, or None on cancel/failure.
         """
-        from PySide6.QtWidgets import QFileDialog
-
-        target, _selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "Export diagnostics",
-            str(Path.home() / "clipersal-diagnostics.zip"),
-            "Zip files (*.zip)",
-        )
-        if not target:
-            return None
-        facts: dict[str, str] = {}
-        if self._diagnostics_facts_provider is not None:
-            try:
-                facts = self._diagnostics_facts_provider()
-            except Exception:  # noqa: BLE001 -- facts are best-effort; the zip matters more
-                log.exception("Diagnostics facts provider failed; exporting without system facts")
-        result = diagnostics.export_diagnostics_zip(
-            Path(target),
-            self._log_path,
-            config_store.default_config_path(),
-            self._config.buffer_dir,
-            facts,
-        )
-        if result is None:
-            self._set_diagnostics_status("Export failed -- see the log for details.", "error")
-            return None
-        self._set_diagnostics_status(f"Diagnostics exported to {result}", "success")
-        return result
-
-    def _on_export_diagnostics(self) -> None:
-        # The Logs tab button; the flow itself is shared with the
-        # crash-report prompt (see _export_diagnostics_with_dialog).
-        self._export_diagnostics_with_dialog()
+        return self._tabs["settings"].export_diagnostics_with_dialog()
 
     # ---- status polling (shared by the Home tab's badge) -------------------
 
@@ -903,7 +776,7 @@ class MainWindow(QWidget):
         self._capture_state = state
         if state == "CRASHED":
             self._set_status_dot(theme.LIVE)
-            self._status_label.setText("Capture stopped -- see Logs")
+            self._status_label.setText("Capture stopped -- see Settings→Logs")
             self._pause_button.setText("Resume capture")
             self.setWindowTitle("Clipersal — Capture stopped")
         elif state == "PAUSED":

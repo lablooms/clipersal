@@ -135,6 +135,10 @@ def _ensure_qapplication():
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
+        # BODY is the app's default reading size (theme.py's typography
+        # rules): every plain button/label/input inherits it, and only
+        # titles/hints/mono readouts set an explicit font on top.
+        app.setFont(theme.qfont(size=theme.FONT_BODY, weight="normal"))
         app.setStyleSheet(theme.build_stylesheet())
         # At construction time, so the first-run wizard / startup-error
         # dialogs that may follow already carry the icon.
@@ -546,6 +550,12 @@ def main(argv: list[str] | None = None) -> int:
     # which only exists once the capture session does; registering after
     # start() is fine since IpcServer shares its handler dict with the
     # socketserver.
+    # `main_window` must be BOUND before the first handler can arrive: the
+    # handlers read it as a late-bound closure cell, and it was previously
+    # only assigned at the construction site below -- a SAVE/SHOW landing in
+    # between (the hotkey listener starts in that window) crashed the
+    # handler with NameError instead of answering.
+    main_window = None
     server.register("SAVE", handle_save)
     server.register("PAUSE", handle_pause)
     server.register("RESUME", handle_resume)
@@ -615,14 +625,35 @@ def main(argv: list[str] | None = None) -> int:
         candidate encoders), and doing it BEFORE anything is stopped means a
         resolution failure leaves the old capture running untouched instead
         of dead with nothing to replace it.
+
+        Capture is (re)started whenever it isn't deliberately paused --
+        including when it had CRASHED (auto-restart gave up): an apply that
+        swaps capture settings must bring capture back with them, not swap
+        in a session that never starts while STATUS claims RECORDING. If the
+        new session fails to start (the Wayland share dialog can be
+        cancelled here), the old -- stopped but intact -- handles are put
+        back and the exception re-raised, so apply_settings' rollback path
+        has a coherent session to return to.
         """
-        was_running = state.session.is_running()
-        if was_running:
-            state.session.stop()
+        old_session = state.session
+        old_setup = state.setup
+        should_run = not state.paused
+        if should_run:
+            # Covers the running case AND the crashed-gave-up case (a dead
+            # process, a still-open ffmpeg.log handle the new session's
+            # start would otherwise trip over on Windows). stop() is a
+            # no-op on an already-stopped session.
+            old_session.stop()
         state.setup = new_setup
         state.session = capture.SegmentedCapture(config, new_setup)
-        if was_running:
+        if not should_run:
+            return
+        try:
             state.session.start()
+        except Exception:
+            state.setup = old_setup
+            state.session = old_session
+            raise
 
     def apply_settings(new_values: dict) -> str | None:
         try:
@@ -698,6 +729,26 @@ def main(argv: list[str] | None = None) -> int:
         # 0 -- rather than failing the whole apply.
         new_clips_max_gb = max(0, new_clips_max_gb)
 
+        # Launch-on-startup registration is a pre-flight gate, like the
+        # combo validations above: it runs BEFORE anything is mutated,
+        # resolved, or persisted. It used to run at the very end and report
+        # the failure as an error after every other field had applied and
+        # persisted -- but the Settings tab treats any error string as "the
+        # apply failed" and rolls every control back to the last-known-good
+        # payload, which silently reverted those actually-applied settings
+        # on the next save. Here, an error keeps the function's
+        # all-or-nothing contract: nothing applied, nothing persisted, and
+        # the rollback the tab performs tells the truth.
+        if new_values["launch_on_startup"] != config.launch_on_startup and autostart.is_supported(os_):
+            try:
+                if new_values["launch_on_startup"]:
+                    autostart.enable(os_)
+                else:
+                    autostart.disable(os_)
+            except OSError as exc:
+                log.warning("Could not update launch-on-startup registration: %s", exc)
+                return f"Could not update launch-on-startup registration: {exc}"
+
         needs_capture_restart = (
             new_values["video_bitrate"] != config.video_bitrate
             or new_values["quality_preset"] != config.quality_preset
@@ -719,7 +770,6 @@ def main(argv: list[str] | None = None) -> int:
             or new_quick_save_seconds_2 != config.quick_save_seconds_2
             or new_screenshot_hotkey != config.screenshot_hotkey
         )
-        needs_autostart_change = new_values["launch_on_startup"] != config.launch_on_startup
         needs_theme_change = new_theme_mode != config.theme_mode
 
         # Resolve the new capture setup BEFORE mutating config or stopping
@@ -749,6 +799,16 @@ def main(argv: list[str] | None = None) -> int:
                 new_setup = capture.resolve_setup(candidate)
             except _SETUP_ERRORS as exc:
                 return f"Could not apply capture settings: {exc}"
+
+        # Snapshot of the pre-mutation config for the restart-rollback path
+        # below (dataclasses.replace copies every field; its __post_init__
+        # mkdirs already exist). Only needed when a restart is pending: if
+        # it fails, the live config must go back to exactly what was in
+        # effect -- the Settings tab rolls its controls back on any returned
+        # error, and the config file was never written, so the in-memory
+        # values must match both.
+        if needs_capture_restart:
+            previous_config = dataclasses.replace(config)
 
         config.buffer_seconds = new_values["buffer_seconds"]
         config.clips_dir = new_clips_dir
@@ -781,31 +841,41 @@ def main(argv: list[str] | None = None) -> int:
         config.clips_max_gb = new_clips_max_gb
         config.save_sound_enabled = new_save_sound_enabled
 
-        autostart_error = None
-        if needs_autostart_change and autostart.is_supported(os_):
-            try:
-                if config.launch_on_startup:
-                    autostart.enable(os_)
-                else:
-                    autostart.disable(os_)
-            except OSError as exc:
-                # Registration failed, so the OS won't do what the toggle
-                # says. Revert the config field to its previous (real)
-                # state before it's persisted below -- otherwise the file
-                # would record intent as fact, the Settings toggle would
-                # keep showing "on" (see SettingsFrame's build-time
-                # reconciliation against autostart.is_enabled), and
-                # needs_autostart_change would never fire again to retry.
-                config.launch_on_startup = not config.launch_on_startup
-                autostart_error = f"Could not update launch-on-startup registration: {exc}"
-                log.warning("%s", autostart_error)
-
         if needs_capture_restart:
-            # new_setup was resolved above, before config was mutated -- it
-            # can't fail here, so the old session is only stopped once its
-            # replacement is known-good.
-            with pause_lock:
-                restart_capture(new_setup)
+            # new_setup was resolved above, before config was mutated --
+            # resolution can't fail here. The restart itself still can (the
+            # Wayland portal handshake happens at session.start(), and its
+            # share dialog can be cancelled there): roll every mutation back
+            # and bring the OLD capture session back, so a returned error
+            # leaves config, Settings controls, disk, and capture all
+            # telling the same story.
+            was_running = state.session.is_running()
+            try:
+                with pause_lock:
+                    restart_capture(new_setup)
+            except Exception as exc:  # noqa: BLE001 -- the Settings contract is error strings, never exceptions
+                log.exception("Capture restart failed during apply_settings; rolling back")
+                for field_info in dataclasses.fields(config):
+                    # Only init fields: the mutation block never touches
+                    # init=False ones (buffer_dir_is_temp), and the
+                    # replace()-derived snapshot can't reproduce them
+                    # faithfully anyway -- see config.py's note that a
+                    # replaced Config always reads as non-temp.
+                    if not field_info.init:
+                        continue
+                    setattr(config, field_info.name, getattr(previous_config, field_info.name))
+                # state.session is the old session again (restart_capture
+                # restored it). Only revive one that was actually running:
+                # a crashed-gave-up session stays down -- STATUS reports
+                # CRASHED and the banner's own Restart button is the way
+                # back, not an immediate retry of what just failed.
+                if was_running:
+                    try:
+                        state.session.start()
+                    except Exception:  # noqa: BLE001 -- doubly unlucky; say so honestly via CRASHED
+                        log.exception("Could not bring the previous capture session back either")
+                        state.session._gave_up = True  # honest STATUS over encapsulation, see gave_up_restarting
+                return f"Could not apply capture settings: {exc}"
 
         if needs_hotkey_rebind:
             rebind_hotkey()
@@ -837,48 +907,53 @@ def main(argv: list[str] | None = None) -> int:
                 protected=clip_metadata.favorites(config.clips_dir),
             )
 
-        config_store.save_overrides(
-            {
-                "buffer_seconds": config.buffer_seconds,
-                "clips_dir": str(config.clips_dir),
-                "hotkey_combo": config.hotkey_combo,
-                "video_bitrate": config.video_bitrate,
-                "quality_preset": config.quality_preset,
-                "encoder_override": config.encoder_override,
-                "monitor_index": config.monitor_index,
-                "mic_device": config.mic_device,
-                "desktop_volume": config.desktop_volume,
-                "mic_volume": config.mic_volume,
-                "capture_mode": config.capture_mode,
-                "window_title": config.window_title,
-                "filename_template": config.filename_template,
-                "clip_retention_days": config.clip_retention_days,
-                "launch_on_startup": config.launch_on_startup,
-                "check_for_updates": config.check_for_updates,
-                "theme_mode": config.theme_mode,
-                "framerate": config.framerate,
-                "resolution_scale": config.resolution_scale,
-                "quick_save_hotkey_1": config.quick_save_hotkey_1,
-                "quick_save_seconds_1": config.quick_save_seconds_1,
-                "quick_save_hotkey_2": config.quick_save_hotkey_2,
-                "quick_save_seconds_2": config.quick_save_seconds_2,
-                "screenshot_hotkey": config.screenshot_hotkey,
-                "clips_max_gb": config.clips_max_gb,
-                "save_sound_enabled": config.save_sound_enabled,
-            }
-        )
-        # Everything else applied cleanly; a failed autostart registration
-        # still surfaces as an error so the Settings tab doesn't show a
-        # hollow "Saved ✓" over a toggle that didn't take effect.
-        return autostart_error
+        try:
+            config_store.save_overrides(
+                {
+                    "buffer_seconds": config.buffer_seconds,
+                    "clips_dir": str(config.clips_dir),
+                    "hotkey_combo": config.hotkey_combo,
+                    "video_bitrate": config.video_bitrate,
+                    "quality_preset": config.quality_preset,
+                    "encoder_override": config.encoder_override,
+                    "monitor_index": config.monitor_index,
+                    "mic_device": config.mic_device,
+                    "desktop_volume": config.desktop_volume,
+                    "mic_volume": config.mic_volume,
+                    "capture_mode": config.capture_mode,
+                    "window_title": config.window_title,
+                    "filename_template": config.filename_template,
+                    "clip_retention_days": config.clip_retention_days,
+                    "launch_on_startup": config.launch_on_startup,
+                    "check_for_updates": config.check_for_updates,
+                    "theme_mode": config.theme_mode,
+                    "framerate": config.framerate,
+                    "resolution_scale": config.resolution_scale,
+                    "quick_save_hotkey_1": config.quick_save_hotkey_1,
+                    "quick_save_seconds_1": config.quick_save_seconds_1,
+                    "quick_save_hotkey_2": config.quick_save_hotkey_2,
+                    "quick_save_seconds_2": config.quick_save_seconds_2,
+                    "screenshot_hotkey": config.screenshot_hotkey,
+                    "clips_max_gb": config.clips_max_gb,
+                    "save_sound_enabled": config.save_sound_enabled,
+                }
+            )
+        except OSError as exc:
+            # The in-memory apply already happened (a read-only config dir,
+            # a full disk) -- but the Settings contract is "None or an error
+            # string", and a disk-write failure must never escape as an
+            # uncaught exception out of the autosave slot.
+            log.exception("Could not persist settings")
+            return f"Could not save settings to {config_store.default_config_path()}: {exc}"
+        return None
 
     # The main window is built once, eagerly, right here -- Clipersal is a
     # real, always-present app window (like OBS), so its whole UI
     # (Home/Clips/Settings/Logs) is built up front. --no-tray doesn't affect
     # this -- the window still needs somewhere to live even with no tray
     # icon; only whether closing it hides-to-tray vs. quits depends on
-    # config.tray_enabled (see MainWindow's docstring).
-    main_window = None
+    # config.tray_enabled (see MainWindow's docstring). (`main_window` itself
+    # was already bound above, before the IPC handlers could first run.)
     if app is not None:
         try:
             from clipersal.main_window_qt import MainWindow
@@ -899,7 +974,8 @@ def main(argv: list[str] | None = None) -> int:
                 tray_enabled=config.tray_enabled,
                 on_quit=stop_event.set,
                 app_signals=app_signals,
-                # Live facts for the Logs tab's diagnostics zip: the encoder
+                # Live facts for the diagnostics zip (the Settings→Logs
+                # sub-tab's export and the crash-report prompt): the encoder
                 # (and potentially the ffmpeg path) changes when Settings
                 # restarts capture, so collect them at export time from the
                 # current state, not from launch-time values.
@@ -1085,7 +1161,13 @@ def _trigger_command_via_ipc(command: str, port: int) -> None:
     e.g. "SAVE" or "SAVE 30" for a quick-save binding.
     """
     try:
-        response = ipc_client.send_command(command, port=port)
+        # SAVE/SCREENSHOT get the same long leash the main window and tray
+        # give them: the server-side remux can legitimately run tens of
+        # seconds (see ipc_client.SAVE_TIMEOUT), and the 5s default reported
+        # a slow-but-successful save as a failure in the log.
+        command_word = command.split(maxsplit=1)[0]
+        timeout = ipc_client.SAVE_TIMEOUT if command_word in ("SAVE", "SCREENSHOT") else 5.0
+        response = ipc_client.send_command(command, port=port, timeout=timeout)
         log.info("Hotkey %s: %s", command, response)
     except ipc_client.IpcClientError as exc:
         log.warning("Hotkey %s failed: %s", command, exc)

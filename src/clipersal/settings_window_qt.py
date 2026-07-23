@@ -1,8 +1,10 @@
 """Settings tab -- a themed QTabWidget grouping the existing fields into
-Capture / Saving / Encoder / Clips / Appearance / About (the old two-column
-card scroll mixed unrelated concerns onto one long page; the update-check
-machinery moved off the hotkey card into About to declutter it). Every tab
-page scrolls, since Capture alone is taller than the window minimum.
+Capture / Saving / Encoder / Clips / Appearance / About, plus a Logs
+sub-tab at the end (the log viewer moved here from its old top-level page;
+see LogsTab). The old two-column card scroll mixed unrelated concerns onto
+one long page; the update-check machinery moved off the hotkey card into
+About to declutter it. Every field-tab page scrolls, since Capture alone
+is taller than the window minimum.
 
 The Monitor/Window sub-panels under "Capture target" and the bitrate slider
 under "Quality preset" are shown/hidden with plain `.setVisible(bool)`; Qt's
@@ -31,7 +33,7 @@ from types import SimpleNamespace
 from typing import Callable
 
 from PySide6.QtCore import QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QGuiApplication, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -39,10 +41,10 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSlider,
-    QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -52,6 +54,7 @@ from clipersal import (
     __version__,
     autostart,
     config_store,
+    diagnostics,
     ffmpeg_utils,
     monitors,
     platform_detect,
@@ -61,7 +64,7 @@ from clipersal import (
 )
 from clipersal.config import Config, _default_clips_dir
 from clipersal.hotkey_widget_qt import HotkeyField
-from clipersal.qt_widgets import SegmentedControl, ToggleSwitch, quiet_message
+from clipersal.qt_widgets import SegmentedControl, StepperSpinBox, ToggleSwitch, quiet_message
 from clipersal.theme import qfont as _qfont
 from clipersal.tray import open_folder
 
@@ -101,6 +104,14 @@ _THEME_MODE_LABELS = {"system": "System", "light": "Light", "dark": "Dark"}
 _THEME_MODES = {label: mode for mode, label in _THEME_MODE_LABELS.items()}
 _NO_WINDOW_SELECTED = "(none selected)"
 _NO_WINDOWS_FOUND = "(no windows found)"
+
+# The Logs sub-tab's tail poll -- the same 2s cadence the old top-level Logs
+# page ran (the timer lives on the LogsTab widget, see below).
+_LOG_TAIL_POLL_MS = 2000
+# Higher than the old 200 now that the search/level filters cut the visible
+# volume down -- a filtered view should still reach reasonably far back.
+_LOG_TAIL_LINES = 500
+_LOG_LEVEL_CHOICES = ("All", "INFO", "WARNING", "ERROR")
 
 # The Settings-editable Config fields, i.e. exactly the keys of the
 # _build_payload dict -- the reset-to-defaults payload is built from the same
@@ -200,6 +211,186 @@ def default_settings_payload() -> dict:
     return defaults
 
 
+class LogsTab(QWidget):
+    """The log viewer, living as the Settings tab widget's LAST sub-tab
+    (after About) -- regular users shouldn't see Logs as a top-level
+    destination, so the old MainWindow Logs page moved here wholesale. All
+    of its features came along unchanged: the 2s tail poll, the search and
+    level filters, the auto-scroll toggle, Copy, and Export diagnostics
+    with its status label. The only deliberate loss is the old H1 page
+    header -- the settings tab bar carries the "Logs" name now.
+
+    Unlike the field tabs this page is NOT wrapped in a QScrollArea: its
+    textbox fills the tab and scrolls itself, exactly like the old page.
+
+    Owns its own poll timer, parented to itself, so a Settings
+    reset-rebuild (which swaps the whole QTabWidget) retires the old timer
+    with the old page and starts a fresh one with the new.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        log_path: Path,
+        diagnostics_facts_provider: Callable[[], dict[str, str]] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._config = config
+        self._log_path = log_path
+        # Live system facts for the diagnostics zip (OS, session, ffmpeg
+        # version, monitors, ...) -- a provider because the encoder can
+        # change via apply_settings after the window is built.
+        self._diagnostics_facts_provider = diagnostics_facts_provider
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        controls = QHBoxLayout()
+        layout.addLayout(controls)
+        self._log_search_edit = QLineEdit(self)
+        self._log_search_edit.setPlaceholderText("Search logs...")
+        self._log_search_edit.textChanged.connect(self._refresh_log_tail)
+        controls.addWidget(self._log_search_edit, 1)
+        self._log_level_combo = QComboBox(self)
+        self._log_level_combo.addItems(_LOG_LEVEL_CHOICES)
+        self._log_level_combo.currentTextChanged.connect(self._refresh_log_tail)
+        controls.addWidget(self._log_level_combo)
+        autoscroll_label = QLabel("Auto-scroll", self)
+        autoscroll_label.setObjectName("hint")
+        controls.addWidget(autoscroll_label)
+        self._log_autoscroll_switch = ToggleSwitch(self, checked=True)
+        controls.addWidget(self._log_autoscroll_switch)
+        copy_button = QPushButton("Copy", self)
+        copy_button.clicked.connect(self._on_copy_logs)
+        controls.addWidget(copy_button)
+
+        # A second, right-aligned row for the two file actions: with the
+        # sidebar and the settings pane eating width, one row for all six
+        # controls clipped the Export button at the 1000px window minimum.
+        actions = QHBoxLayout()
+        layout.addLayout(actions)
+        actions.addStretch()
+        export_button = QPushButton("Export diagnostics...", self)
+        export_button.clicked.connect(self._on_export_diagnostics)
+        actions.addWidget(export_button)
+        open_log_folder_button = QPushButton("Open log folder", self)
+        open_log_folder_button.clicked.connect(lambda: open_folder(self._log_path.parent))
+        actions.addWidget(open_log_folder_button)
+
+        self._log_textbox = QPlainTextEdit(self)
+        self._log_textbox.setReadOnly(True)
+        self._log_textbox.setFont(_qfont(size=theme.FONT_MONO, weight="normal", mono=True))
+        self._log_textbox.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        layout.addWidget(self._log_textbox, 1)
+
+        # Export-diagnostics feedback, same state pattern as the Settings
+        # footer's status label (#statusLabel[state=...]).
+        self._diagnostics_status_label = QLabel("", self)
+        self._diagnostics_status_label.setObjectName("statusLabel")
+        self._diagnostics_status_label.setWordWrap(True)
+        layout.addWidget(self._diagnostics_status_label)
+
+        self._refresh_log_tail()
+
+        self._log_timer = QTimer(self)
+        self._log_timer.timeout.connect(self._refresh_log_tail)
+        self._log_timer.start(_LOG_TAIL_POLL_MS)
+
+    def _log_line_matches(self, line: str, search: str, level: str) -> bool:
+        if level != "All":
+            # Log lines look like "2026-07-22 01:43:36,076 INFO clipersal.cli:
+            # ..." -- the level is the third whitespace-separated token (the
+            # asctime itself contains a space). Lines without one (traceback
+            # continuations) only pass the "All" filter.
+            parts = line.split()
+            if len(parts) < 3 or parts[2] != level:
+                return False
+        if search and search.lower() not in line.lower():
+            return False
+        return True
+
+    def _refresh_log_tail(self) -> None:
+        search = self._log_search_edit.text() if hasattr(self, "_log_search_edit") else ""
+        level = self._log_level_combo.currentText() if hasattr(self, "_log_level_combo") else "All"
+        try:
+            with open(self._log_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()[-_LOG_TAIL_LINES:]
+            content = "".join(line for line in lines if self._log_line_matches(line, search, level))
+            if not lines:
+                content = "(log file is empty)"
+            elif not content:
+                content = "(no log lines match)"
+        except OSError:
+            content = f"(log file not found yet: {self._log_path})"
+        scrollbar = self._log_textbox.verticalScrollBar()
+        previous_value = scrollbar.value()
+        self._log_textbox.setPlainText(content)
+        if self._log_autoscroll_switch.isChecked():
+            cursor = self._log_textbox.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self._log_textbox.setTextCursor(cursor)
+        else:
+            # With auto-scroll off a refresh must not yank the view back to
+            # wherever the new content's cursor landed -- keep the position.
+            scrollbar.setValue(previous_value)
+
+    def _on_copy_logs(self) -> None:
+        # The textbox already holds exactly the filtered view, so copying it
+        # copies what the user actually sees.
+        QGuiApplication.clipboard().setText(self._log_textbox.toPlainText())
+
+    def _set_diagnostics_status(self, text: str, state: str) -> None:
+        self._diagnostics_status_label.setText(text)
+        self._diagnostics_status_label.setProperty("state", state)
+        style = self._diagnostics_status_label.style()
+        style.unpolish(self._diagnostics_status_label)
+        style.polish(self._diagnostics_status_label)
+
+    def export_diagnostics_with_dialog(self) -> Path | None:
+        """Save-dialog + zip export, shared by this tab's "Export
+        diagnostics..." button and the main window's crash-report prompt
+        ("Export zip", via MainWindow._export_diagnostics_with_dialog) so
+        the flow lives in exactly one place. The outcome is reported on
+        this tab's status label either way. Returns the exported path, or
+        None when the user cancelled or the export failed.
+        """
+        from PySide6.QtWidgets import QFileDialog
+
+        target, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export diagnostics",
+            str(Path.home() / "clipersal-diagnostics.zip"),
+            "Zip files (*.zip)",
+        )
+        if not target:
+            return None
+        facts: dict[str, str] = {}
+        if self._diagnostics_facts_provider is not None:
+            try:
+                facts = self._diagnostics_facts_provider()
+            except Exception:  # noqa: BLE001 -- facts are best-effort; the zip matters more
+                log.exception("Diagnostics facts provider failed; exporting without system facts")
+        result = diagnostics.export_diagnostics_zip(
+            Path(target),
+            self._log_path,
+            config_store.default_config_path(),
+            self._config.buffer_dir,
+            facts,
+        )
+        if result is None:
+            self._set_diagnostics_status("Export failed -- see the log for details.", "error")
+            return None
+        self._set_diagnostics_status(f"Diagnostics exported to {result}", "success")
+        return result
+
+    def _on_export_diagnostics(self) -> None:
+        # The tab's own button; the flow itself is shared with the main
+        # window's crash-report prompt (see export_diagnostics_with_dialog).
+        self.export_diagnostics_with_dialog()
+
+
 class SettingsFrame(QWidget):
     """on_apply(new_values) is called -- debounced, on every settled field
     change -- with the validated field values; it should live-apply what it
@@ -228,6 +419,8 @@ class SettingsFrame(QWidget):
         ffmpeg_path: str,
         parent: QWidget | None = None,
         on_update_found: Callable[[str, str], None] | None = None,
+        log_path: Path | None = None,
+        diagnostics_facts_provider: Callable[[], dict[str, str]] | None = None,
     ) -> None:
         super().__init__(parent)
         self._config = config
@@ -235,6 +428,12 @@ class SettingsFrame(QWidget):
         self._on_update_found = on_update_found
         self._ffmpeg_path = ffmpeg_path
         self._current_encoder = current_encoder
+        # The Logs sub-tab's inputs: the app's log file (the same
+        # config_store.default_log_path() cli.py configures logging into --
+        # injectable so tests stay hermetic) and the live system-facts
+        # provider for its diagnostics zip.
+        self._log_path = log_path if log_path is not None else config_store.default_log_path()
+        self._diagnostics_facts_provider = diagnostics_facts_provider
         self.check_now_responded.connect(self._on_check_now_responded)
         self._os = platform_detect.get_os()
         # On Wayland the window-title picker can't work: window capture goes
@@ -271,6 +470,12 @@ class SettingsFrame(QWidget):
         self._outer_layout.setContentsMargins(18, 18, 18, 18)
         self._outer_layout.setSpacing(8)
 
+        # The page title, matching Home ("Home") and Clips ("Clips") -- H1
+        # per theme.py's typography rules.
+        title_label = QLabel("Settings", self)
+        title_label.setFont(_qfont(size=theme.FONT_H1))
+        self._outer_layout.addWidget(title_label)
+
         self.tabs = QTabWidget(self)
         self._outer_layout.addWidget(self.tabs, 1)
         self._build_tabs(config)
@@ -296,7 +501,9 @@ class SettingsFrame(QWidget):
         footer.addWidget(autosave_hint)
 
         view_logs_button = QPushButton("View logs", self)
-        view_logs_button.clicked.connect(lambda: open_folder(config_store.default_log_path().parent))
+        # Jumps to the Logs sub-tab at the end of the tab widget (the log
+        # viewer moved here from its old top-level page).
+        view_logs_button.clicked.connect(lambda: self.select_subtab("logs"))
         footer.addWidget(view_logs_button)
 
         self._status_clear_timer = QTimer(self)
@@ -365,6 +572,18 @@ class SettingsFrame(QWidget):
         self._build_update_card(about_tab, config)
         about_tab.addStretch()
 
+        # Logs comes LAST and is added directly (not via _make_tab): its
+        # textbox fills the page and scrolls itself, so a scroll wrapper
+        # would only nest a second scrollbar. It always reads the LIVE
+        # config -- on a reset rebuild `config` here is a SimpleNamespace of
+        # the payload, which has no buffer_dir for the diagnostics zip.
+        self.logs_tab = LogsTab(
+            self._config,
+            self._log_path,
+            diagnostics_facts_provider=self._diagnostics_facts_provider,
+        )
+        self.tabs.addTab(self.logs_tab, "Logs")
+
         # Wired LAST, once every field holds its initial value: the
         # population above fires most of these very signals, so connecting
         # any earlier would schedule applies off the constructor. _reload()
@@ -391,6 +610,24 @@ class SettingsFrame(QWidget):
         self._outer_layout.insertWidget(index, new_tabs, 1)
         self._build_tabs(SimpleNamespace(**values))
 
+    # ---- sub-tab routing + diagnostics --------------------------------------
+
+    def select_subtab(self, name: str) -> None:
+        """Switch to the sub-tab whose label matches `name`
+        (case-insensitive, e.g. "logs"). MainWindow routes every legacy
+        "show me the logs" entry point here via select_settings_subtab."""
+        wanted = name.lower()
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i).lower() == wanted:
+                self.tabs.setCurrentIndex(i)
+                return
+
+    def export_diagnostics_with_dialog(self) -> Path | None:
+        """The diagnostics zip flow lives on the Logs sub-tab; MainWindow's
+        crash-report prompt ("Export zip") reaches it through here so both
+        entry points share the one implementation."""
+        return self.logs_tab.export_diagnostics_with_dialog()
+
     # ---- small layout helpers -------------------------------------------
 
     def _make_card(self, parent_layout: QVBoxLayout, title: str | None) -> QVBoxLayout:
@@ -406,21 +643,21 @@ class SettingsFrame(QWidget):
             card_layout.addWidget(title_label)
         return card_layout
 
-    def _bold_label(self, text: str, parent: QWidget) -> QLabel:
-        label = QLabel(text, parent)
-        font = label.font()
-        font.setBold(True)
-        label.setFont(font)
-        return label
+    def _field_label(self, text: str, parent: QWidget) -> QLabel:
+        """A field name label -- plain BODY text (theme.py's typography
+        rules: bold is reserved for titles, the status word, and clip names)."""
+        return QLabel(text, parent)
 
     def _field_row(self, card_layout: QVBoxLayout, label_text: str, value_text: str, parent: QWidget) -> QLabel:
         row = QHBoxLayout()
         card_layout.addLayout(row)
-        row.addWidget(self._bold_label(label_text, parent))
+        row.addWidget(self._field_label(label_text, parent))
         row.addStretch()
         value_label = QLabel(value_text, parent)
         value_label.setObjectName("valueBadge")
-        value_label.setFont(_qfont(mono=True))
+        # The badge is a code-ish readout ("60s", "100%") -- MONO per
+        # theme.py's typography rules, never bold.
+        value_label.setFont(_qfont(size=theme.FONT_MONO, weight="normal", mono=True))
         row.addWidget(value_label)
         return value_label
 
@@ -456,7 +693,7 @@ class SettingsFrame(QWidget):
         self._build_volume_controls(audio_layout, config, ffmpeg_path, card)
 
     def _build_framerate_and_scale(self, capture_layout: QVBoxLayout, config: Config, card: QWidget) -> None:
-        capture_layout.addWidget(self._bold_label("Frame rate", card))
+        capture_layout.addWidget(self._field_label("Frame rate", card))
         self.framerate_combo = QComboBox(card)
         for fps in _FRAMERATE_CHOICES:
             self.framerate_combo.addItem(str(fps), fps)
@@ -467,7 +704,7 @@ class SettingsFrame(QWidget):
         capture_layout.addWidget(self.framerate_combo)
         self._hint(capture_layout, "Frames per second captured (applies automatically; restarts capture)", card)
 
-        capture_layout.addWidget(self._bold_label("Resolution scale", card))
+        capture_layout.addWidget(self._field_label("Resolution scale", card))
         self.resolution_scale_combo = QComboBox(card)
         for label, value in _RESOLUTION_SCALE_CHOICES:
             self.resolution_scale_combo.addItem(label, value)
@@ -479,7 +716,7 @@ class SettingsFrame(QWidget):
     def _build_capture_target(self, capture_layout: QVBoxLayout, config: Config, card: QWidget) -> None:
         detected_monitors = monitors.list_monitors(self._os)
 
-        capture_layout.addWidget(self._bold_label("Capture target", card))
+        capture_layout.addWidget(self._field_label("Capture target", card))
 
         target_choices = ["Desktop"]
         if len(detected_monitors) > 1:
@@ -487,7 +724,6 @@ class SettingsFrame(QWidget):
         target_choices.append("Window")
 
         self.target_control = SegmentedControl(target_choices, card)
-        self.target_control.setFont(_qfont(mono=True))
         initial_target = _CAPTURE_TARGET_LABELS.get(config.capture_mode, "Desktop")
         if initial_target not in target_choices:
             initial_target = "Desktop"  # e.g. saved as "Monitor" but only one monitor is attached now
@@ -577,7 +813,7 @@ class SettingsFrame(QWidget):
         mic_names = ffmpeg_utils.list_microphones(ffmpeg_path, self._os)
         self.mic_combo: QComboBox | None = None
         if mic_names:
-            capture_layout.addWidget(self._bold_label("Microphone", card))
+            capture_layout.addWidget(self._field_label("Microphone", card))
             self.mic_combo = QComboBox(card)
             self.mic_combo.addItems(["None", *mic_names])
             initial_mic = config.mic_device if config.mic_device in mic_names else "None"
@@ -643,10 +879,9 @@ class SettingsFrame(QWidget):
         self._build_quality_preset(quality_layout, config, card)
 
     def _build_quality_preset(self, capture_layout: QVBoxLayout, config: Config, card: QWidget) -> None:
-        capture_layout.addWidget(self._bold_label("Quality preset", card))
+        capture_layout.addWidget(self._field_label("Quality preset", card))
 
         self.preset_control = SegmentedControl([label for label, _ in _QUALITY_PRESET_CHOICES], card)
-        self.preset_control.setFont(_qfont(mono=True))
         preset_label_by_value = {value: label for label, value in _QUALITY_PRESET_CHOICES}
         initial_preset_label = preset_label_by_value.get(config.quality_preset, "Custom")
         self.preset_control.setCurrent(initial_preset_label)
@@ -691,18 +926,17 @@ class SettingsFrame(QWidget):
         save_layout = self._make_card(tab_layout, None)
         card = save_layout.parentWidget()
 
-        save_layout.addWidget(self._bold_label("Clips folder", card))
+        save_layout.addWidget(self._field_label("Clips folder", card))
         clips_row = QHBoxLayout()
         save_layout.addLayout(clips_row)
         self.clips_dir_edit = QLineEdit(str(config.clips_dir), card)
         self.clips_dir_edit.setReadOnly(True)
-        self.clips_dir_edit.setFont(_qfont(mono=True))
         clips_row.addWidget(self.clips_dir_edit, 1)
         browse_button = QPushButton("Browse...", card)
         browse_button.clicked.connect(self._browse_clips_dir)
         clips_row.addWidget(browse_button)
 
-        save_layout.addWidget(self._bold_label("Hotkey", card))
+        save_layout.addWidget(self._field_label("Hotkey", card))
         self.hotkey_field = HotkeyField(config.hotkey_combo, card)
         save_layout.addWidget(self.hotkey_field)
         self._hint(
@@ -716,7 +950,7 @@ class SettingsFrame(QWidget):
             save_layout, "Quick-save hotkey 2", config.quick_save_hotkey_2, config.quick_save_seconds_2, card
         )
 
-        save_layout.addWidget(self._bold_label("Screenshot hotkey", card))
+        save_layout.addWidget(self._field_label("Screenshot hotkey", card))
         self.screenshot_hotkey_field = HotkeyField(config.screenshot_hotkey, card)
         save_layout.addWidget(self.screenshot_hotkey_field)
         self._hint(save_layout, "Grabs a still frame from the buffer -- leave empty to disable", card)
@@ -727,7 +961,7 @@ class SettingsFrame(QWidget):
         save_layout.addLayout(sound_row)
         sound_text_col = QVBoxLayout()
         sound_row.addLayout(sound_text_col, 1)
-        sound_text_col.addWidget(self._bold_label("Play a sound when a clip is saved", card))
+        sound_text_col.addWidget(self._field_label("Play a sound when a clip is saved", card))
         sound_desc = QLabel("Short system beep on every successful save", card)
         sound_desc.setObjectName("hint")
         sound_text_col.addWidget(sound_desc)
@@ -738,18 +972,18 @@ class SettingsFrame(QWidget):
 
     def _build_quick_save_row(
         self, save_layout: QVBoxLayout, label: str, combo: str, seconds: int, card: QWidget
-    ) -> tuple[HotkeyField, QSpinBox]:
+    ) -> tuple[HotkeyField, StepperSpinBox]:
         """One HotkeyField + seconds spinbox row for a "save just the last N
         seconds" binding. An empty combo means disabled (apply_settings
         skips validation and pynput binding for it); the spinbox range
         matches apply_settings' 5-300s clamp.
         """
-        save_layout.addWidget(self._bold_label(label, card))
+        save_layout.addWidget(self._field_label(label, card))
         row = QHBoxLayout()
         save_layout.addLayout(row)
         field = HotkeyField(combo, card)
         row.addWidget(field, 1)
-        spin = QSpinBox(card)
+        spin = StepperSpinBox(card)
         spin.setRange(*_QUICK_SAVE_SECONDS_RANGE)
         spin.setSuffix(" s")
         spin.setValue(max(_QUICK_SAVE_SECONDS_RANGE[0], min(_QUICK_SAVE_SECONDS_RANGE[1], seconds)))
@@ -777,7 +1011,7 @@ class SettingsFrame(QWidget):
         save_layout.addLayout(startup_row)
         startup_text_col = QVBoxLayout()
         startup_row.addLayout(startup_text_col, 1)
-        startup_text_col.addWidget(self._bold_label("Launch on startup", card))
+        startup_text_col.addWidget(self._field_label("Launch on startup", card))
         startup_desc = QLabel(
             "Start automatically when you log in" if startup_supported else "Not supported on this platform yet", card
         )
@@ -828,7 +1062,7 @@ class SettingsFrame(QWidget):
         update_layout.addLayout(update_row)
         update_text_col = QVBoxLayout()
         update_row.addLayout(update_text_col, 1)
-        update_text_col.addWidget(self._bold_label("Check for updates automatically", card))
+        update_text_col.addWidget(self._field_label("Check for updates automatically", card))
         update_desc = QLabel("Check GitHub for a newer version once at startup", card)
         update_desc.setObjectName("hint")
         update_text_col.addWidget(update_desc)
@@ -921,7 +1155,7 @@ class SettingsFrame(QWidget):
         encoder_layout.addLayout(autodetect_row)
         autodetect_text_col = QVBoxLayout()
         autodetect_row.addLayout(autodetect_text_col, 1)
-        autodetect_text_col.addWidget(self._bold_label("Auto-detect", card))
+        autodetect_text_col.addWidget(self._field_label("Auto-detect", card))
         autodetect_desc = QLabel("Picks NVENC / VAAPI / QSV, falling back to libx264", card)
         autodetect_desc.setObjectName("hint")
         autodetect_desc.setWordWrap(True)
@@ -929,7 +1163,6 @@ class SettingsFrame(QWidget):
 
         initial_manual_label = self._encoder_label_by_value.get(config.encoder_override or current_encoder, "libx264")
         self.encoder_control = SegmentedControl([label for label, _ in _ENCODER_CHOICES], card)
-        self.encoder_control.setFont(_qfont(mono=True))
         self.encoder_control.setCurrent(initial_manual_label)
         encoder_layout.addWidget(self.encoder_control)
 
@@ -947,9 +1180,8 @@ class SettingsFrame(QWidget):
         clips_layout = self._make_card(tab_layout, None)
         card = clips_layout.parentWidget()
 
-        clips_layout.addWidget(self._bold_label("Filename template", card))
+        clips_layout.addWidget(self._field_label("Filename template", card))
         self.filename_template_edit = QLineEdit(config.filename_template, card)
-        self.filename_template_edit.setFont(_qfont(mono=True))
         clips_layout.addWidget(self.filename_template_edit)
         self._hint(clips_layout, "Placeholders: {date}, {time}, {datetime}, {window} (active window title)", card)
 
@@ -996,9 +1228,8 @@ class SettingsFrame(QWidget):
         # widget's side it's just another field in the autosave payload. An
         # unknown persisted mode (a hand-edited config) shows as "System",
         # and the next apply normalizes it to a real mode.
-        appearance_layout.addWidget(self._bold_label("Theme", card))
+        appearance_layout.addWidget(self._field_label("Theme", card))
         self.theme_control = SegmentedControl(list(_THEME_MODES), card)
-        self.theme_control.setFont(_qfont(mono=True))
         self.theme_control.setCurrent(_THEME_MODE_LABELS.get(config.theme_mode, "System"))
         appearance_layout.addWidget(self.theme_control)
         self._hint(appearance_layout, "System follows your OS dark-mode setting", card)
@@ -1349,11 +1580,17 @@ def build_settings_frame(
     on_apply: Callable[[dict], str | None],
     ffmpeg_path: str,
     on_update_found: Callable[[str, str], None] | None = None,
+    log_path: Path | None = None,
+    diagnostics_facts_provider: Callable[[], dict[str, str]] | None = None,
 ) -> SettingsFrame:
     """Thin factory function kept for API parity with the CustomTkinter
-    original's `build_settings_frame(...)` shape.
+    original's `build_settings_frame(...)` shape. `log_path` /
+    `diagnostics_facts_provider` feed the Logs sub-tab (None -> the default
+    log path / a diagnostics zip without live system facts).
     """
     return SettingsFrame(
         config, ipc_port, save_events, current_encoder, on_apply, ffmpeg_path, parent,
         on_update_found=on_update_found,
+        log_path=log_path,
+        diagnostics_facts_provider=diagnostics_facts_provider,
     )

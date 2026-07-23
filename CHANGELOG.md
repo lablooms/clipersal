@@ -197,6 +197,60 @@ The big experience-and-creator update, on top of 0.1.0.
   shown is what's saved), and the launch-on-startup toggle reconciles with the
   real registration state instead of a stale persisted belief.
 
+### Fixed (post-release)
+
+- **Logs moved into Settings**: the top-level Logs page is now the Settings
+  tab widget's last sub-tab (… / Appearance / About / Logs), so the sidebar
+  reads just Home / Clips / Settings. Every old entry point still lands on the
+  log viewer — Ctrl+4, the crash banner's and the Settings footer's "View
+  logs", the tray's View logs, and `clipersal-trigger logs` all open
+  Settings → Logs now.
+- **Selection mode no longer pushes the clip list down**: the selection action
+  bar ("N selected", All/None, Delete selected, Done) takes over the Clips
+  tab's fixed footer strip in place of the usual count/size line, instead of
+  appearing above the list and shoving every row down when it opened.
+- **Typography normalized on one scale** (documented at the top of
+  `theme.py`): H1 18 page titles, H2 14 card/section titles, BODY 12 for all
+  interactive text (installed as the application font — everything sat at the
+  platform default before), HINT 11 for secondary text, MONO 11 for code-ish
+  readouts. Bold is reserved for page/card titles, the status word, clip
+  names, and primary buttons; settings field labels, nav buttons, segmented
+  controls, and value badges no longer invent their own weights/sizes.
+- **Spin-box steppers and scrollbars remade**: the up/down steppers are now
+  custom themed ▲/▼ buttons built into the inputs (no more native grey
+  arrows), and scrollbars are slim 8px pills on a transparent track (no
+  buttons, no page fill, accent while dragging) in both orientations.
+- **"Trim…" opens the player paused**: it used to start playing immediately,
+  which read as "just a video player" and made the trim marks impossible to
+  land on a moving playhead. Play actions still autoplay.
+- **Screenshots can't return a ghost path**: ffmpeg can exit 0 without
+  decoding a single frame (seen on QSV-encoded segments with `-sseof`) — the
+  grab now verifies the PNG actually exists and falls back to the next seek
+  strategy instead of "successfully" writing nothing. Found by the
+  end-to-end smoke test (record → save → trim → screenshot against a real
+  ffmpeg, 11/11 checks).
+- **Deep-review bug pass** (each with a regression test):
+  - cancelling a hotkey recording with a key held no longer leaves a partial
+    combo behind — the autosave was rebinding the save hotkey to a bare
+    `<ctrl>` that fired on every ctrl press;
+  - a failed launch-on-startup registration now blocks the whole settings
+    apply (nothing mutated, nothing persisted) instead of applying everything
+    else and then erroring, which made the autosave roll back genuinely-saved
+    values;
+  - IPC commands landing before the main window exists no longer die on a
+    `NameError` — they answer "main window unavailable" properly;
+  - the tray's pause/resume no longer blocks the GUI thread on a multi-second
+    IPC call (now a worker, like every other trigger), and can't be inverted
+    by a concurrent status re-sync;
+  - hotkey-triggered saves/screenshots use the 70 s save timeout instead of
+    the 5 s default — a slow-but-successful save no longer logs as failed;
+  - a capture restart that fails during settings apply (e.g. a cancelled
+    Wayland share prompt) rolls the config back and revives the old session
+    instead of leaving capture dead with config half-mutated; applying
+    capture settings while CRASHED now actually restarts capture;
+  - a read-only config dir reports "could not save settings" (settings tab
+    and first-run wizard) instead of raising an uncaught exception.
+
 ## [0.1.0] — 2026-07-19
 
 ### Added

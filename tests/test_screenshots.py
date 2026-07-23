@@ -55,7 +55,7 @@ def test_grabs_last_frame_of_newest_finalized_segment(tmp_path: Path, monkeypatc
     _make_segments(buffer_dir, ["seg-20260101-000000.ts", "seg-20260101-000002.ts", "seg-20260101-000004.ts"])
 
     calls = []
-    monkeypatch.setattr(screenshots.subprocess, "run", _fake_run_factory(calls, [0]))
+    monkeypatch.setattr(screenshots.subprocess, "run", _fake_run_factory(calls, [0], create_output=True))
 
     result = save_screenshot("ffmpeg", buffer_dir, clips_dir)
 
@@ -75,7 +75,7 @@ def test_tail_seek_failure_retries_from_first_frame(tmp_path: Path, monkeypatch)
     _make_segments(buffer_dir, ["seg-20260101-000000.ts", "seg-20260101-000002.ts"])
 
     calls = []
-    monkeypatch.setattr(screenshots.subprocess, "run", _fake_run_factory(calls, [1, 0]))
+    monkeypatch.setattr(screenshots.subprocess, "run", _fake_run_factory(calls, [1, 0], create_output=True))
 
     result = save_screenshot("ffmpeg", buffer_dir, clips_dir)
 
@@ -135,7 +135,7 @@ def test_name_collision_gets_a_counter_suffix(tmp_path: Path, monkeypatch) -> No
     (clips_dir / "screenshot-fixed.png").write_bytes(b"earlier screenshot")
 
     calls = []
-    monkeypatch.setattr(screenshots.subprocess, "run", _fake_run_factory(calls, [0]))
+    monkeypatch.setattr(screenshots.subprocess, "run", _fake_run_factory(calls, [0], create_output=True))
 
     result = save_screenshot("ffmpeg", buffer_dir, clips_dir)
 
@@ -153,8 +153,50 @@ def test_vanished_segments_are_skipped(tmp_path: Path, monkeypatch) -> None:
     (buffer_dir / "seg-20260101-000002.ts").unlink()
 
     calls = []
-    monkeypatch.setattr(screenshots.subprocess, "run", _fake_run_factory(calls, [0]))
+    monkeypatch.setattr(screenshots.subprocess, "run", _fake_run_factory(calls, [0], create_output=True))
 
     save_screenshot("ffmpeg", buffer_dir, clips_dir)
 
     assert str(buffer_dir / "seg-20260101-000000.ts") in calls[0]
+
+
+def test_returncode_zero_without_output_file_retries_next_seek(tmp_path: Path, monkeypatch) -> None:
+    # Real bug found by the end-to-end smoke: ffmpeg exits 0 but decodes no
+    # frame (e.g. -sseof past the last decodable frame on QSV segments) --
+    # the ghost path must not be returned; the next seek strategy runs.
+    buffer_dir = tmp_path / "buffer"
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    _make_segments(buffer_dir, ["seg-20260101-000000.ts", "seg-20260101-000002.ts"])
+
+    calls = []
+
+    def fake_run(cmd, capture_output, text, timeout, **kwargs):
+        calls.append(list(cmd))
+        if len(calls) == 2:  # only the -ss 0 retry "produces" a frame
+            Path(cmd[-1]).write_bytes(b"real png")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(screenshots.subprocess, "run", fake_run)
+
+    result = save_screenshot("ffmpeg", buffer_dir, clips_dir)
+
+    assert len(calls) == 2
+    assert "-sseof" in calls[0] and "-ss" in calls[1]
+    assert result.exists() and result.stat().st_size > 0
+
+
+def test_returncode_zero_with_no_output_at_all_raises(tmp_path: Path, monkeypatch) -> None:
+    buffer_dir = tmp_path / "buffer"
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    _make_segments(buffer_dir, ["seg-20260101-000000.ts", "seg-20260101-000002.ts"])
+
+    calls = []
+    monkeypatch.setattr(screenshots.subprocess, "run", _fake_run_factory(calls, [0, 0]))  # never creates output
+
+    with pytest.raises(ScreenshotError, match="screenshot grab failed"):
+        save_screenshot("ffmpeg", buffer_dir, clips_dir)
+
+    assert len(calls) == 2
+    assert list(clips_dir.glob("*.png")) == []

@@ -50,12 +50,24 @@ def _make_config(tmp_path: Path, **overrides) -> Config:
     return Config(**kwargs)
 
 
-def _build(tmp_path: Path, on_apply=None, on_update_found=None, **config_overrides) -> SettingsFrame:
+def _build(
+    tmp_path: Path,
+    on_apply=None,
+    on_update_found=None,
+    log_path=None,
+    diagnostics_facts_provider=None,
+    **config_overrides,
+) -> SettingsFrame:
     config = _make_config(tmp_path, **config_overrides)
     return SettingsFrame(
         config, ipc_port=51525, save_events=None, current_encoder="libx264",
         on_apply=on_apply or (lambda values: None), ffmpeg_path="ffmpeg",
         on_update_found=on_update_found,
+        # Hermetic by default: the Logs sub-tab must never read the dev
+        # machine's real log file. Tests pass their own path explicitly when
+        # the content matters.
+        log_path=log_path if log_path is not None else tmp_path / "log.txt",
+        diagnostics_facts_provider=diagnostics_facts_provider,
     )
 
 
@@ -751,6 +763,28 @@ def test_cancelled_hotkey_recording_schedules_nothing(tmp_path: Path, monkeypatc
     assert frame._apply_timer.isActive() is False  # nothing changed, nothing to save
 
 
+def test_cancelled_recording_with_a_key_held_applies_nothing(tmp_path: Path, monkeypatch) -> None:
+    # Regression: cancelling a recording with a key still HELD used to leave
+    # the half-captured modifier-only text ("<ctrl>") in the entry, and the
+    # settled-combo comparison then scheduled an apply -- the save hotkey
+    # silently became a bare modifier that fires on every ctrl press. The
+    # cancel must restore the pre-record combo, so nothing schedules.
+    import pynput.keyboard
+
+    monkeypatch.setattr(pynput.keyboard, "Listener", _FakeListener)
+    applied = []
+    frame = _build(tmp_path, on_apply=lambda values: applied.append(dict(values)) or None)
+
+    field = frame.hotkey_field
+    field.record_button.click()
+    field._on_key_press("ctrl")  # held -- the entry shows the half-captured "<ctrl>"
+    field.record_button.click()  # cancel mid-capture
+
+    assert field.combo() == "<ctrl>+<alt>+r"
+    assert frame._apply_timer.isActive() is False
+    assert applied == []
+
+
 def test_manually_typed_hotkey_applies_on_editing_finished(tmp_path: Path) -> None:
     applied = []
     frame = _build(tmp_path, on_apply=lambda values: applied.append(dict(values)) or None)
@@ -1112,7 +1146,7 @@ def _is_descendant(widget, ancestor) -> bool:
 
 def test_settings_fields_are_grouped_into_the_expected_tabs(tmp_path: Path) -> None:
     frame = _build(tmp_path)
-    assert _tab_labels(frame) == ["Capture", "Saving", "Encoder", "Clips", "Appearance", "About"]
+    assert _tab_labels(frame) == ["Capture", "Saving", "Encoder", "Clips", "Appearance", "About", "Logs"]
 
     for widget in (
         frame.buffer_slider, frame.target_control, frame.window_combo,
@@ -1145,12 +1179,60 @@ def test_settings_fields_are_grouped_into_the_expected_tabs(tmp_path: Path) -> N
         assert _is_descendant(widget, _tab_page(frame, "About")), widget
 
 
+def test_logs_is_the_last_tab_with_its_full_widget_set(tmp_path: Path) -> None:
+    frame = _build(tmp_path)
+    assert _tab_labels(frame)[-1] == "Logs"
+    logs = frame.logs_tab
+    assert _tab_page(frame, "Logs") is logs
+    # The whole old top-level Logs page came along: search, level combo,
+    # auto-scroll toggle, Copy / Export / open-folder, the mono textbox, and
+    # the diagnostics status label.
+    assert logs._log_search_edit.placeholderText() == "Search logs..."
+    assert [logs._log_level_combo.itemText(i) for i in range(logs._log_level_combo.count())] == [
+        "All", "INFO", "WARNING", "ERROR",
+    ]
+    assert logs._log_autoscroll_switch.isChecked() is True
+    button_texts = [button.text() for button in logs.findChildren(QPushButton)]
+    assert "Copy" in button_texts
+    assert "Export diagnostics..." in button_texts
+    assert "Open log folder" in button_texts
+    assert logs._log_textbox.isReadOnly() is True
+    assert logs._diagnostics_status_label.objectName() == "statusLabel"
+    # The tail poll runs on the tab's own timer, same 2s cadence as before.
+    assert logs._log_timer.isActive() is True
+    assert logs._log_timer.interval() == settings_window_qt._LOG_TAIL_POLL_MS
+
+
+def test_select_subtab_switches_to_the_named_tab(tmp_path: Path) -> None:
+    frame = _build(tmp_path)
+    frame.select_subtab("logs")
+    assert frame.tabs.currentWidget() is frame.logs_tab
+    frame.select_subtab("About")
+    assert frame.tabs.currentIndex() == _tab_labels(frame).index("About")
+    # An unknown name is a no-op.
+    frame.select_subtab("nonexistent")
+    assert frame.tabs.currentIndex() == _tab_labels(frame).index("About")
+
+
+def test_footer_view_logs_button_jumps_to_the_logs_subtab(tmp_path: Path) -> None:
+    frame = _build(tmp_path)
+    view_logs = next(b for b in frame.findChildren(QPushButton) if b.text() == "View logs")
+    assert frame.tabs.currentWidget() is not frame.logs_tab
+    view_logs.click()
+    assert frame.tabs.currentWidget() is frame.logs_tab
+
+
 def test_every_tab_page_scrolls(tmp_path: Path) -> None:
     from PySide6.QtWidgets import QScrollArea
 
     frame = _build(tmp_path)
     for i in range(frame.tabs.count()):
-        assert isinstance(frame.tabs.widget(i), QScrollArea)
+        if frame.tabs.tabText(i) == "Logs":
+            # The Logs page is the one exception: its textbox fills the tab
+            # and scrolls itself, so it isn't scroll-wrapped.
+            assert frame.tabs.widget(i) is frame.logs_tab
+        else:
+            assert isinstance(frame.tabs.widget(i), QScrollArea)
 
 
 def test_about_tab_shows_version_license_and_github_link(tmp_path: Path) -> None:
@@ -1245,7 +1327,7 @@ def test_reset_to_defaults_applies_defaults_and_repopulates_the_ui(tmp_path: Pat
     assert frame.check_for_updates_switch.isChecked() is True
     assert frame.hotkey_field.combo() == defaults["hotkey_combo"]
     assert frame.clips_dir_edit.text() == defaults["clips_dir"]
-    assert _tab_labels(frame) == ["Capture", "Saving", "Encoder", "Clips", "Appearance", "About"]
+    assert _tab_labels(frame) == ["Capture", "Saving", "Encoder", "Clips", "Appearance", "About", "Logs"]
     assert frame.status_label.text() == "Saved ✓"
     assert frame.status_label.property("state") == "success"
     # The reset payload is the new last-known-good snapshot...
@@ -1295,8 +1377,157 @@ def test_reset_confirmation_calls_out_the_clips_folder_reset(tmp_path: Path, mon
 def test_tab_pages_do_not_autofill_an_unthemed_background(tmp_path: Path) -> None:
     # QScrollArea.setWidget flips the page's autoFillBackground ON, which
     # fills it with the unthemed palette Window grey in both modes -- the
-    # "rogue dark background" report. Every tab page must have it off.
+    # "rogue dark background" report. Every scroll-wrapped tab page must
+    # have it off (the Logs tab isn't scroll-wrapped -- it fills the tab
+    # with its own scrolling textbox).
     frame = _build(tmp_path)
     for i in range(frame.tabs.count()):
+        if frame.tabs.tabText(i) == "Logs":
+            continue
         scroll = frame.tabs.widget(i)
         assert scroll.widget().autoFillBackground() is False
+
+
+# ---- Logs sub-tab: search / level filter / copy -------------------------------
+# Moved from test_main_window_qt.py along with the Logs page itself.
+
+
+def _write_log(log_path: Path) -> None:
+    log_path.write_text(
+        "2026-07-22 01:00:00,000 INFO clipersal.cli: capture started\n"
+        "2026-07-22 01:00:01,000 WARNING clipersal.capture: ffmpeg restarted\n"
+        "2026-07-22 01:00:02,000 INFO clipersal.cli: save completed\n"
+        "2026-07-22 01:00:03,000 ERROR clipersal.concat: remux failed\n",
+        encoding="utf-8",
+    )
+
+
+def test_logs_tab_search_filters_case_insensitively(tmp_path: Path) -> None:
+    _write_log(tmp_path / "log.txt")
+    logs = _build(tmp_path).logs_tab
+    logs._log_search_edit.setText("FFMPEG")  # textChanged triggers the refresh
+    content = logs._log_textbox.toPlainText()
+    assert "ffmpeg restarted" in content
+    assert "capture started" not in content
+
+
+def test_logs_tab_level_filter_matches_the_level_token(tmp_path: Path) -> None:
+    _write_log(tmp_path / "log.txt")
+    logs = _build(tmp_path).logs_tab
+    logs._log_level_combo.setCurrentText("ERROR")
+    content = logs._log_textbox.toPlainText()
+    assert "remux failed" in content
+    assert "capture started" not in content
+    assert "ffmpeg restarted" not in content
+
+
+def test_logs_tab_search_and_level_combine(tmp_path: Path) -> None:
+    _write_log(tmp_path / "log.txt")
+    logs = _build(tmp_path).logs_tab
+    logs._log_search_edit.setText("save")
+    logs._log_level_combo.setCurrentText("INFO")
+    content = logs._log_textbox.toPlainText()
+    assert "save completed" in content
+    assert "capture started" not in content
+
+
+def test_logs_tab_shows_placeholder_when_nothing_matches(tmp_path: Path) -> None:
+    _write_log(tmp_path / "log.txt")
+    logs = _build(tmp_path).logs_tab
+    logs._log_search_edit.setText("no-such-text-anywhere")
+    assert logs._log_textbox.toPlainText() == "(no log lines match)"
+
+
+def test_logs_tab_missing_log_file_message(tmp_path: Path) -> None:
+    logs = _build(tmp_path).logs_tab  # no log.txt written
+    logs._refresh_log_tail()
+    assert "log file not found" in logs._log_textbox.toPlainText()
+
+
+def test_logs_tab_copy_puts_the_filtered_text_on_the_clipboard(tmp_path: Path) -> None:
+    _write_log(tmp_path / "log.txt")
+    logs = _build(tmp_path).logs_tab
+    logs._log_level_combo.setCurrentText("WARNING")
+    logs._on_copy_logs()
+    from PySide6.QtGui import QGuiApplication
+
+    assert QGuiApplication.clipboard().text() == logs._log_textbox.toPlainText()
+    assert "ffmpeg restarted" in QGuiApplication.clipboard().text()
+
+
+def test_logs_tab_autoscroll_off_keeps_scroll_position(tmp_path: Path) -> None:
+    _write_log(tmp_path / "log.txt")
+    logs = _build(tmp_path).logs_tab
+    logs._log_autoscroll_switch.setChecked(False)
+    scrollbar = logs._log_textbox.verticalScrollBar()
+    scrollbar.setValue(0)
+    logs._refresh_log_tail()
+    assert scrollbar.value() == 0
+
+
+# ---- Logs sub-tab: export diagnostics ------------------------------------------
+
+
+def test_export_diagnostics_writes_zip_and_reports_success(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "log.txt").write_text("log line\n", encoding="utf-8")
+    target = tmp_path / "diag.zip"
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(target), "Zip files (*.zip)"))
+    )
+
+    logs = _build(tmp_path, diagnostics_facts_provider=lambda: {"os": "test-os"}).logs_tab
+    logs._on_export_diagnostics()
+
+    assert target.exists()
+    assert logs._diagnostics_status_label.property("state") == "success"
+    assert str(target) in logs._diagnostics_status_label.text()
+
+
+def test_export_diagnostics_reports_failure(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "log.txt").write_text("log line\n", encoding="utf-8")
+    # A directory where the zip should go -> export_diagnostics_zip fails.
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(tmp_path), "Zip files (*.zip)"))
+    )
+
+    logs = _build(tmp_path, diagnostics_facts_provider=lambda: {}).logs_tab
+    logs._on_export_diagnostics()
+
+    assert logs._diagnostics_status_label.property("state") == "error"
+    assert "Export failed" in logs._diagnostics_status_label.text()
+
+
+def test_export_diagnostics_cancelled_dialog_does_nothing(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: ("", "")))
+
+    logs = _build(tmp_path).logs_tab
+    logs._on_export_diagnostics()
+
+    assert logs._diagnostics_status_label.text() == ""
+
+
+def test_export_diagnostics_survives_a_failing_facts_provider(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "log.txt").write_text("log line\n", encoding="utf-8")
+    target = tmp_path / "diag.zip"
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(target), "Zip files (*.zip)"))
+    )
+
+    def boom():
+        raise RuntimeError("facts unavailable (fake)")
+
+    logs = _build(tmp_path, diagnostics_facts_provider=boom).logs_tab
+    logs._on_export_diagnostics()  # must not raise -- facts are best-effort
+
+    assert target.exists()
+    assert logs._diagnostics_status_label.property("state") == "success"
+
+
+def test_settings_frame_forwards_diagnostics_export_to_the_logs_tab(tmp_path: Path, monkeypatch) -> None:
+    # MainWindow's crash-report prompt reaches the flow through this
+    # forwarder -- it must be the Logs tab's one implementation.
+    frame = _build(tmp_path)
+    calls = []
+    monkeypatch.setattr(frame.logs_tab, "export_diagnostics_with_dialog", lambda: calls.append(True))
+    frame.export_diagnostics_with_dialog()
+    assert calls == [True]

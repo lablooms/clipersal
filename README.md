@@ -18,10 +18,11 @@ triggered over a local IPC socket via a real global hotkey (Windows / Linux-X11)
 target the whole desktop, a specific monitor, or a single window, with an optional
 microphone mixed in alongside best-effort system-audio loopback, a named quality preset
 (Performance / Balanced / Quality / Custom), and automatic restart if ffmpeg crashes
-unexpectedly. A persistent main window (Home / Clips / Settings / Logs, like OBS) hosts
+unexpectedly. A persistent main window (Home / Clips / Settings, like OBS) hosts
 everything — Settings (buffer length, clips folder, capture target, microphone, quality
 preset, hotkey, encoder, filename template, clip retention, launch-on-startup, update
-checks), an in-app clip gallery with open/reveal/rename/delete actions, and a log viewer.
+checks), an in-app clip gallery with open/reveal/rename/delete actions, and a log viewer
+(the Settings tab's last sub-tab).
 Saves can be trimmed to just the last N seconds, and a save-notification toast pops up
 with a thumbnail preview. A first-run wizard greets a fresh install, a second launch
 detects the already-running instance instead of failing confusingly, logs rotate to a
@@ -91,7 +92,7 @@ clipersal-trigger status            # RECORDING or PAUSED
 clipersal-trigger show              # open/focus the main window
 clipersal-trigger settings          # open the main window's Settings tab
 clipersal-trigger gallery           # open the main window's Clips tab
-clipersal-trigger logs              # open the main window's Logs tab
+clipersal-trigger logs              # open the log viewer (Settings → Logs)
 clipersal-trigger ping              # health check
 clipersal-trigger quit              # ask a running instance to shut down
 ```
@@ -99,7 +100,8 @@ clipersal-trigger quit              # ask a running instance to shut down
 ## Main window
 
 Clipersal has one persistent main window, the same shape as OBS: a sidebar with **Home**,
-**Clips**, **Settings**, and **Logs**. It opens on launch, and closing it (the ✕ button)
+**Clips**, and **Settings** (the log viewer lives inside Settings as its last sub-tab,
+**Logs**). It opens on launch, and closing it (the ✕ button)
 just hides it back to the tray rather than quitting — use the tray's **Quit** (or
 `clipersal-trigger quit`) to actually exit. If you disable the tray (`--no-tray`), closing
 the window quits instead, since there'd be no way to bring it back.
@@ -117,7 +119,7 @@ to **Lablooms** (the studio) and **♥ Support** (the project's GitHub repo).
 
 Window keyboard shortcuts: **Ctrl+S** save now, **Ctrl+Shift+S** save last 30 s,
 **Ctrl+P** pause/resume, **F5** refresh the gallery, **Ctrl+,** open Settings,
-**Ctrl+1–4** switch tabs.
+**Ctrl+1–3** switch tabs, **Ctrl+4** jump to the log viewer (Settings → Logs).
 
 ## System tray
 
@@ -158,6 +160,9 @@ tabs with a warm gold (Pollen Gold) accent:
   setting and is the default)
 - **About** — version, license, the update checker (with a **Check now** button and
   last-checked time), and project links
+- **Logs** — the log viewer: search and level filters over the rotating log file's
+  tail, an auto-scroll toggle, a copy button, **Open log folder**, and **Export
+  diagnostics…** (a zip of logs + config + system facts for bug reports)
 
 Combo boxes, spin boxes, and sliders never change value when you scroll past them
 (the scroll wheel never adjusts them — keyboard arrows still work when focused) —
@@ -251,7 +256,8 @@ Skipping it is fine -- it still saves your current settings so it won't ask agai
 Launching a second copy while one is already running shows a friendly "already running"
 message instead of a confusing socket error, and never starts a second capture session.
 
-The **Logs** tab (tray's **View logs**, or `clipersal-trigger logs`) shows the tail of
+The **Logs** sub-tab (Settings → Logs — the tray's **View logs** and `clipersal-trigger
+logs` both land there) shows the tail of
 the log file, which rotates next to the config file (printed in the startup banner as
 `logs:`) -- useful since a packaged, windowed build has no console to print to. It has
 search and level filters, an auto-scroll toggle, a copy button, and an **Export

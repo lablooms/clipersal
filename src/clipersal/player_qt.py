@@ -70,6 +70,7 @@ def play_clip(
     clip_path: Path,
     ffmpeg_path: str | None = None,
     on_trim_exported=None,
+    autoplay: bool = True,
 ) -> "PlayerDialog | None":
     """Open `clip_path` in the in-app player, or in the OS's default player
     when QtMultimedia is unavailable (the pre-0.1.4 behavior for every open
@@ -87,7 +88,7 @@ def play_clip(
     if not multimedia_available():
         open_file(clip_path)
         return None
-    dialog = PlayerDialog(clip_path, ffmpeg_path, parent_widget)
+    dialog = PlayerDialog(clip_path, ffmpeg_path, parent_widget, autoplay=autoplay)
     dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
     if on_trim_exported is not None:
         dialog.trim_exported.connect(on_trim_exported)
@@ -158,7 +159,13 @@ class PlayerDialog(QDialog):
 
     trim_exported = Signal(object)  # Path of the exported "<stem>-trimmed.mp4"
 
-    def __init__(self, clip_path: Path, ffmpeg_path: str | None = None, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        clip_path: Path,
+        ffmpeg_path: str | None = None,
+        parent: QWidget | None = None,
+        autoplay: bool = True,
+    ) -> None:
         if not _MULTIMEDIA_OK:
             raise RuntimeError(
                 "PySide6.QtMultimedia is not available -- check multimedia_available() "
@@ -240,10 +247,10 @@ class PlayerDialog(QDialog):
         trim_layout.setSpacing(8)
         layout.addWidget(trim_card)
 
-        trim_title = QLabel("Trim", trim_card)
-        title_font = trim_title.font()
-        title_font.setBold(True)
-        trim_title.setFont(title_font)
+        trim_title = QLabel("TRIM", trim_card)
+        # A card section title -- the #cardTitle style (literal caps; Qt QSS
+        # has no text-transform), same convention as the settings cards.
+        trim_title.setObjectName("cardTitle")
         trim_layout.addWidget(trim_title)
 
         marks_row = QHBoxLayout()
@@ -290,8 +297,12 @@ class PlayerDialog(QDialog):
         self._worker.trim_finished.connect(self._on_trim_finished)
 
         self._refresh_trim_state()
-        # "Play" is the whole point of opening the dialog -- start immediately.
-        self._player.play()
+        # Watching is the point of opening the dialog for play -- start
+        # immediately. A trim-focused open stays paused instead: autoplay
+        # made "Trim…" feel like it just played the video, with the marks
+        # impossible to land on a moving playhead.
+        if autoplay:
+            self._player.play()
 
     # ---- playback controls ---------------------------------------------------
 

@@ -222,3 +222,12 @@ def test_trim_export_failure_shows_the_error_inline(dialog: PlayerDialog, monkey
     assert "ffmpeg trim failed" in dialog._trim_status_label.text()
     assert emitted == []
     assert dialog.export_button.isEnabled() is True  # usable again after a failure
+
+
+def test_autoplay_false_opens_paused(clip_path: Path) -> None:
+    from PySide6.QtMultimedia import QMediaPlayer
+
+    dialog = PlayerDialog(clip_path, "ffmpeg", autoplay=False)
+
+    assert dialog._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState
+    assert dialog.play_pause_button.text() == "Play"

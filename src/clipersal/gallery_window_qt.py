@@ -53,7 +53,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
-    QDoubleSpinBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -66,7 +65,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QSpinBox,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -74,7 +72,7 @@ from PySide6.QtWidgets import (
 
 from clipersal import clip_metadata, export, player_qt, theme, thumbnails
 from clipersal.brand import SprigAccent
-from clipersal.qt_widgets import ElidedLabel, SegmentedControl, ToggleSwitch, quiet_message
+from clipersal.qt_widgets import ElidedLabel, SegmentedControl, StepperDoubleSpinBox, StepperSpinBox, ToggleSwitch, quiet_message
 from clipersal.theme import qfont as _qfont
 from clipersal.tray import open_folder
 
@@ -548,7 +546,10 @@ class ClipDetailsDialog(QDialog):
 
         facts_column = QVBoxLayout()
         top_row.addLayout(facts_column, 1)
-        self.name_label = QLabel(clip_path.name, self)
+        # Elided (middle, keeping the extension): at the dialog's minimum
+        # width the facts column shares its row with the 240px preview, so
+        # an unbounded name label would clip at the dialog's right edge.
+        self.name_label = ElidedLabel(clip_path.name, self, Qt.TextElideMode.ElideMiddle)
         name_font = self.name_label.font()
         name_font.setBold(True)
         self.name_label.setFont(name_font)
@@ -568,6 +569,9 @@ class ClipDetailsDialog(QDialog):
         facts_column.addWidget(self.meta_label)
         self.info_label = QLabel("Duration: probing…  ·  Resolution: probing…", self)
         self.info_label.setObjectName("hint")
+        # Word-wrap like the meta line above: the two facts together are
+        # wider than the facts column at the dialog's minimum width.
+        self.info_label.setWordWrap(True)
         facts_column.addWidget(self.info_label)
 
         favorite_row = QHBoxLayout()
@@ -754,19 +758,19 @@ class GifExportDialog(_ExportDialog):
         fields_row = QHBoxLayout()
         fields_row.setSpacing(10)
         layout.addLayout(fields_row)
-        self.start_spin = QDoubleSpinBox(self)
+        self.start_spin = StepperDoubleSpinBox(self)
         self.start_spin.setRange(0.0, 9999.0)
         self.start_spin.setDecimals(1)
         self.start_spin.setSuffix(" s")
-        self.duration_spin = QDoubleSpinBox(self)
+        self.duration_spin = StepperDoubleSpinBox(self)
         self.duration_spin.setRange(0.5, 30.0)
         self.duration_spin.setDecimals(1)
         self.duration_spin.setValue(3.0)
         self.duration_spin.setSuffix(" s")
-        self.fps_spin = QSpinBox(self)
+        self.fps_spin = StepperSpinBox(self)
         self.fps_spin.setRange(4, 30)
         self.fps_spin.setValue(12)
-        self.width_spin = QSpinBox(self)
+        self.width_spin = StepperSpinBox(self)
         self.width_spin.setRange(200, 1920)
         self.width_spin.setSingleStep(20)
         self.width_spin.setValue(480)
@@ -1033,31 +1037,13 @@ class GalleryFrame(QWidget):
         self.favorites_first_switch.toggled.connect(self._on_favorites_first_changed)
         controls.addWidget(self.favorites_first_switch)
 
+        # The entry toggle for selection mode: its checked state marks the
+        # mode while active. Its TEXT stays "Select" -- the selection bar's
+        # own "Done" button is the exit (see the footer below).
         self.select_button = QPushButton("Select", self)
         self.select_button.setCheckable(True)
         self.select_button.toggled.connect(self._set_selection_mode)
         controls.addWidget(self.select_button)
-
-        # Selection-mode bar, hidden until the Select toggle is on.
-        self._selection_bar = QWidget(self)
-        selection_layout = QHBoxLayout(self._selection_bar)
-        selection_layout.setContentsMargins(0, 0, 0, 0)
-        selection_layout.setSpacing(8)
-        self.select_all_button = QPushButton("All", self._selection_bar)
-        self.select_all_button.clicked.connect(self._select_all_visible)
-        self.select_none_button = QPushButton("None", self._selection_bar)
-        self.select_none_button.clicked.connect(self._select_none)
-        for button in (self.select_all_button, self.select_none_button):
-            button.setFixedHeight(26)
-            selection_layout.addWidget(button)
-        selection_layout.addStretch()
-        self.delete_selected_button = QPushButton("Delete selected (0)", self._selection_bar)
-        self.delete_selected_button.setObjectName("danger")
-        self.delete_selected_button.setEnabled(False)
-        self.delete_selected_button.clicked.connect(self._do_delete_selected)
-        selection_layout.addWidget(self.delete_selected_button)
-        outer.addWidget(self._selection_bar)
-        self._selection_bar.hide()
 
         self._empty_container = QWidget(self)
         empty_layout = QVBoxLayout(self._empty_container)
@@ -1105,10 +1091,59 @@ class GalleryFrame(QWidget):
         # visible cards (same order) whenever it changes.
         self._grid_scroll_area.viewport().installEventFilter(self)
 
-        self.footer_label = QLabel(self)
+        # Footer: a fixed-height strip at the bottom whose CONTENT swaps
+        # between the normal stats line and the selection-mode action bar.
+        # The selection bar used to appear ABOVE the list and shove every
+        # row/card down on entering selection mode; living in the footer
+        # means the list never moves (the stack is pinned to the taller of
+        # its two pages, so the strip's height never changes either).
+        self._footer_stack = QStackedWidget(self)
+        outer.addWidget(self._footer_stack)
+
+        self._footer_normal_page = QWidget(self._footer_stack)
+        normal_layout = QHBoxLayout(self._footer_normal_page)
+        normal_layout.setContentsMargins(0, 0, 0, 0)
+        self.footer_label = QLabel(self._footer_normal_page)
         self.footer_label.setObjectName("hint")
-        self.footer_label.setAlignment(Qt.AlignmentFlag.AlignRight)
-        outer.addWidget(self.footer_label)
+        self.footer_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        normal_layout.addWidget(self.footer_label)
+        self._footer_stack.addWidget(self._footer_normal_page)
+
+        # The selection action bar: "N selected" + All/None on the left,
+        # Delete selected + Done on the right.
+        self._selection_bar = QWidget(self._footer_stack)
+        selection_layout = QHBoxLayout(self._selection_bar)
+        selection_layout.setContentsMargins(0, 0, 0, 0)
+        selection_layout.setSpacing(8)
+        self._selected_count_label = QLabel("0 selected", self._selection_bar)
+        self._selected_count_label.setObjectName("hint")
+        selection_layout.addWidget(self._selected_count_label)
+        self.select_all_button = QPushButton("All", self._selection_bar)
+        self.select_all_button.clicked.connect(self._select_all_visible)
+        selection_layout.addWidget(self.select_all_button)
+        self.select_none_button = QPushButton("None", self._selection_bar)
+        self.select_none_button.clicked.connect(self._select_none)
+        selection_layout.addWidget(self.select_none_button)
+        selection_layout.addStretch()
+        self.delete_selected_button = QPushButton("Delete selected (0)", self._selection_bar)
+        self.delete_selected_button.setObjectName("danger")
+        self.delete_selected_button.setEnabled(False)
+        self.delete_selected_button.clicked.connect(self._do_delete_selected)
+        selection_layout.addWidget(self.delete_selected_button)
+        self.done_selecting_button = QPushButton("Done", self._selection_bar)
+        # Exiting through the toggle keeps exactly one state path: unchecking
+        # the header button fires toggled -> _set_selection_mode(False).
+        self.done_selecting_button.clicked.connect(lambda: self.select_button.setChecked(False))
+        selection_layout.addWidget(self.done_selecting_button)
+        self._footer_stack.addWidget(self._selection_bar)
+
+        # Pin the strip at the TALLER page's height so the content swap
+        # can't resize it (a QStackedWidget's sizeHint tracks only its
+        # current page -- the bar's buttons are taller than the stats line).
+        self._footer_stack.setFixedHeight(
+            max(self._footer_normal_page.sizeHint().height(), self._selection_bar.sizeHint().height())
+        )
+        self._footer_stack.setCurrentWidget(self._footer_normal_page)
 
         self.refresh()
 
@@ -1439,17 +1474,20 @@ class GalleryFrame(QWidget):
 
     # ---- play in-app (0.1.4) ---------------------------------------------------
 
-    def _play_clip(self, clip_path: Path) -> None:
+    def _play_clip(self, clip_path: Path, autoplay: bool = True) -> None:
         """Row Play button / double-click / context-menu "Play" and "Trim...":
         the in-app player when QtMultimedia is importable, the OS default
         player otherwise. Construction + the fallback live in
         player_qt.play_clip, shared with the main window's recent-clips
-        strip; this method only keeps the modal-less dialog referenced."""
+        strip; this method only keeps the modal-less dialog referenced.
+        `autoplay=False` (the Trim... action) opens paused so the playhead
+        holds still for marking start/end."""
         dialog = player_qt.play_clip(
             self,
             clip_path,
             self._ffmpeg_path,
             on_trim_exported=self._on_player_trim_exported,
+            autoplay=autoplay,
         )
         if dialog is not None:
             self._players.append(dialog)
@@ -1566,8 +1604,9 @@ class GalleryFrame(QWidget):
 
     def _set_selection_mode(self, enabled: bool) -> None:
         self._selection_mode = enabled
-        self.select_button.setText("Done" if enabled else "Select")
-        self._selection_bar.setVisible(enabled)
+        # The footer swaps its content to become the selection action bar --
+        # the strip's height is pinned, so the list above never shifts.
+        self._footer_stack.setCurrentWidget(self._selection_bar if enabled else self._footer_normal_page)
         if not enabled:
             # Leaving selection mode drops the selection with it -- no
             # half-armed Delete button lurking behind the Done toggle.
@@ -1597,6 +1636,7 @@ class GalleryFrame(QWidget):
 
     def _update_selection_ui(self) -> None:
         count = len(self._selected)
+        self._selected_count_label.setText(f"{count} selected")
         self.delete_selected_button.setText(f"Delete selected ({count})")
         self.delete_selected_button.setEnabled(count > 0)
 
@@ -1692,7 +1732,7 @@ class GalleryFrame(QWidget):
         rename_action = menu.addAction("Rename…")
         rename_action.triggered.connect(lambda: self._do_rename(clip_path))
         trim_action = menu.addAction("Trim…")
-        trim_action.triggered.connect(lambda: self._play_clip(clip_path))
+        trim_action.triggered.connect(lambda: self._play_clip(clip_path, autoplay=False))
         gif_action = menu.addAction("Export as GIF…")
         gif_action.triggered.connect(lambda: self._do_export_gif(clip_path))
         compress_action = menu.addAction("Compress…")

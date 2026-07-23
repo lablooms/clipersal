@@ -61,6 +61,9 @@ class TrayIcon(QSystemTrayIcon):
     # STATUS response-or-None from the re-sync worker -- same worker-thread +
     # queued-signal shape as _save_responded (see _on_menu_about_to_show).
     _status_responded = Signal(object)
+    # (command, response-or-None) from the pause/resume worker -- the pause
+    # toggle's IPC send also runs off the GUI thread (see _on_toggle_pause).
+    _pause_responded = Signal(object)
 
     def __init__(
         self, ipc_port: int, clips_dir_provider: Callable[[], Path], log_path: Path | None = None, parent=None
@@ -78,6 +81,8 @@ class TrayIcon(QSystemTrayIcon):
         self.activated.connect(self._on_activated)
         self._save_responded.connect(self._on_save_responded)
         self._status_responded.connect(self._on_status_responded)
+        self._pause_responded.connect(self._on_pause_responded)
+        self._pause_in_flight = False
 
         self._menu = QMenu()
         self._menu.addAction("Open Clipersal", self._on_show)
@@ -171,11 +176,33 @@ class TrayIcon(QSystemTrayIcon):
         return "Resume capture" if self._paused else "Pause capture"
 
     def _on_toggle_pause(self) -> None:
+        # Off the GUI thread, like the save/status sends: PAUSE's server-side
+        # session stop can take seconds (ffmpeg terminate + cleanup-thread
+        # join), and a tray menu click runs on the app's event loop -- a
+        # synchronous send froze the whole UI for the duration (the main
+        # window's pause button workers its send for the same reason). A
+        # click while one is already in flight is dropped; the response
+        # re-syncs the label either way.
+        if self._pause_in_flight:
+            return
+        self._pause_in_flight = True
         command = "RESUME" if self._paused else "PAUSE"
+        threading.Thread(target=self._pause_worker, args=(command,), daemon=True).start()
+
+    def _pause_worker(self, command: str) -> None:
         response = self._send(command)
-        if response is not None and response.startswith("OK"):
-            self._paused = not self._paused
-            self._refresh_status()
+        self._pause_responded.emit((command, response))
+
+    def _on_pause_responded(self, payload: tuple) -> None:
+        command, response = payload
+        self._pause_in_flight = False
+        if response is None or not response.startswith("OK"):
+            return  # already logged in _send; the last known state stays
+        # Set from the COMMAND, not a blind toggle: an aboutToShow STATUS
+        # re-sync may already have flipped _paused while the send was in
+        # flight, and toggling on top of that would invert the truth.
+        self._paused = command == "PAUSE"
+        self._refresh_status()
 
     def _on_settings(self) -> None:
         response = self._send("SETTINGS")
