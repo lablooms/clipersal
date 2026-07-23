@@ -8,6 +8,7 @@ replaced/re-saved clip gets a fresh thumbnail rather than a stale cached one.
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import subprocess
@@ -159,6 +160,60 @@ def get_duration_seconds(ffprobe_path: str, clip_path: Path) -> float | None:
         return float(result.stdout.strip())
     except ValueError:
         return None
+
+
+def get_video_info(ffprobe_path: str, clip_path: Path) -> tuple[float | None, int | None, int | None] | None:
+    """Best-effort (duration_seconds, width, height) for clip_path in a
+    single ffprobe call, for the clip details dialog. Returns None when the
+    probe itself fails (ffprobe missing, nonzero exit, unparseable JSON,
+    timeout); a successfully probed file with a missing field reports that
+    field as None (e.g. width/height for an audio-only file, or a duration
+    ffprobe reports as "N/A"). Never raises -- same degrade-don't-crash rule
+    as get_duration_seconds, which stays as-is for its existing callers.
+    """
+    cmd = [
+        ffprobe_path,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        str(clip_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_PROBE_TIMEOUT, **NO_WINDOW_KWARGS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.debug("ffprobe video-info check for %s raised: %s", clip_path, exc)
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError:
+        return None
+
+    duration: float | None = None
+    try:
+        duration = float(payload.get("format", {}).get("duration"))
+    except (TypeError, ValueError, AttributeError):
+        pass  # absent, or ffprobe's "N/A" for an unknown duration
+
+    width: int | None = None
+    height: int | None = None
+    streams = payload.get("streams")
+    if isinstance(streams, list) and streams:
+        try:
+            width = int(streams[0]["width"])
+            height = int(streams[0]["height"])
+        except (KeyError, TypeError, ValueError):
+            pass  # stream present but without dimensions -- report them absent
+
+    return (duration, width, height)
 
 
 def cleanup_orphaned_thumbnails(cache_dir: Path, existing_clip_stems: set[str]) -> None:

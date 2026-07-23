@@ -87,6 +87,9 @@ def _install_headless_startup_fakes(monkeypatch, tmp_path):
         def gave_up_restarting(self):
             return False
 
+        def uptime_seconds(self):
+            return 123.456
+
     fake_setup = SimpleNamespace(
         encoder="fake-encoder",
         video_source=SimpleNamespace(kind="fake"),
@@ -103,7 +106,10 @@ def _install_headless_startup_fakes(monkeypatch, tmp_path):
         clips_dir=tmp_path / "clips",
         filename_template="clip-test",
         clip_retention_days=0,
-        dark_mode=False,
+        clips_max_gb=0,
+        theme_mode="system",
+        capture_mode="desktop",
+        window_title="",
     )
     fakes.config = fake_config
 
@@ -112,6 +118,10 @@ def _install_headless_startup_fakes(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "_another_instance_running", lambda port: False)
     monkeypatch.setattr(cli, "config_from_args", lambda args: fake_config)
     monkeypatch.setattr(cli, "_show_startup_error", startup_errors.append)
+    # Never a real registry/gsettings probe -- deterministic "system" theme resolution.
+    monkeypatch.setattr(cli.platform_detect, "system_dark_preferred", lambda os_: False)
+    # Never a real ctypes/xprop probe -- deterministic {window} resolution.
+    monkeypatch.setattr(cli.window_capture, "active_window_title", lambda *a, **k: None)
     monkeypatch.setattr(cli.capture, "resolve_setup", lambda config: calls.append("resolve_setup") or fake_setup)
     monkeypatch.setattr(cli.capture, "SegmentedCapture", FakeSession)
     monkeypatch.setattr(cli.ipc, "IpcServer", FakeIpcServer)
@@ -231,7 +241,7 @@ def test_concurrent_saves_are_serialized_and_get_distinct_names(monkeypatch, tmp
     concurrency = {"current": 0, "max": 0}
     concurrency_lock = threading.Lock()
 
-    def fake_save_clip(ffmpeg_path, buffer_dir, clips_dir_, filename_template, trim_seconds):
+    def fake_save_clip(ffmpeg_path, buffer_dir, clips_dir_, filename_template, trim_seconds, window_title=None):
         with concurrency_lock:
             concurrency["current"] += 1
             concurrency["max"] = max(concurrency["max"], concurrency["current"])
@@ -245,7 +255,7 @@ def test_concurrent_saves_are_serialized_and_get_distinct_names(monkeypatch, tmp
                 concurrency["current"] -= 1
 
     monkeypatch.setattr(cli.concat, "save_clip", fake_save_clip)
-    monkeypatch.setattr(cli.concat, "enforce_clip_retention", lambda clips_dir, days: [])
+    monkeypatch.setattr(cli.concat, "enforce_clip_retention", lambda clips_dir, days, protected=None: [])
 
     result: dict = {}
 
@@ -308,7 +318,7 @@ def _settings_values(config, **overrides):
         "clip_retention_days": config.clip_retention_days,
         "launch_on_startup": config.launch_on_startup,
         "check_for_updates": config.check_for_updates,
-        "dark_mode": config.dark_mode,
+        "theme_mode": config.theme_mode,
     }
     values.update(overrides)
     return values
@@ -341,6 +351,7 @@ def _install_apply_settings_fakes(monkeypatch, tmp_path, hotkey_enabled=False):
             self.save_completed = FakeSignal()
             self.save_failed = FakeSignal()
             self.toast_requested = FakeSignal()
+            self.screenshot_saved = FakeSignal()
             self.update_available = FakeSignal()
             self.theme_changed = FakeSignal()
 
@@ -433,15 +444,21 @@ def _install_apply_settings_fakes(monkeypatch, tmp_path, hotkey_enabled=False):
         return fake_setup
 
     class FakeHotkeyListener:
-        def __init__(self, combo, callback):
-            self._combo = combo
-            fakes.hotkey_events.append(("construct", combo))
+        def __init__(self, combo, callback=None):
+            # Accepts either the single-combo form (combo, callback) or a
+            # {combo: callback} mapping, mirroring the real HotkeyListener.
+            self._mapping = dict(combo) if isinstance(combo, dict) else {combo: callback}
+            fakes.hotkey_events.append(("construct", tuple(self._mapping)))
+
+        @classmethod
+        def from_mapping(cls, mapping):
+            return cls(dict(mapping))
 
         def start(self):
-            fakes.hotkey_events.append(("start", self._combo))
+            fakes.hotkey_events.append(("start", tuple(self._mapping)))
 
         def stop(self):
-            fakes.hotkey_events.append(("stop", self._combo))
+            fakes.hotkey_events.append(("stop", tuple(self._mapping)))
 
     config = Config(
         ipc_port=0,
@@ -466,8 +483,12 @@ def _install_apply_settings_fakes(monkeypatch, tmp_path, hotkey_enabled=False):
     monkeypatch.setattr(cli.capture, "SegmentedCapture", FakeSession)
     monkeypatch.setattr(cli.ipc, "IpcServer", FakeIpcServer)
     monkeypatch.setattr(cli.config_store, "save_overrides", lambda overrides: fakes.saved_overrides.append(overrides))
+    # Never a real registry/gsettings probe -- deterministic "system" theme resolution.
+    monkeypatch.setattr(cli.platform_detect, "system_dark_preferred", lambda os_: False)
+    # Never a real ctypes/xprop probe -- deterministic {window} resolution.
+    monkeypatch.setattr(cli.window_capture, "active_window_title", lambda *a, **k: None)
     monkeypatch.setattr(cli.config_store, "default_config_path", lambda: existing_config_file)
-    monkeypatch.setattr(cli.concat, "enforce_clip_retention", lambda clips_dir, days: [])
+    monkeypatch.setattr(cli.concat, "enforce_clip_retention", lambda clips_dir, days, protected=None: [])
     monkeypatch.setattr(cli.autostart, "is_supported", lambda os_: False)
     monkeypatch.setattr(cli.hotkey_module, "is_supported", lambda os_, session_type: True)
     monkeypatch.setattr(cli.hotkey_module, "HotkeyListener", FakeHotkeyListener)
@@ -611,7 +632,7 @@ def test_apply_settings_invalid_hotkey_is_rejected_before_touching_anything(monk
     assert fakes.saved_overrides == []
     # The old listener is still the only one that exists -- never stopped,
     # no construction of the garbage combo attempted.
-    assert fakes.hotkey_events == [("construct", "<ctrl>+<alt>+r"), ("start", "<ctrl>+<alt>+r")]
+    assert fakes.hotkey_events == [("construct", ("<ctrl>+<alt>+r",)), ("start", ("<ctrl>+<alt>+r",))]
 
     _stop_main(fakes, thread, result)
 
@@ -630,7 +651,7 @@ def test_apply_settings_failed_autostart_registration_reverts_toggle_and_reports
 
     error = fakes.on_apply(_settings_values(fakes.config, launch_on_startup=True))
 
-    # The failure surfaces as an apply error -- no hollow "Settings saved."
+    # The failure surfaces as an apply error -- no hollow "Saved ✓"
     # over a toggle that didn't take effect.
     assert error is not None and "launch-on-startup" in error
     # Belief reverts to reality: the field (and what gets persisted) says
@@ -679,11 +700,11 @@ def test_rebind_hotkey_constructs_new_binding_before_stopping_old_listener(monke
 
     assert error is None
     assert fakes.hotkey_events == [
-        ("construct", "<ctrl>+<alt>+r"),  # startup binding
-        ("start", "<ctrl>+<alt>+r"),
-        ("construct", "<ctrl>+<shift>+s"),  # new binding is built AND started ...
-        ("start", "<ctrl>+<shift>+s"),
-        ("stop", "<ctrl>+<alt>+r"),  # ... before the old one is dropped
+        ("construct", ("<ctrl>+<alt>+r",)),  # startup binding
+        ("start", ("<ctrl>+<alt>+r",)),
+        ("construct", ("<ctrl>+<shift>+s",)),  # new binding is built AND started ...
+        ("start", ("<ctrl>+<shift>+s",)),
+        ("stop", ("<ctrl>+<alt>+r",)),  # ... before the old one is dropped
     ]
     assert fakes.saved_overrides[0]["hotkey_combo"] == "<ctrl>+<shift>+s"
 
@@ -696,7 +717,7 @@ def test_main_applies_configured_theme_before_building_the_app_stylesheet(monkey
     # global stylesheet. Both are faked to record order only -- the real
     # apply_theme would flip process-global token state for no benefit here.
     fakes = _install_headless_startup_fakes(monkeypatch, tmp_path)
-    fakes.config.dark_mode = True
+    fakes.config.theme_mode = "dark"
 
     order = []
     monkeypatch.setattr(cli.theme, "apply_theme", lambda dark: order.append(("apply_theme", dark)))
@@ -723,17 +744,50 @@ def test_main_applies_configured_theme_before_building_the_app_stylesheet(monkey
     assert order[:2] == [("apply_theme", True), "ensure_qapplication"]
 
 
-def test_apply_settings_dark_mode_is_live_applied_without_capture_restart(monkeypatch, tmp_path) -> None:
+def test_main_system_theme_mode_follows_the_os_dark_setting(monkeypatch, tmp_path) -> None:
+    # theme_mode="system" resolves through platform_detect at startup: a
+    # dark-mode OS gets the dark palette applied before the app exists, with
+    # no explicit light/dark pick anywhere. Same ordering assertion as the
+    # forced-dark test above.
+    fakes = _install_headless_startup_fakes(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli.platform_detect, "system_dark_preferred", lambda os_: True)
+
+    order = []
+    monkeypatch.setattr(cli.theme, "apply_theme", lambda dark: order.append(("apply_theme", dark)))
+    monkeypatch.setattr(cli, "_ensure_qapplication", lambda: order.append("ensure_qapplication") or None)
+
+    result = {}
+
+    def run() -> None:
+        result["rc"] = cli.main([])
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if fakes.server is not None and "QUIT" in fakes.server.handlers:
+            break
+        time.sleep(0.01)
+    assert fakes.server is not None and "QUIT" in fakes.server.handlers
+
+    fakes.server.handlers["QUIT"]()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert result["rc"] == 0
+    assert order[:2] == [("apply_theme", True), "ensure_qapplication"]
+
+
+def test_apply_settings_theme_mode_is_live_applied_without_capture_restart(monkeypatch, tmp_path) -> None:
     from clipersal import theme
 
     fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
     thread, result = _start_main(fakes)
 
     try:
-        error = fakes.on_apply(_settings_values(fakes.config, dark_mode=True))
+        error = fakes.on_apply(_settings_values(fakes.config, theme_mode="dark"))
 
         assert error is None
-        assert fakes.config.dark_mode is True
+        assert fakes.config.theme_mode == "dark"
         # Live-mutated class (like buffer_seconds), NOT capture-restart class:
         # no re-resolution, no session swap -- the theme has nothing to do
         # with the ffmpeg command line.
@@ -746,7 +800,8 @@ def test_apply_settings_dark_mode_is_live_applied_without_capture_restart(monkey
         assert theme.current_theme() == "dark"
         assert fakes.app is not None and fakes.app.stylesheets
         assert theme.DARK_TOKENS["BACKGROUND"] in fakes.app.stylesheets[-1]
-        assert fakes.saved_overrides[0]["dark_mode"] is True
+        assert fakes.saved_overrides[0]["theme_mode"] == "dark"
+        assert "dark_mode" not in fakes.saved_overrides[0]
     finally:
         # apply_settings really ran apply_theme -- don't leak the dark
         # palette into the rest of the suite.
@@ -755,14 +810,56 @@ def test_apply_settings_dark_mode_is_live_applied_without_capture_restart(monkey
     _stop_main(fakes, thread, result)
 
 
-def test_apply_settings_unchanged_dark_mode_does_not_retheme(monkeypatch, tmp_path) -> None:
+def test_apply_settings_unchanged_theme_mode_does_not_retheme(monkeypatch, tmp_path) -> None:
     fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
     thread, result = _start_main(fakes)
 
     error = fakes.on_apply(_settings_values(fakes.config, buffer_seconds=90))
 
     assert error is None
-    assert fakes.config.dark_mode is False
+    assert fakes.config.theme_mode == "system"
+    assert fakes.app.stylesheets == []
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_system_mode_re_reads_the_os_dark_setting(monkeypatch, tmp_path) -> None:
+    from clipersal import theme
+
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    # Forced-light config on a dark-mode OS: picking "system" must resolve
+    # through the OS probe at apply time, not just flip a stored bool.
+    fakes.config.theme_mode = "light"
+    monkeypatch.setattr(cli.platform_detect, "system_dark_preferred", lambda os_: True)
+    thread, result = _start_main(fakes)
+
+    try:
+        error = fakes.on_apply(_settings_values(fakes.config, theme_mode="system"))
+
+        assert error is None
+        assert fakes.config.theme_mode == "system"
+        assert theme.current_theme() == "dark"
+        assert fakes.app is not None and fakes.app.stylesheets
+        assert theme.DARK_TOKENS["BACKGROUND"] in fakes.app.stylesheets[-1]
+        assert fakes.saved_overrides[0]["theme_mode"] == "system"
+    finally:
+        theme.apply_theme(False)
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_invalid_theme_mode_is_rejected(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, theme_mode="blue"))
+
+    # Only reachable via a hand-typed payload, but it must fail cleanly:
+    # nothing mutated, nothing persisted, no retheme.
+    assert error is not None
+    assert "Invalid theme mode" in error
+    assert fakes.config.theme_mode == "system"
+    assert fakes.saved_overrides == []
     assert fakes.app.stylesheets == []
 
     _stop_main(fakes, thread, result)
@@ -849,6 +946,8 @@ def test_cleanup_temp_buffer_removes_auto_created_dir(tmp_path: Path) -> None:
 
     cli._cleanup_temp_buffer(config)
 
+
+
     assert not buffer_dir.exists()
 
 
@@ -859,3 +958,717 @@ def test_cleanup_temp_buffer_preserves_user_supplied_dir(tmp_path: Path) -> None
     cli._cleanup_temp_buffer(config)
 
     assert (config.buffer_dir / "seg.ts").exists()
+
+
+# ---- STATS / SCREENSHOT IPC handlers -----------------------------------------
+
+
+def test_stats_handler_reports_capture_buffer_and_clips(monkeypatch, tmp_path) -> None:
+    fakes = _install_headless_startup_fakes(monkeypatch, tmp_path)
+
+    result = {}
+
+    def run() -> None:
+        result["rc"] = cli.main([])
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if fakes.server is not None and "STATS" in fakes.server.handlers:
+            break
+        time.sleep(0.01)
+    assert fakes.server is not None and "STATS" in fakes.server.handlers
+
+    buffer_dir = fakes.config.buffer_dir
+    buffer_dir.mkdir(parents=True, exist_ok=True)
+    (buffer_dir / "seg-20260101-000000.ts").write_bytes(b"x" * 100)
+    (buffer_dir / "seg-20260101-000002.ts").write_bytes(b"x" * 300)
+    (buffer_dir / "ffmpeg.log").write_text("not a segment")  # must not be counted
+    clips_dir = fakes.config.clips_dir
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    (clips_dir / "clip-1.mp4").write_bytes(b"clip")
+    (clips_dir / "clip-2.mp4").write_bytes(b"clip")
+    (clips_dir / "screenshot-1.png").write_bytes(b"shot")  # screenshots are not clips
+
+    from clipersal.ipc_client import parse_stats_payload
+
+    payload = fakes.server.handlers["STATS"]()
+    fields = parse_stats_payload(payload)
+
+    assert fields["state"] == "RECORDING"
+    assert fields["uptime"] == "123.5"  # the fake session's 123.456, rounded to 1 decimal
+    assert fields["segments"] == "2"
+    assert fields["buffer_bytes"] == "400"
+    assert fields["encoder"] == "fake-encoder"
+    assert fields["buffer_seconds"] == "30"
+    assert int(fields["clips_free_bytes"]) > 0
+    assert fields["clips_count"] == "2"
+    assert "\n" not in payload
+
+    fakes.server.handlers["QUIT"]()
+    thread.join(timeout=10)
+    assert result["rc"] == 0
+
+
+def test_stats_handler_degrades_failed_fields_to_empty_strings(monkeypatch, tmp_path) -> None:
+    fakes = _install_headless_startup_fakes(monkeypatch, tmp_path)
+
+    def boom(*args, **kwargs):
+        raise OSError("disk gone (fake)")
+
+    monkeypatch.setattr(cli.shutil, "disk_usage", boom)
+    clips_dir = fakes.config.clips_dir
+    real_glob = Path.glob
+
+    def selective_glob(self, pattern):
+        if self == clips_dir:
+            raise OSError("clips dir gone (fake)")
+        return real_glob(self, pattern)
+
+    monkeypatch.setattr(Path, "glob", selective_glob)
+
+    result = {}
+
+    def run() -> None:
+        result["rc"] = cli.main([])
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if fakes.server is not None and "STATS" in fakes.server.handlers:
+            break
+        time.sleep(0.01)
+    assert fakes.server is not None and "STATS" in fakes.server.handlers
+
+    from clipersal.ipc_client import parse_stats_payload
+
+    fields = parse_stats_payload(fakes.server.handlers["STATS"]())
+
+    # The failed probes read as empty strings; the rest still report.
+    assert fields["clips_free_bytes"] == ""
+    assert fields["clips_count"] == ""
+    assert fields["state"] == "RECORDING"
+    assert fields["encoder"] == "fake-encoder"
+
+    fakes.server.handlers["QUIT"]()
+    thread.join(timeout=10)
+    assert result["rc"] == 0
+
+
+def test_screenshot_handler_calls_save_screenshot_and_returns_the_path(monkeypatch, tmp_path) -> None:
+    fakes = _install_headless_startup_fakes(monkeypatch, tmp_path)
+    screenshot_calls = []
+    expected = tmp_path / "clips" / "screenshot-1.png"
+
+    def fake_save_screenshot(ffmpeg_path, buffer_dir, clips_dir):
+        screenshot_calls.append((ffmpeg_path, buffer_dir, clips_dir))
+        return expected
+
+    monkeypatch.setattr(cli.screenshots, "save_screenshot", fake_save_screenshot)
+
+    result = {}
+
+    def run() -> None:
+        result["rc"] = cli.main([])
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if fakes.server is not None and "SCREENSHOT" in fakes.server.handlers:
+            break
+        time.sleep(0.01)
+    assert fakes.server is not None and "SCREENSHOT" in fakes.server.handlers
+
+    assert fakes.server.handlers["SCREENSHOT"]() == str(expected)
+    assert screenshot_calls == [("ffmpeg", fakes.config.buffer_dir, fakes.config.clips_dir)]
+
+    fakes.server.handlers["QUIT"]()
+    thread.join(timeout=10)
+    assert result["rc"] == 0
+
+
+def test_screenshot_handler_emits_screenshot_saved_with_the_screenshot_toast(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    expected = tmp_path / "clips" / "screenshot-1.png"
+    monkeypatch.setattr(cli.screenshots, "save_screenshot", lambda *a: expected)
+
+    import clipersal.toast_qt as toast_qt
+
+    toasts = []
+    monkeypatch.setattr(
+        toast_qt,
+        "show_save_toast",
+        lambda parent, ffmpeg_path, clip_path, cache_dir, title="Clip saved": toasts.append((clip_path, title)),
+    )
+
+    thread, result = _start_main(fakes)
+
+    assert fakes.server.handlers["SCREENSHOT"]() == str(expected)
+    # The FakeAppSignals fixture delivers synchronously, so the toast slot
+    # has already run -- with the screenshot title, not "Clip saved".
+    assert toasts == [(expected, "Screenshot saved")]
+
+    _stop_main(fakes, thread, result)
+
+
+# ---- apply_settings: framerate / resolution scale / extra hotkeys -------------
+
+
+def test_apply_settings_framerate_change_is_capture_restart_class(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, framerate=60))
+
+    assert error is None
+    assert fakes.config.framerate == 60
+    # The framerate is baked into the capture-source args, so this is the
+    # same restart class as a bitrate change: re-resolved, session swapped.
+    resolve_calls = [c for c in fakes.calls if isinstance(c, tuple) and c[0] == "resolve_setup"]
+    assert len(resolve_calls) == 2  # startup + the apply
+    assert fakes.calls.count("session_construct") == 2
+    assert fakes.calls.count("session_start") == 2
+    assert fakes.saved_overrides[0]["framerate"] == 60
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_resolution_scale_change_is_capture_restart_class(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, resolution_scale="720p"))
+
+    assert error is None
+    assert fakes.config.resolution_scale == "720p"
+    resolve_calls = [c for c in fakes.calls if isinstance(c, tuple) and c[0] == "resolve_setup"]
+    assert len(resolve_calls) == 2
+    assert fakes.calls.count("session_construct") == 2
+    assert fakes.saved_overrides[0]["resolution_scale"] == "720p"
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_17_key_payload_keeps_new_fields_at_defaults(monkeypatch, tmp_path) -> None:
+    # The pre-quick-save Settings UI sends exactly the original 17 keys;
+    # apply_settings must tolerate the new keys being absent entirely.
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, buffer_seconds=90))
+
+    assert error is None
+    assert fakes.config.framerate == 30
+    assert fakes.config.resolution_scale == "native"
+    assert fakes.config.quick_save_hotkey_1 == ""
+    assert fakes.config.screenshot_hotkey == ""
+    # No capture restart (only a live field changed) and no hotkey rebind.
+    resolve_calls = [c for c in fakes.calls if isinstance(c, tuple) and c[0] == "resolve_setup"]
+    assert len(resolve_calls) == 1
+    assert fakes.hotkey_events == []
+    # ...but the defaults are still persisted, so the file stays complete.
+    assert fakes.saved_overrides[0]["framerate"] == 30
+    assert fakes.saved_overrides[0]["resolution_scale"] == "native"
+    assert fakes.saved_overrides[0]["quick_save_seconds_1"] == 30
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_rejects_duplicate_combos_case_insensitively(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, quick_save_hotkey_1="<CTRL>+<ALT>+R"))
+
+    assert error is not None and "both" in error
+    assert fakes.config.quick_save_hotkey_1 == ""
+    assert fakes.saved_overrides == []
+    # Rejected before anything was touched -- no persist, no rebind.
+    assert fakes.hotkey_events == []
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_rejects_two_quick_saves_sharing_a_combo(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(
+        _settings_values(fakes.config, quick_save_hotkey_1="<ctrl>+1", quick_save_hotkey_2="<ctrl>+1")
+    )
+
+    assert error is not None and "quick-save hotkey 1" in error and "quick-save hotkey 2" in error
+    assert fakes.saved_overrides == []
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_rejects_invalid_quick_save_combo(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, quick_save_hotkey_1="garbage combo"))
+
+    assert error is not None and "Invalid quick-save hotkey 1" in error
+    assert fakes.config.quick_save_hotkey_1 == ""
+    assert fakes.saved_overrides == []
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_clamps_out_of_range_quick_save_seconds(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, quick_save_seconds_1=10000, quick_save_seconds_2=1))
+
+    assert error is None
+    assert fakes.config.quick_save_seconds_1 == 300
+    assert fakes.config.quick_save_seconds_2 == 5
+    assert fakes.saved_overrides[0]["quick_save_seconds_1"] == 300
+    assert fakes.saved_overrides[0]["quick_save_seconds_2"] == 5
+
+    _stop_main(fakes, thread, result)
+
+
+def test_rebind_hotkey_includes_exactly_the_configured_combos(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path, hotkey_enabled=True)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(
+        _settings_values(
+            fakes.config,
+            quick_save_hotkey_1="<ctrl>+1",
+            quick_save_seconds_1=45,
+            screenshot_hotkey="<ctrl>+<f12>",
+        )
+    )
+
+    assert error is None
+    # Startup bound just the main combo; the rebind replaces it with the
+    # full mapping -- main save, quick-save 1, screenshot (quick-save 2 is
+    # empty = disabled and must not appear).
+    assert fakes.hotkey_events == [
+        ("construct", ("<ctrl>+<alt>+r",)),
+        ("start", ("<ctrl>+<alt>+r",)),
+        ("construct", ("<ctrl>+<alt>+r", "<ctrl>+1", "<ctrl>+<f12>")),
+        ("start", ("<ctrl>+<alt>+r", "<ctrl>+1", "<ctrl>+<f12>")),
+        ("stop", ("<ctrl>+<alt>+r",)),
+    ]
+    assert fakes.config.quick_save_seconds_1 == 45
+    assert fakes.saved_overrides[0]["quick_save_hotkey_1"] == "<ctrl>+1"
+    assert fakes.saved_overrides[0]["screenshot_hotkey"] == "<ctrl>+<f12>"
+
+    _stop_main(fakes, thread, result)
+
+
+def test_hotkey_callbacks_send_the_right_ipc_commands(monkeypatch, tmp_path) -> None:
+    # The mapping's callbacks must go through the IPC client boundary:
+    # main -> SAVE, quick-save -> SAVE <seconds>, screenshot -> SCREENSHOT.
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path, hotkey_enabled=True)
+    fakes.config.quick_save_hotkey_1 = "<ctrl>+1"
+    fakes.config.quick_save_seconds_1 = 45
+    fakes.config.screenshot_hotkey = "<ctrl>+<f12>"
+
+    sent = []
+    monkeypatch.setattr(
+        cli.ipc_client, "send_command", lambda command, port, timeout=5.0: sent.append(command) or "OK done"
+    )
+
+    # Capture the mapping rebind_hotkey builds by intercepting from_mapping.
+    mappings = []
+
+    class RecordingListener:
+        def __init__(self, mapping):
+            self._mapping = mapping
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(
+        cli.hotkey_module,
+        "HotkeyListener",
+        SimpleNamespace(from_mapping=lambda mapping: mappings.append(mapping) or RecordingListener(mapping)),
+    )
+
+    thread, result = _start_main(fakes)
+
+    assert len(mappings) == 1
+    mapping = mappings[0]
+    assert set(mapping) == {"<ctrl>+<alt>+r", "<ctrl>+1", "<ctrl>+<f12>"}
+    for callback in mapping.values():
+        callback()
+    assert sent == ["SAVE", "SAVE 45", "SCREENSHOT"]
+
+    _stop_main(fakes, thread, result)
+
+
+
+# ---- 0.1.4: size-cap sweep on save/apply, save-sound fields, {window} saves ---------
+
+
+def test_save_handler_runs_size_cap_with_just_saved_clip_protected(monkeypatch, tmp_path) -> None:
+    fakes = _install_headless_startup_fakes(monkeypatch, tmp_path)
+    fakes.config.clips_max_gb = 2
+    clips_dir = fakes.config.clips_dir
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    saved_clip = clips_dir / "clip-test.mp4"
+
+    monkeypatch.setattr(cli.concat, "save_clip", lambda *a, **k: saved_clip)
+    monkeypatch.setattr(cli.concat, "enforce_clip_retention", lambda *a, **k: [])
+    monkeypatch.setattr(cli.clip_metadata, "favorites", lambda clips_dir_: {"favorite.mp4"})
+    size_cap_calls = []
+    monkeypatch.setattr(
+        cli.concat,
+        "enforce_size_cap",
+        lambda clips_dir_, max_bytes, protected=None: size_cap_calls.append((clips_dir_, max_bytes, protected)) or [],
+    )
+
+    result = {}
+
+    def run() -> None:
+        result["rc"] = cli.main([])
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if fakes.server is not None and "QUIT" in fakes.server.handlers:
+            break
+        time.sleep(0.01)
+    assert fakes.server is not None and "QUIT" in fakes.server.handlers
+
+    assert fakes.server.handlers["SAVE"]() == str(saved_clip)
+
+    # GiB -> bytes, and the just-saved clip is protected alongside the
+    # favorites: a save must never delete the clip it just produced.
+    assert size_cap_calls == [(clips_dir, 2 * (1 << 30), {"favorite.mp4", "clip-test.mp4"})]
+
+    fakes.server.handlers["QUIT"]()
+    thread.join(timeout=10)
+    assert result["rc"] == 0
+
+
+def test_save_handler_skips_size_cap_when_unlimited(monkeypatch, tmp_path) -> None:
+    fakes = _install_headless_startup_fakes(monkeypatch, tmp_path)  # clips_max_gb = 0
+    clips_dir = fakes.config.clips_dir
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    saved_clip = clips_dir / "clip-test.mp4"
+
+    monkeypatch.setattr(cli.concat, "save_clip", lambda *a, **k: saved_clip)
+    monkeypatch.setattr(cli.concat, "enforce_clip_retention", lambda *a, **k: [])
+    size_cap_calls = []
+    monkeypatch.setattr(
+        cli.concat, "enforce_size_cap", lambda *a, **k: size_cap_calls.append((a, k)) or []
+    )
+
+    result = {}
+
+    def run() -> None:
+        result["rc"] = cli.main([])
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if fakes.server is not None and "QUIT" in fakes.server.handlers:
+            break
+        time.sleep(0.01)
+    assert fakes.server is not None and "QUIT" in fakes.server.handlers
+
+    assert fakes.server.handlers["SAVE"]() == str(saved_clip)
+    assert size_cap_calls == []
+
+    fakes.server.handlers["QUIT"]()
+    thread.join(timeout=10)
+    assert result["rc"] == 0
+
+
+def test_save_handler_passes_the_active_window_title_to_save_clip(monkeypatch, tmp_path) -> None:
+    fakes = _install_headless_startup_fakes(monkeypatch, tmp_path)  # capture_mode == "desktop"
+    clips_dir = fakes.config.clips_dir
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    saved_clip = clips_dir / "clip-test.mp4"
+    captured = {}
+    monkeypatch.setattr(cli.concat, "save_clip", lambda *a, **k: captured.update(k) or saved_clip)
+    monkeypatch.setattr(cli.concat, "enforce_clip_retention", lambda *a, **k: [])
+    # Outside window-capture mode the {window} placeholder names the clip
+    # after whatever window has focus at save time.
+    monkeypatch.setattr(cli.window_capture, "active_window_title", lambda os_, session_type: "Valorant")
+
+    result = {}
+
+    def run() -> None:
+        result["rc"] = cli.main([])
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if fakes.server is not None and "QUIT" in fakes.server.handlers:
+            break
+        time.sleep(0.01)
+    assert fakes.server is not None and "QUIT" in fakes.server.handlers
+
+    assert fakes.server.handlers["SAVE"]() == str(saved_clip)
+    assert captured["window_title"] == "Valorant"
+
+    fakes.server.handlers["QUIT"]()
+    thread.join(timeout=10)
+    assert result["rc"] == 0
+
+
+def test_save_handler_names_window_mode_clips_after_the_captured_window(monkeypatch, tmp_path) -> None:
+    # In window-capture mode the captured window IS the subject, so its
+    # configured title names the clip -- the foreground-window probe is not
+    # consulted at all.
+    fakes = _install_headless_startup_fakes(monkeypatch, tmp_path)
+    fakes.config.capture_mode = "window"
+    fakes.config.window_title = "My Captured App"
+    clips_dir = fakes.config.clips_dir
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    saved_clip = clips_dir / "clip-test.mp4"
+    captured = {}
+    monkeypatch.setattr(cli.concat, "save_clip", lambda *a, **k: captured.update(k) or saved_clip)
+    monkeypatch.setattr(cli.concat, "enforce_clip_retention", lambda *a, **k: [])
+
+    def probe_must_not_run(*a, **k):
+        raise AssertionError("active_window_title must not be probed in window-capture mode")
+
+    monkeypatch.setattr(cli.window_capture, "active_window_title", probe_must_not_run)
+
+    result = {}
+
+    def run() -> None:
+        result["rc"] = cli.main([])
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if fakes.server is not None and "QUIT" in fakes.server.handlers:
+            break
+        time.sleep(0.01)
+    assert fakes.server is not None and "QUIT" in fakes.server.handlers
+
+    assert fakes.server.handlers["SAVE"]() == str(saved_clip)
+    assert captured["window_title"] == "My Captured App"
+
+    fakes.server.handlers["QUIT"]()
+    thread.join(timeout=10)
+    assert result["rc"] == 0
+
+
+def test_apply_settings_save_sound_is_live_apply_class(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, save_sound_enabled=True))
+
+    assert error is None
+    assert fakes.config.save_sound_enabled is True
+    # Live-mutate class (like buffer_seconds): no re-resolution, no session
+    # swap -- it doesn't touch the ffmpeg command line.
+    resolve_calls = [c for c in fakes.calls if isinstance(c, tuple) and c[0] == "resolve_setup"]
+    assert len(resolve_calls) == 1
+    assert fakes.calls.count("session_stop") == 0
+    assert fakes.saved_overrides[0]["save_sound_enabled"] is True
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_clips_max_gb_live_applies_and_sweeps(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    size_cap_calls = []
+    monkeypatch.setattr(
+        cli.concat,
+        "enforce_size_cap",
+        lambda clips_dir, max_bytes, protected=None: size_cap_calls.append((clips_dir, max_bytes, protected)) or [],
+    )
+    monkeypatch.setattr(cli.clip_metadata, "favorites", lambda clips_dir: {"star.mp4"})
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, clips_max_gb=5))
+
+    assert error is None
+    assert fakes.config.clips_max_gb == 5
+    # Live-mutate class: no re-resolution, no session swap.
+    resolve_calls = [c for c in fakes.calls if isinstance(c, tuple) and c[0] == "resolve_setup"]
+    assert len(resolve_calls) == 1
+    assert fakes.calls.count("session_stop") == 0
+    # Changing the cap sweeps immediately (same pattern as retention), with
+    # the favorites protected.
+    assert size_cap_calls == [(fakes.config.clips_dir, 5 * (1 << 30), {"star.mp4"})]
+    assert fakes.saved_overrides[0]["clips_max_gb"] == 5
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_zero_or_negative_clips_max_gb_skips_sweep_and_clamps(monkeypatch, tmp_path) -> None:
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    size_cap_calls = []
+    monkeypatch.setattr(
+        cli.concat, "enforce_size_cap", lambda *a, **k: size_cap_calls.append((a, k)) or []
+    )
+    thread, result = _start_main(fakes)
+
+    assert fakes.on_apply(_settings_values(fakes.config, clips_max_gb=0)) is None
+    assert fakes.config.clips_max_gb == 0
+    assert size_cap_calls == []
+
+    # A negative cap (hand-edited config) clamps to 0 = unlimited rather
+    # than failing the whole apply.
+    assert fakes.on_apply(_settings_values(fakes.config, clips_max_gb=-3)) is None
+    assert fakes.config.clips_max_gb == 0
+    assert fakes.saved_overrides[-1]["clips_max_gb"] == 0
+    assert size_cap_calls == []
+
+    _stop_main(fakes, thread, result)
+
+
+def test_apply_settings_17_key_payload_keeps_wave5_fields_at_defaults(monkeypatch, tmp_path) -> None:
+    # Same tolerance as the wave-2 fields: a Settings payload without the
+    # new keys must leave them at their current (default) values.
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    thread, result = _start_main(fakes)
+
+    error = fakes.on_apply(_settings_values(fakes.config, buffer_seconds=90))
+
+    assert error is None
+    assert fakes.config.clips_max_gb == 0
+    assert fakes.config.save_sound_enabled is False
+    # ...but the defaults are still persisted, so the file stays complete.
+    assert fakes.saved_overrides[0]["clips_max_gb"] == 0
+    assert fakes.saved_overrides[0]["save_sound_enabled"] is False
+
+    _stop_main(fakes, thread, result)
+
+
+# ---- save sound: QApplication.beep on the toast paths ----------------------------
+
+
+def test_save_toast_plays_a_beep_when_save_sound_enabled(monkeypatch, tmp_path) -> None:
+    from PySide6.QtWidgets import QApplication
+
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    fakes.config.save_sound_enabled = True
+    fakes.config.clips_dir.mkdir(parents=True, exist_ok=True)
+    saved_clip = fakes.config.clips_dir / "clip-test.mp4"
+    monkeypatch.setattr(cli.concat, "save_clip", lambda *a, **k: saved_clip)
+
+    import clipersal.toast_qt as toast_qt
+
+    monkeypatch.setattr(toast_qt, "show_save_toast", lambda *a, **k: None)
+    beeps = []
+    monkeypatch.setattr(QApplication, "beep", staticmethod(lambda: beeps.append(True)))
+
+    thread, result = _start_main(fakes)
+
+    assert fakes.server.handlers["SAVE"]() == str(saved_clip)
+    # The FakeAppSignals fixture delivers synchronously, so the toast slot
+    # (toast -> beep) has already run by the time SAVE returns.
+    assert beeps == [True]
+
+    _stop_main(fakes, thread, result)
+
+
+def test_save_toast_does_not_beep_when_save_sound_disabled(monkeypatch, tmp_path) -> None:
+    from PySide6.QtWidgets import QApplication
+
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)  # save_sound_enabled = False
+    fakes.config.clips_dir.mkdir(parents=True, exist_ok=True)
+    saved_clip = fakes.config.clips_dir / "clip-test.mp4"
+    monkeypatch.setattr(cli.concat, "save_clip", lambda *a, **k: saved_clip)
+
+    import clipersal.toast_qt as toast_qt
+
+    toasts = []
+    monkeypatch.setattr(toast_qt, "show_save_toast", lambda *a, **k: toasts.append(a))
+    beeps = []
+    monkeypatch.setattr(QApplication, "beep", staticmethod(lambda: beeps.append(True)))
+
+    thread, result = _start_main(fakes)
+
+    assert fakes.server.handlers["SAVE"]() == str(saved_clip)
+    # The toast still shows -- only the sound is gated by the setting.
+    assert len(toasts) == 1
+    assert beeps == []
+
+    _stop_main(fakes, thread, result)
+
+
+def test_screenshot_toast_also_beeps_when_save_sound_enabled(monkeypatch, tmp_path) -> None:
+    from PySide6.QtWidgets import QApplication
+
+    fakes = _install_apply_settings_fakes(monkeypatch, tmp_path)
+    fakes.config.save_sound_enabled = True
+    expected = tmp_path / "clips" / "screenshot-1.png"
+    monkeypatch.setattr(cli.screenshots, "save_screenshot", lambda *a: expected)
+
+    import clipersal.toast_qt as toast_qt
+
+    monkeypatch.setattr(toast_qt, "show_save_toast", lambda *a, **k: None)
+    beeps = []
+    monkeypatch.setattr(QApplication, "beep", staticmethod(lambda: beeps.append(True)))
+
+    thread, result = _start_main(fakes)
+
+    assert fakes.server.handlers["SCREENSHOT"]() == str(expected)
+    assert beeps == [True]
+
+    _stop_main(fakes, thread, result)
+
+
+# ---- WheelGuard: the app-level scroll-wheel guard on the shared QApplication ------
+
+
+def test_ensure_qapplication_installs_the_wheel_guard() -> None:
+    import os
+
+    import pytest
+
+    pytest.importorskip("PySide6")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    from clipersal.qt_widgets import WheelGuard
+
+    app = cli._ensure_qapplication()
+    assert app is not None
+    assert isinstance(app._wheel_guard, WheelGuard)
+
+
+def test_ensure_qapplication_does_not_stack_duplicate_wheel_guards() -> None:
+    import os
+
+    import pytest
+
+    pytest.importorskip("PySide6")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    first = cli._ensure_qapplication()._wheel_guard
+    assert cli._ensure_qapplication()._wheel_guard is first
+
+
+# ---- app identity: window icon + AppUserModelID on the shared QApplication ----
+
+
+def test_configure_app_identity_sets_a_non_null_window_icon() -> None:
+    import os
+
+    import pytest
+
+    pytest.importorskip("PySide6")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    app = cli._ensure_qapplication()
+    # Called directly (not via construction): the QApplication may predate
+    # this test in a full-suite run, and the icon is only wired at
+    # construction time.
+    cli._configure_app_identity(app)
+    assert app.windowIcon().isNull() is False

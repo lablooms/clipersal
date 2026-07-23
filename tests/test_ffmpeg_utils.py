@@ -344,3 +344,14 @@ def test_build_wayland_input_args_exact_argv() -> None:
         "-framerate", "30",
         "-i", "pipe:0",
     ]
+
+
+def test_windows_gdigrab_source_carries_the_configured_framerate(monkeypatch) -> None:
+    # resolve_setup passes config.framerate straight into the capture
+    # source args -- 60 must land in the argv, not the hardcoded default.
+    monkeypatch.setattr("clipersal.ffmpeg_utils.list_filters", lambda ffmpeg_path: set())
+
+    source = build_video_capture_source("ffmpeg", OS.WINDOWS, None, framerate=60, monitor_index=0)
+
+    assert source.kind == "gdigrab"
+    assert source.input_args == ["-f", "gdigrab", "-framerate", "60", "-i", "desktop"]

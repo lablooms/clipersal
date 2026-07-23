@@ -6,20 +6,108 @@ full design rationale behind each entry.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project
 does not yet follow strict semantic versioning (still pre-1.0).
 
-## [0.1.2-beta] — 2026-07-20
+## [0.1.1-beta] — 2026-07-22
 
-### Fixed
-
-- **UI polish**: labels no longer paint a visible background box behind their
-  text. The global stylesheet's blanket `QWidget` background is replaced by
-  backgrounds scoped to the containers that own a surface (the main window,
-  dialogs, menus, cards, inputs) — text now sits cleanly on its card in both
-  light and dark mode. The first-run wizard's dead bottom space is gone too.
-
-## [0.1.1-beta] — 2026-07-20
+The big experience-and-creator update, on top of 0.1.0.
 
 ### Added
 
+- **In-app video player**: double-click a clip (or right-click → **Play**) to watch it
+  without leaving Clipersal — play/pause, seek, volume, and 0.5×/1×/1.5×/2× speed,
+  built on QtMultimedia (shipped in the packaged builds; if the backend is
+  unavailable the gallery falls back to the OS default player). The player has a
+  built-in **trim export**: mark start/end from the playhead and export a stream-copy
+  cut (instant, zero quality loss; the original is always kept, and the trimmed copy
+  gets a unique `-trimmed` name). Also opens from the Home tab's recent-clips strip.
+- **Export as GIF**: right-click any clip → "Export as GIF…" — pick start, duration
+  (up to 30 s), frame rate, and width; a two-pass palette render produces a
+  shareable `.gif` next to the clip.
+- **Compress**: right-click → "Compress…" re-encodes a clip to a smaller file
+  (2.5–8 Mbps, optional 720p/480p downscale) using the same hardware encoder the
+  capture uses, keeping the original untouched.
+- **Gallery overhaul**: search-as-you-type filtering, sorting (newest/oldest/
+  name/size, plus **Window A–Z** grouping), a **window filter** that groups clips
+  by the app they were saved from (with per-window clip counts), a favorites-first
+  option, a selection mode with select-all/none and confirmed batch delete, a
+  right-click context menu (also behind a per-row "⋯" button) with every action —
+  play, open, reveal, favorite, details, rename, GIF, compress, copy path,
+  **copy filename**, delete — clip durations in the meta line (probed off the UI
+  thread), per-clip **details and notes** (notes show as tooltips), drag-and-drop
+  of clips straight out of the window, and a footer with the total clip count,
+  size, and favorites count.
+- **Gallery grid view**: a List/Grid switch in the Clips tab header swaps the
+  classic rows for a thumbnail grid (cards with the same heart/⋯/context menu,
+  double-click to play, selection checkboxes, and drag-out) — search, window
+  filter, sorting, favorites-first, and the selection all apply identically in
+  both views.
+- **Favorites**: star a clip (♡/♥) to keep it — favorites persist across launches in
+  a sidecar file (`clips_dir/.clipmeta.json`, never config.json) and are exempt from
+  both the retention sweep and the folder size cap.
+- **Clips folder size cap**: Settings → Clips can cap the folder at 1–50 GB; after
+  each save the oldest non-favorite clips are swept until the folder fits (the clip
+  you just saved and all favorites are always protected).
+- **Home dashboard**: the status card shows live session stats — uptime, buffer fill,
+  buffer size on disk, the active encoder, and free space on the clips drive — fed by
+  a new IPC `STATS` command (also available as `clipersal-trigger stats` for
+  scripting). The pause button follows the real capture state, and the window title
+  carries it too ("Clipersal — Paused" / "Clipersal — Capture stopped").
+- **Crash recovery + crash reports**: when ffmpeg burns through its restart budget
+  (the "Capture stopped" state), a banner offers one-click "Restart capture", and a
+  dialog asks whether you'd like to **send a crash report** — it opens a pre-filled
+  GitHub issue in your browser (log tails + system facts) for you to review and edit
+  before submitting. Nothing is ever sent automatically; an "Export zip" option
+  (the diagnostics bundle) is right there too.
+- **Low-disk warning**: a dismissible banner appears when the clips drive drops
+  below 1 GiB free and clears itself above 1.5 GiB (hysteresis, no flapping).
+- **Quick-save hotkeys**: two extra configurable global hotkeys, each with its own
+  save duration (5–300 s, defaults 30 s and 60 s, disabled until bound), alongside
+  the main save hotkey — one listener binds the whole combo map, and duplicates or
+  invalid combos are rejected in Settings with a clear error.
+- **Screenshot capture**: a `SCREENSHOT` IPC command (tray item, optional global
+  hotkey, and `clipersal-trigger screenshot`) grabs the last frame of the newest
+  finalized buffer segment into `screenshot-<date>-<time>.png` next to your clips.
+  It deliberately reads the buffer instead of opening a second capture device — on
+  Windows a concurrent ddagrab/gdigrab grab is platform-dependent, and on Wayland
+  it's impossible without a new portal consent prompt; the frame is at most a couple
+  of segment-lengths old, which is exactly the instant-replay model.
+- **`{window}` filename templates**: clips can be named after the app you were using —
+  the default template is now `{window}-{date}-{time}` (e.g.
+  `Valorant-20260717-011351.mp4`). The active window title is read at save time
+  (Windows/X11; sanitized, 40-char cap), falls back to `clip` when unavailable, and
+  uses the captured window's own title in window-capture mode. Existing configs keep
+  their saved template.
+- **Frame rate and resolution-scale settings**: an FPS picker (15/24/30/60 — the
+  frame rate is now persisted, previously CLI-only) and a resolution scale
+  (Native/1080p/720p) inserted into the ffmpeg filter chain. Both apply via the
+  validate-then-restart capture path; at the Native/30 defaults the capture command
+  is byte-identical to before.
+- **Toast upgrade**: save toasts have "Open" (plays the clip with the OS default
+  app) and "Show in folder" buttons, a duration+size meta line, and stacking —
+  consecutive saves pile upward instead of overlapping, and remaining toasts reflow
+  when one closes.
+- **Logs tab**: search and level filtering (All/INFO/WARNING/ERROR) over a deeper
+  500-line tail, an auto-scroll toggle, a copy-to-clipboard button, and a one-click
+  **diagnostics export** — a zip of the app logs, the ffmpeg log, the config, and a
+  `system.txt` (OS, session type, versions, encoder, monitors) for bug reports.
+- **Tab-based Settings**: Capture / Saving / Encoder / Clips / Appearance / About
+  tabs replace the single scrolling panel — every option is easier to find and
+  nothing crowds at small window sizes. Combo boxes, spin boxes, and sliders no
+  longer change value when you scroll past them (the scroll wheel never adjusts
+  them — keyboard arrows still work when focused), and a **Reset to defaults**
+  button restores every setting after a confirmation that spells out what resets.
+- **"Check now" for updates**: the About tab shows the last check time and can force
+  an immediate update check (bypassing the 24 h throttle, still notify-only).
+- **Follow-system theme**: the appearance setting is now **System / Light / Dark**,
+  defaulting to **System** — Clipersal starts in dark mode when your OS is in dark
+  mode and vice versa (Windows `AppsUseLightTheme`, GNOME `color-scheme`; best-effort,
+  other desktops fall back to light). An explicit dark choice in an older config is
+  honored; the Pollen Gold dark variant itself is unchanged (warm espresso-brown,
+  same gold accent family, applies live without a restart).
+- **Desktop and microphone volume sliders** (0–200 %) in Settings → Capture,
+  baked into the capture's audio mix as per-source `volume=` filter stages.
+  Changes restart capture; at the 100 % defaults the ffmpeg command is
+  byte-identical to before. Sliders disable with a hint when their source
+  doesn't exist.
 - **Experimental Wayland screen capture** (Linux): capture now works on Wayland
   sessions via xdg-desktop-portal ScreenCast + PipeWire — the desktop's own consent
   dialog asks which screen (or window) to share on first launch, the choice is
@@ -31,24 +119,55 @@ does not yet follow strict semantic versioning (still pre-1.0).
   verification on a real Wayland session (checklist in `ARCHITECTURE.md`). The global
   hotkey still doesn't exist on Wayland — `clipersal-trigger` + a DE keybinding
   remains the save trigger. New runtime dependency: `jeepney` (pure-Python D-Bus).
-- **In-app clip trimmer**: the Clips tab gains a Trim action per row — a dialog
-  with start/end fields, live result duration, frame-grab previews at both cut
-  points, and an honest note that cuts snap to the nearest ~2 s keyframe. The cut
-  is a stream copy (instant, zero quality loss; a precise re-encode mode is a
-  documented deferral), the original clip is always kept, and the trimmed copy
-  gets a unique `-trimmed` name.
-- **Dark mode**: a Pollen Gold dark variant (same gold accent family on warm
-  charcoal-brown) with a Settings → Appearance toggle. Applies live without a
-  restart and persists. (This reverses the pre-beta "light-only" removal — the
-  owner asked for it back.)
-- **Desktop and microphone volume sliders** (0–200 %) in Settings → Capture,
-  baked into the capture's audio mix as per-source `volume=` filter stages.
-  Changes restart capture; at the 100 % defaults the ffmpeg command is
-  byte-identical to before. Sliders disable with a hint when their source
-  doesn't exist.
+- **Window keyboard shortcuts**: Ctrl+S save now, Ctrl+Shift+S save last 30 s,
+  Ctrl+P pause/resume, F5 refresh gallery, Ctrl+, open Settings, Ctrl+1–4 switch
+  tabs. (Global triggers still all go through the IPC boundary.)
+- **Save sound**: an optional beep on every successful save (Settings → Saving) —
+  audible confirmation when you're saving via hotkey with the window hidden.
+- **Lablooms identity + Support**: the sidebar footer links to the studio and has a
+  "♥ Support" button (opens the project page — star it if Clipersal helps you).
+- **Window and taskbar icon**: the main window (and every dialog) now carries the
+  Clipersal icon in the title bar and taskbar, including a proper Windows App User
+  Model ID so taskbar grouping/pinning works.
+- **Installer offers FFmpeg**: the Windows installer asks (opt-out, recommended) to
+  install FFmpeg for you via winget at the end of setup — the long-standing
+  "ffmpeg is never bundled" licensing rule is untouched, since it's your own package
+  manager doing the install with your consent. Without winget it points you at the
+  download page instead.
+
+### Changed
+
+- **License: MIT → GPL-3.0-only.** See `LICENSE`.
+- **Settings now save automatically** — the Save button is gone. Every field change
+  applies after a short debounce (sliders apply on release, never mid-drag; hotkeys
+  apply when the recorder finishes), confirmed by an inline "Saved ✓". A change that
+  fails to apply shows the error and returns the field to its previous value.
+- The default filename template changed from `clip-{date}-{time}` to
+  `{window}-{date}-{time}`; a persisted copy of the old default (what everyone
+  who never customized it has) is migrated automatically on launch — custom
+  templates are untouched.
+- Gallery rows are slimmer: Play, ♥, and a "⋯" menu instead of five text buttons —
+  every action is one click further at most, and rows stay readable at small sizes.
+  The old separate trim dialog is gone; the in-app player's playhead trim replaces it.
 
 ### Fixed
 
+- **UI polish**: labels no longer paint a visible background box behind their
+  text — backgrounds are scoped to the containers that own a surface (the main
+  window, dialogs, menus, cards, inputs) in both light and dark mode. A follow-up
+  theming audit removed the remaining unthemed boxes (scroll viewports, the player
+  surface, hardcoded tray/status colors), unified font sizes on a proper type
+  scale, and themed the last native-looking controls (spin-box steppers, combo
+  drop-downs, checkbox indicators, segmented-control tracks). The first-run
+  wizard's dead bottom space is gone too.
+- **No more alert sounds**: message boxes (delete confirms, rename warnings,
+  reset confirmation, the crash prompt) no longer play the Windows system alert
+  sound — and GIF/compress exports report success inline inside their dialog
+  instead of closing it with a "dudun~" popup.
+- The Home recent-clips strip now refreshes itself when clips are deleted, renamed,
+  or created from the gallery (and has its own Refresh button).
+- Buttons and rows no longer truncate or crowd at the minimum window size; the
+  Home status line elides the clips path from the middle instead of clipping it.
 - Failed or timed-out saves/trims no longer leave a partial, broken `.mp4` in
   the gallery.
 - A hand-edited config file with wrong-typed values (e.g. text where a number

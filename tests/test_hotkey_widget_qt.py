@@ -239,3 +239,41 @@ def test_hide_event_while_idle_is_harmless() -> None:
     assert field.is_recording() is False
     assert field.combo() == "<ctrl>+<alt>+r"
     assert _FakeListener.instances == []
+
+
+# ---- recording_finished (the autosave hook) ------------------------------------
+
+
+def test_recording_finished_fires_on_accept_and_cancel() -> None:
+    field = HotkeyField("<ctrl>+<alt>+r")
+    emissions = []
+    field.recording_finished.connect(lambda: emissions.append(1))
+
+    field.record_button.click()
+    field._on_key_press("ctrl")
+    field._on_key_press("s")
+    field._on_key_release("s")
+    field._on_key_release("ctrl")
+    assert len(emissions) == 1  # accepted with <ctrl>+s
+
+    field.record_button.click()
+    field.record_button.click()  # cancel
+    assert len(emissions) == 2  # cancel fires too -- hosts compare the combo
+    # ...and the cancel restored the PRE-RECORD text, not the constructor's.
+    assert field.combo() == "<ctrl>+s"
+
+
+def test_cancel_restores_a_manually_typed_combo_not_the_initial_one() -> None:
+    field = HotkeyField("<ctrl>+<alt>+r")
+    field.entry.setText("<ctrl>+m")
+    field.record_button.click()
+    field.cancel_recording()
+    assert field.combo() == "<ctrl>+m"
+
+
+def test_recording_finished_does_not_fire_when_never_recording() -> None:
+    field = HotkeyField("<ctrl>+<alt>+r")
+    emissions = []
+    field.recording_finished.connect(lambda: emissions.append(1))
+    field.cancel_recording()  # no-op while idle
+    assert emissions == []

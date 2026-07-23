@@ -24,10 +24,13 @@ repo_root = Path(SPECPATH).resolve().parent
 icon_path = str(repo_root / "assets" / "icon.ico")
 
 # Qt submodules this app never uses -- PySide6's full wheel includes
-# WebEngine, QML/Quick, Multimedia, 3D, etc., and PyInstaller will happily
-# bundle all of it if not told otherwise. Excluding the big, definitely-unused
-# ones keeps the frozen bundle from growing far larger than it needs to;
-# still expect real growth over the pre-PySide6 ~20MB bundle regardless.
+# WebEngine, QML/Quick, 3D, etc., and PyInstaller will happily bundle all of
+# it if not told otherwise. Excluding the big, definitely-unused ones keeps
+# the frozen bundle from growing far larger than it needs to; still expect
+# real growth over the pre-PySide6 ~20MB bundle regardless.
+# QtMultimedia / QtMultimediaWidgets are deliberately NOT excluded:
+# player_qt.py's in-app clip player (QMediaPlayer + QVideoWidget) needs them
+# in the frozen build -- the size cost is accepted, see ARCHITECTURE.md.
 QT_EXCLUDES = [
     "PySide6.QtQml",
     "PySide6.QtQuick",
@@ -36,8 +39,6 @@ QT_EXCLUDES = [
     "PySide6.QtWebEngineCore",
     "PySide6.QtWebEngineWidgets",
     "PySide6.QtWebEngineQuick",
-    "PySide6.QtMultimedia",
-    "PySide6.QtMultimediaWidgets",
     "PySide6.QtNetwork",
     "PySide6.QtSql",
     "PySide6.QtTest",
@@ -70,6 +71,13 @@ QT_EXCLUDES = [
 app_analysis = Analysis(
     [str(repo_root / "packaging" / "entry_clipersal.py")],
     pathex=[str(repo_root / "src")],
+    # Ship the icon as data so brand.app_icon() can load it at runtime from
+    # sys._MEIPASS/assets/ -- the exe's own icon resource (icon= below) only
+    # covers Explorer / the taskbar, not Qt's window title bars.
+    datas=[
+        (str(repo_root / "assets" / "icon.png"), "assets"),
+        (str(repo_root / "assets" / "icon.ico"), "assets"),
+    ],
     hiddenimports=[],
     hookspath=[],
     excludes=QT_EXCLUDES,

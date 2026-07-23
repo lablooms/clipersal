@@ -104,8 +104,19 @@ apply_theme(False)  # establish the module-level constants at import time
 
 MONO_FONT = ("Cascadia Code", "Consolas", "Courier New")
 
+# Typography scale (point sizes) -- the ONLY sizes widgets should use, so a
+# rogue ad-hoc `pointSize()+N` or a bare "size 10 here, 13 there" can't creep
+# back in. H1 = tab/page headers ("Home", "Clips"), H2 = section emphasis
+# (the Home status word), BODY = the default reading size, HINT = secondary
+# text, MONO = code-ish readouts (log tail, value badges, status meta).
+FONT_H1 = 18
+FONT_H2 = 14
+FONT_BODY = 12
+FONT_HINT = 11
+FONT_MONO = 11
 
-def qfont(size: int = 12, weight: str = "bold", mono: bool = False) -> "QFont":
+
+def qfont(size: int = FONT_BODY, weight: str = "bold", mono: bool = False) -> "QFont":
     """QFont.setFamilies is Qt's own native ordered-fallback mechanism, so
     this needs no manual "pick index 0" fallback logic.
     """
@@ -193,6 +204,11 @@ def build_stylesheet() -> str:
         border: 1px solid {border};
         border-radius: 14px;
     }}
+    /* Gallery list rows and grid cards alike: an accent edge on hover.
+       Same 1px width as the resting border, so there's no layout shift. */
+    QFrame#card:hover {{
+        border: 1px solid {accent};
+    }}
 
     QLabel#cardTitle {{
         color: {text_muted};
@@ -226,6 +242,18 @@ def build_stylesheet() -> str:
         color: {good};
     }}
 
+    /* Banner titles on the Home tab: LIVE (danger-adjacent orange, see the
+       module docstring's semantic color note) for the crash banner, accent
+       gold for the low-disk warning. */
+    QLabel#crashTitle {{
+        color: {live};
+        font-weight: bold;
+    }}
+    QLabel#bannerTitle {{
+        color: {accent};
+        font-weight: bold;
+    }}
+
     #sidebar {{
         background-color: {surface};
         border-right: 1px solid {border};
@@ -247,12 +275,32 @@ def build_stylesheet() -> str:
         color: {text};
     }}
 
+    /* The sidebar's "♥ Support" link: the navButton's shape (transparent,
+       muted, left-aligned) but never checkable -- its hover cue is accent
+       text instead of the raised fill alone. */
+    QPushButton#supportButton {{
+        background-color: transparent;
+        color: {text_muted};
+        border: none;
+        text-align: left;
+        padding: 8px 12px;
+        border-radius: 8px;
+        font-weight: bold;
+    }}
+    QPushButton#supportButton:hover {{
+        background-color: {surface_raised};
+        color: {accent};
+    }}
+
     QPushButton {{
         background-color: {surface_raised};
         color: {text};
         border: 1px solid {border};
         border-radius: 8px;
         padding: 6px 14px;
+        /* Legibility floor: with 6px vertical padding alone the buttons
+           rendered short enough that their text read cramped/truncated. */
+        min-height: 28px;
     }}
     QPushButton:hover {{
         background-color: {accent};
@@ -269,6 +317,55 @@ def build_stylesheet() -> str:
     }}
     QPushButton#primary:hover {{
         background-color: {accent_hover};
+    }}
+
+    /* Gallery batch delete -- the destructive-action look. LIVE is the
+       palette's danger-adjacent color (see the module docstring's semantic
+       color note); the disabled state falls back to a plain raised button
+       so "Delete selected (0)" doesn't read as armed. */
+    QPushButton#danger {{
+        background-color: {live};
+        color: {on_accent};
+        border: none;
+        font-weight: bold;
+    }}
+    QPushButton#danger:hover {{
+        background-color: {live};
+    }}
+    QPushButton#danger:disabled {{
+        background-color: {surface_raised};
+        color: {text_muted};
+    }}
+
+    /* Gallery favorite heart: a borderless glyph button whose only state
+       cue is its text color -- muted when off, accent when checked. Reading
+       the tokens here (at stylesheet-build time) keeps the heart following
+       live theme switches like every QSS-styled widget. */
+    QPushButton#heartButton {{
+        background-color: transparent;
+        border: none;
+        border-radius: 8px;
+        color: {text_muted};
+        font-size: 17px;  /* icon glyph (♥), intentionally px-sized */
+        padding: 0 0 2px 0;  /* optical centering: the glyph rides high in its line box */
+        min-height: 0;  /* glyph button -- exempt from the QPushButton legibility floor */
+    }}
+    QPushButton#heartButton:hover {{
+        background-color: {surface_raised};
+        color: {accent};
+    }}
+    QPushButton#heartButton:checked {{
+        color: {accent};
+    }}
+
+    /* Gallery row's "⋯" overflow button (opens the row's full right-click
+       menu): the default raised-button look, minus the legibility floor and
+       side-padding that would make a single glyph oddly wide. */
+    QPushButton#menuButton {{
+        padding: 0 0 4px 0;  /* ⋯ sits high in the line box -- push it to optical center */
+        min-height: 0;
+        font-size: 15px;  /* icon glyph (⋯), intentionally px-sized */
+        font-weight: bold;
     }}
 
     QPushButton#recordButton[recording="true"] {{
@@ -290,6 +387,7 @@ def build_stylesheet() -> str:
         border: none;
         border-radius: 6px;
         padding: 6px 12px;
+        min-height: 0;  /* segmented buttons keep their compact track size */
     }}
     QPushButton#segmentedButton:hover {{
         background-color: {border};
@@ -301,21 +399,68 @@ def build_stylesheet() -> str:
         font-weight: bold;
     }}
 
-    QLineEdit, QPlainTextEdit, QComboBox {{
+    QLineEdit, QPlainTextEdit, QComboBox, QSpinBox {{
         background-color: {surface_raised};
         color: {text};
         border: 1px solid {border};
         border-radius: 8px;
         padding: 4px 8px;
     }}
+    QLineEdit:disabled, QPlainTextEdit:disabled, QComboBox:disabled, QSpinBox:disabled {{
+        /* The platform style's own disabled paint can be an unthemed grey
+           box; pin it to the palette and just mute the text. */
+        background-color: {surface_raised};
+        color: {text_muted};
+    }}
     QComboBox::drop-down {{
         border: none;
+        width: 24px;
+        border-top-right-radius: 8px;
+        border-bottom-right-radius: 8px;
+    }}
+    QComboBox::drop-down:hover {{
+        background-color: {track};
     }}
     QComboBox QAbstractItemView {{
         background-color: {surface_raised};
         color: {text};
         selection-background-color: {accent};
         selection-color: {on_accent};
+    }}
+
+    /* Spinbox steppers: the native grey up/down column clashed with the
+       themed input it sits inside of ("the turning up and down button" the
+       user flagged in the export dialogs). The arrow glyphs themselves are
+       drawn by Qt in the spinbox's text color, which the QLineEdit-style
+       rule above already points at the TEXT token. */
+    QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {{
+        background-color: {track};
+        border: none;
+        border-left: 1px solid {border};
+        width: 18px;
+    }}
+    QAbstractSpinBox::up-button:hover, QAbstractSpinBox::down-button:hover {{
+        background-color: {surface_raised};
+    }}
+    QAbstractSpinBox::up-button:pressed, QAbstractSpinBox::down-button:pressed {{
+        background-color: {accent};
+    }}
+
+    /* Checkbox indicator (gallery selection mode): a themed rounded square,
+       accent-filled when on -- mirrors the ToggleSwitch's on/off reading. */
+    QCheckBox::indicator {{
+        width: 16px;
+        height: 16px;
+        border-radius: 5px;
+        border: 1px solid {border};
+        background-color: {surface_raised};
+    }}
+    QCheckBox::indicator:hover {{
+        border-color: {accent};
+    }}
+    QCheckBox::indicator:checked {{
+        background-color: {accent};
+        border-color: {accent};
     }}
 
     QSlider::groove:horizontal {{
@@ -335,6 +480,50 @@ def build_stylesheet() -> str:
         border-radius: 3px;
     }}
 
+    /* Settings' tab bar: raised-gold tabs on the pane, muted text until
+       selected, and an ACCENT top edge as the selected indicator. The pane
+       itself stays transparent (cards paint their own surfaces); the -1px
+       top overlap lets the selected tab's bottom edge merge into it. */
+    QTabWidget::pane {{
+        border: 1px solid {border};
+        border-radius: 10px;
+        background: transparent;
+        top: -1px;
+    }}
+    QTabBar::tab {{
+        background-color: {surface_raised};
+        color: {text_muted};
+        border: 1px solid {border};
+        border-bottom: none;
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
+        padding: 8px 16px;
+        margin-right: 4px;
+    }}
+    QTabBar::tab:hover:!selected {{
+        color: {text};
+    }}
+    QTabBar::tab:selected {{
+        background-color: {bg};
+        color: {text};
+        border-top: 2px solid {accent};
+    }}
+
+    /* The player's idle surface. QVideoWidget paints its own (black) frame
+       during playback -- expected -- but before/without media it showed an
+       unthemed black box; idle chrome now reads as a raised panel. */
+    QVideoWidget#videoSurface {{
+        background-color: {surface_raised};
+        border: 1px solid {border};
+        border-radius: 10px;
+    }}
+
+    QScrollArea QWidget#qt_scrollarea_viewport {{
+        /* A scroll viewport can otherwise paint an unthemed (platform-grey
+           or dark) box behind the scrolled page. */
+        background: transparent;
+    }}
+
     QScrollArea {{
         border: none;
         background: transparent;
@@ -351,5 +540,21 @@ def build_stylesheet() -> str:
     }}
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
         height: 0;
+    }}
+
+    /* Horizontal twin (the Logs textbox, wide pages): left unthemed it
+       painted a platform-default white/grey strip, glaring in dark mode. */
+    QScrollBar:horizontal {{
+        background: {bg};
+        height: 10px;
+        margin: 0;
+    }}
+    QScrollBar::handle:horizontal {{
+        background: {border};
+        border-radius: 5px;
+        min-width: 24px;
+    }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+        width: 0;
     }}
     """

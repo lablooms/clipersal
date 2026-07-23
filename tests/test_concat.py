@@ -16,6 +16,7 @@ from clipersal.concat import (
     _finalized_segments,
     _unique_output_path,
     enforce_clip_retention,
+    enforce_size_cap,
     render_filename,
     save_clip,
     trim_clip,
@@ -256,6 +257,77 @@ def test_render_filename_keeps_names_that_merely_start_with_a_reserved_word() ->
     assert render_filename("com10") == "com10"
 
 
+def test_render_filename_window_placeholder_uses_the_given_title() -> None:
+    now = datetime(2026, 7, 17, 1, 13, 51)
+
+    assert render_filename("{window}-{date}-{time}", now=now, window_title="Valorant") == "Valorant-20260717-011351"
+
+
+def test_render_filename_window_placeholder_falls_back_to_clip_without_a_title() -> None:
+    now = datetime(2026, 7, 22, 1, 13, 51)
+
+    # None (Wayland, an unreadable foreground window), empty, and
+    # all-whitespace titles all degrade to the pre-{window} default name.
+    assert render_filename("{window}-{date}-{time}", now=now) == "clip-20260722-011351"
+    assert render_filename("{window}-{date}-{time}", now=now, window_title="") == "clip-20260722-011351"
+    assert render_filename("{window}-{date}-{time}", now=now, window_title="   ") == "clip-20260722-011351"
+
+
+def test_render_filename_window_title_is_sanitized_for_filename_use() -> None:
+    # Invalid filename characters become "_" and whitespace runs collapse to
+    # single spaces; case is preserved.
+    assert render_filename("{window}", window_title='My "App":  Weird/Title*?') == "My _App__ Weird_Title__"
+
+
+def test_render_filename_window_title_is_capped_at_40_chars() -> None:
+    assert render_filename("{window}", window_title="A" * 60) == "A" * 40
+
+
+def test_render_filename_window_title_cap_leaves_no_trailing_space() -> None:
+    # The 40-char cut can land right after a space -- a trailing-space
+    # filename is unusable on Windows, so the cut is stripped again.
+    title = "x" * 39 + " " + "y" * 20
+    assert render_filename("{window}", window_title=title) == "x" * 39
+
+
+def test_render_filename_window_title_reserved_device_name_falls_back_to_clip() -> None:
+    # Same protection as a literal reserved template: "NUL.mp4" would open
+    # the null device, not a file -- but a title that merely STARTS with a
+    # reserved word is fine.
+    assert render_filename("{window}", window_title="NUL") == "clip"
+    assert render_filename("{window}", window_title="Console App") == "Console App"
+
+
+def test_save_clip_names_output_with_the_window_placeholder(tmp_path: Path, monkeypatch) -> None:
+    buffer_dir = tmp_path / "buffer"
+    clips_dir = tmp_path / "clips"
+    buffer_dir.mkdir()
+    clips_dir.mkdir()
+    for name in ("seg-20260101-000100.ts", "seg-20260101-000200.ts"):
+        _touch(buffer_dir / name)
+    monkeypatch.setattr(concat_module.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stderr=""))
+
+    output_path = save_clip("ffmpeg", buffer_dir, clips_dir, filename_template="{window}-{date}", window_title="Valorant")
+
+    assert output_path.name.startswith("Valorant-")
+    assert output_path.suffix == ".mp4"
+
+
+def test_save_clip_without_a_window_title_keeps_the_clip_fallback(tmp_path: Path, monkeypatch) -> None:
+    buffer_dir = tmp_path / "buffer"
+    clips_dir = tmp_path / "clips"
+    buffer_dir.mkdir()
+    clips_dir.mkdir()
+    for name in ("seg-20260101-000100.ts", "seg-20260101-000200.ts"):
+        _touch(buffer_dir / name)
+    monkeypatch.setattr(concat_module.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stderr=""))
+
+    output_path = save_clip("ffmpeg", buffer_dir, clips_dir, filename_template="{window}-{date}")
+
+    assert output_path.name.startswith("clip-")
+    assert output_path.suffix == ".mp4"
+
+
 def test_unique_output_path_appends_counter_on_collision(tmp_path: Path) -> None:
     (tmp_path / "clip-test.mp4").write_bytes(b"existing")
 
@@ -322,6 +394,61 @@ def test_enforce_clip_retention_ignores_non_mp4_files(tmp_path: Path) -> None:
 
     assert deleted == []
     assert old_thumbnail.exists()
+
+
+def test_enforce_clip_retention_never_deletes_protected_names(tmp_path: Path) -> None:
+    # Favorites (clip_metadata) are passed in as protected so a starred clip
+    # survives the sweep no matter how old it is.
+    now = time.time()
+    old_favorite = tmp_path / "clip-favorite.mp4"
+    old_plain = tmp_path / "clip-plain.mp4"
+    _touch(old_favorite, mtime=now - 10 * 86400)
+    _touch(old_plain, mtime=now - 10 * 86400)
+
+    deleted = enforce_clip_retention(tmp_path, retention_days=5, now=now, protected={"clip-favorite.mp4"})
+
+    assert deleted == [old_plain]
+    assert old_favorite.exists()
+    assert not old_plain.exists()
+
+
+def test_enforce_clip_retention_default_protected_is_none_and_behaves_as_before(tmp_path: Path) -> None:
+    # protected=None (the default) must be exactly the pre-favorites
+    # behavior: every .mp4 older than the cutoff goes.
+    now = time.time()
+    old_clip = tmp_path / "clip-old.mp4"
+    _touch(old_clip, mtime=now - 10 * 86400)
+
+    deleted = enforce_clip_retention(tmp_path, retention_days=5, now=now)
+
+    assert deleted == [old_clip]
+    assert not old_clip.exists()
+
+
+def test_enforce_clip_retention_protected_matches_full_filename_not_stem(tmp_path: Path) -> None:
+    # clip_metadata keys are full filenames, so a bare stem must NOT
+    # protect the file -- matching is exact, never fuzzy.
+    now = time.time()
+    old_clip = tmp_path / "clip-old.mp4"
+    _touch(old_clip, mtime=now - 10 * 86400)
+
+    deleted = enforce_clip_retention(tmp_path, retention_days=5, now=now, protected={"clip-old"})
+
+    assert deleted == [old_clip]
+    assert not old_clip.exists()
+
+
+def test_enforce_clip_retention_unknown_protected_names_are_harmless(tmp_path: Path) -> None:
+    now = time.time()
+    old_clip = tmp_path / "clip-old.mp4"
+    _touch(old_clip, mtime=now - 10 * 86400)
+
+    deleted = enforce_clip_retention(
+        tmp_path, retention_days=5, now=now, protected={"clip-deleted-long-ago.mp4", "clip-old.mp4"}
+    )
+
+    assert deleted == []
+    assert old_clip.exists()
 
 
 # ---- trim_clip ------------------------------------------------------------
@@ -574,3 +701,147 @@ def test_trim_clip_keeps_output_on_success(tmp_path: Path, monkeypatch) -> None:
 
     assert output_path.exists()
     assert output_path.read_bytes() == b"partial ffmpeg output"
+
+
+# ---- enforce_size_cap ----------------------------------------------------------
+
+
+def _touch_sized(path: Path, size: int, mtime: float) -> None:
+    path.write_bytes(b"x" * size)
+    os.utime(path, (mtime, mtime))
+
+
+def test_enforce_size_cap_deletes_oldest_first_until_under_cap(tmp_path: Path) -> None:
+    now = time.time()
+    oldest = tmp_path / "clip-oldest.mp4"
+    middle = tmp_path / "clip-middle.mp4"
+    newest = tmp_path / "clip-newest.mp4"
+    _touch_sized(oldest, 100, mtime=now - 300)
+    _touch_sized(middle, 100, mtime=now - 200)
+    _touch_sized(newest, 100, mtime=now - 100)
+
+    deleted = enforce_size_cap(tmp_path, max_bytes=150)
+
+    # 300 bytes total: two oldest must go to fit 150, the newest survives.
+    assert deleted == [oldest, middle]
+    assert not oldest.exists()
+    assert not middle.exists()
+    assert newest.exists()
+
+
+def test_enforce_size_cap_noop_when_already_under_cap(tmp_path: Path) -> None:
+    clip = tmp_path / "clip.mp4"
+    _touch_sized(clip, 100, mtime=time.time())
+
+    assert enforce_size_cap(tmp_path, max_bytes=1000) == []
+    assert clip.exists()
+
+
+def test_enforce_size_cap_zero_and_negative_disable_it(tmp_path: Path) -> None:
+    clip = tmp_path / "clip.mp4"
+    _touch_sized(clip, 100, mtime=time.time())
+
+    assert enforce_size_cap(tmp_path, max_bytes=0) == []
+    assert enforce_size_cap(tmp_path, max_bytes=-1) == []
+    assert clip.exists()
+
+
+def test_enforce_size_cap_skips_protected_and_deletes_next_oldest(tmp_path: Path) -> None:
+    now = time.time()
+    favorite = tmp_path / "clip-favorite.mp4"
+    plain = tmp_path / "clip-plain.mp4"
+    newest = tmp_path / "clip-newest.mp4"
+    _touch_sized(favorite, 100, mtime=now - 300)  # oldest, but protected
+    _touch_sized(plain, 100, mtime=now - 200)
+    _touch_sized(newest, 100, mtime=now - 100)
+
+    deleted = enforce_size_cap(tmp_path, max_bytes=200, protected={"clip-favorite.mp4"})
+
+    # 300 bytes total, cap 200: the protected favorite is skipped and the
+    # next-oldest goes instead, bringing the folder exactly to the cap.
+    assert deleted == [plain]
+    assert favorite.exists()
+    assert not plain.exists()
+    assert newest.exists()
+
+
+def test_enforce_size_cap_stops_when_only_protected_clips_remain(tmp_path: Path) -> None:
+    now = time.time()
+    plain = tmp_path / "clip-plain.mp4"
+    fav1 = tmp_path / "clip-fav-1.mp4"
+    fav2 = tmp_path / "clip-fav-2.mp4"
+    _touch_sized(plain, 100, mtime=now - 300)
+    _touch_sized(fav1, 100, mtime=now - 200)
+    _touch_sized(fav2, 100, mtime=now - 100)
+
+    # Even after deleting the one unprotected clip the folder is still over
+    # the cap -- the sweep must stop there, not eat the favorites.
+    deleted = enforce_size_cap(tmp_path, max_bytes=50, protected={"clip-fav-1.mp4", "clip-fav-2.mp4"})
+
+    assert deleted == [plain]
+    assert not plain.exists()
+    assert fav1.exists()
+    assert fav2.exists()
+
+
+def test_enforce_size_cap_ignores_non_mp4_files(tmp_path: Path) -> None:
+    now = time.time()
+    screenshot = tmp_path / "screenshot-1.png"
+    _touch_sized(screenshot, 5000, mtime=now - 300)
+    clip = tmp_path / "clip.mp4"
+    _touch_sized(clip, 50, mtime=now - 100)
+
+    deleted = enforce_size_cap(tmp_path, max_bytes=100)
+
+    # The PNG counts nothing toward the cap and is never a deletion candidate.
+    assert deleted == []
+    assert screenshot.exists()
+    assert clip.exists()
+
+
+def test_enforce_size_cap_tolerates_a_clip_vanishing_mid_sweep(tmp_path: Path, monkeypatch) -> None:
+    now = time.time()
+    ghost = tmp_path / "clip-ghost.mp4"
+    real = tmp_path / "clip-real.mp4"
+    _touch_sized(ghost, 100, mtime=now - 200)
+    _touch_sized(real, 100, mtime=now - 100)
+
+    real_stat = Path.stat
+
+    def selective_stat(self, *args, **kwargs):
+        if self == ghost:
+            raise FileNotFoundError("swept by someone else")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", selective_stat)
+
+    deleted = enforce_size_cap(tmp_path, max_bytes=50)
+
+    # The ghost is skipped entirely; only the real clip's 100 bytes count,
+    # so it must go to fit the cap.
+    assert deleted == [real]
+
+
+def test_enforce_size_cap_tolerates_undeletable_clips(tmp_path: Path, monkeypatch) -> None:
+    now = time.time()
+    stuck = tmp_path / "clip-stuck.mp4"
+    deletable = tmp_path / "clip-deletable.mp4"
+    _touch_sized(stuck, 100, mtime=now - 200)
+    _touch_sized(deletable, 100, mtime=now - 100)
+
+    real_unlink = Path.unlink
+
+    def selective_unlink(self, *args, **kwargs):
+        if self == stuck:
+            raise OSError("file locked by another process")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", selective_unlink)
+
+    deleted = enforce_size_cap(tmp_path, max_bytes=50)
+
+    # The locked clip is logged and skipped; the sweep moves on to the next
+    # oldest instead of dying on the first failure.
+    assert deleted == [deletable]
+    assert stuck.exists()
+    assert not deletable.exists()

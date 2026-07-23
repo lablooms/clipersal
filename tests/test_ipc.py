@@ -232,3 +232,40 @@ def test_second_bind_on_same_port_is_refused() -> None:
             second.start()
     finally:
         first.stop()
+
+
+# ---- STATS payload parsing (client-side; see cli.py's handle_stats) ---------
+
+
+def test_parse_stats_payload_from_full_ok_response() -> None:
+    from clipersal.ipc_client import parse_stats_payload
+
+    line = "OK state=RECORDING|uptime=123.4|segments=27|buffer_bytes=12345678|encoder=h264_nvenc|buffer_seconds=60|clips_free_bytes=123456789|clips_count=5"
+
+    assert parse_stats_payload(line) == {
+        "state": "RECORDING",
+        "uptime": "123.4",
+        "segments": "27",
+        "buffer_bytes": "12345678",
+        "encoder": "h264_nvenc",
+        "buffer_seconds": "60",
+        "clips_free_bytes": "123456789",
+        "clips_count": "5",
+    }
+
+
+def test_parse_stats_payload_accepts_bare_payload_and_empty_values() -> None:
+    from clipersal.ipc_client import parse_stats_payload
+
+    # Degraded fields arrive as empty strings -- the parser must keep them,
+    # not drop or choke on them.
+    fields = parse_stats_payload("state=PAUSED|uptime=|segments=3")
+
+    assert fields == {"state": "PAUSED", "uptime": "", "segments": "3"}
+
+
+def test_parse_stats_payload_ignores_malformed_parts() -> None:
+    from clipersal.ipc_client import parse_stats_payload
+
+    assert parse_stats_payload("state=CRASHED|garbage|=nokey") == {"state": "CRASHED"}
+    assert parse_stats_payload("") == {}

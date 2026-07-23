@@ -17,18 +17,27 @@ at-a-glance status indicator there.
 same glyph shape a second time using `ImageDraw` primitives for the app icon --
 duplicated by hand rather than shared, the same way the accent color itself is
 already duplicated as literal hex constants between that file and theme.py.
+
+`app_icon()` loads that rendered asset (`assets/icon.png`) as the QApplication's
+window icon -- the one place the actual image file is used at runtime instead of
+a hand-painted Qt shape.
 """
 
 from __future__ import annotations
 
+import logging
 import math
+import sys
+from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QWidget
 
 from clipersal import theme
+
+log = logging.getLogger(__name__)
 
 
 def draw_bloom(painter: QPainter, rect: QRectF, color: QColor) -> None:
@@ -168,6 +177,41 @@ GLYPHS: dict[str, Callable[[QPainter, QRectF, QColor], None]] = {
 }
 
 DEFAULT_GLYPH = "seed_puff"
+
+# Studio identity + support links, opened from the main window's sidebar
+# footer. Module constants (not inline literals) so the sidebar and tests
+# reference exactly one value each.
+LABLOOMS_URL = "https://github.com/lablooms"
+SUPPORT_URL = "https://github.com/lablooms/clipersal"
+
+# src/clipersal/brand.py -> repo root is two levels up. A module constant so
+# tests can point the lookup elsewhere.
+_SOURCE_ICON_PATH = Path(__file__).resolve().parents[2] / "assets" / "icon.png"
+
+
+def app_icon() -> QIcon:
+    """The app's window/taskbar icon, loaded from assets/icon.png (rendered by
+    packaging/generate_icon.py; the .ico sibling covers the exe/installer
+    side). Under a frozen PyInstaller build, data files live in sys._MEIPASS,
+    so that location is tried first. A genuinely missing asset degrades to a
+    null QIcon with a warning -- a missing icon must never break startup.
+    """
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "assets" / "icon.png")
+    candidates.append(_SOURCE_ICON_PATH)
+    for candidate in candidates:
+        if candidate.is_file():
+            icon = QIcon(str(candidate))
+            if not icon.isNull():
+                return icon
+    log.warning(
+        "App icon asset not found (tried %s); falling back to a null icon",
+        ", ".join(str(candidate) for candidate in candidates),
+    )
+    return QIcon()
 
 
 class BrandMark(QWidget):

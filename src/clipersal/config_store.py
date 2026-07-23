@@ -3,7 +3,9 @@
 Only the settings exposed in the Settings window are persisted: buffer
 length, clips folder, hotkey combo, video bitrate, quality preset, encoder
 override, filename template, clip retention (days), launch-on-startup,
-check-for-updates, and dark mode.
+check-for-updates, theme mode, framerate, resolution scale, the
+quick-save / screenshot hotkey bindings, the clips folder size cap, and the
+save-sound toggle.
 `config.py`
 loads this once at import time to seed argparse defaults (so precedence is
 CLI flag > config file > hardcoded default), and the Settings window writes
@@ -37,7 +39,16 @@ PERSISTED_KEYS = (
     "clip_retention_days",
     "launch_on_startup",
     "check_for_updates",
-    "dark_mode",
+    "theme_mode",
+    "framerate",
+    "resolution_scale",
+    "quick_save_hotkey_1",
+    "quick_save_seconds_1",
+    "quick_save_hotkey_2",
+    "quick_save_seconds_2",
+    "screenshot_hotkey",
+    "clips_max_gb",
+    "save_sound_enabled",
 )
 
 # The JSON type each persisted key must have, mirroring config.py's Config
@@ -64,7 +75,16 @@ _KEY_TYPES: dict[str, type] = {
     "clip_retention_days": int,
     "launch_on_startup": bool,
     "check_for_updates": bool,
-    "dark_mode": bool,
+    "theme_mode": str,
+    "framerate": int,
+    "resolution_scale": str,
+    "quick_save_hotkey_1": str,
+    "quick_save_seconds_1": int,
+    "quick_save_hotkey_2": str,
+    "quick_save_seconds_2": int,
+    "screenshot_hotkey": str,
+    "clips_max_gb": int,
+    "save_sound_enabled": bool,
 }
 
 # encoder_override / mic_device legitimately persist null ("no override" /
@@ -109,6 +129,16 @@ def default_log_path() -> Path:
     return default_config_path().parent / "clipersal.log"
 
 
+# The pre-0.1.1-beta default filename template. Everyone who never customized
+# their template has exactly this value persisted, so a plain default change
+# would never reach them -- load-time migration rewrites it to the new
+# `{window}-{date}-{time}` default (persisted on the next settings save). A
+# user who deliberately re-typed the old default is indistinguishable from an
+# untouched one and gets migrated too -- accepted, and documented here.
+_LEGACY_FILENAME_TEMPLATE = "clip-{date}-{time}"
+_DEFAULT_FILENAME_TEMPLATE = "{window}-{date}-{time}"
+
+
 def load_overrides(path: Path | None = None) -> dict[str, Any]:
     path = path or default_config_path()
     if not path.exists():
@@ -136,6 +166,24 @@ def load_overrides(path: Path | None = None) -> dict[str, Any]:
                 path,
                 value,
             )
+    if overrides.get("filename_template") == _LEGACY_FILENAME_TEMPLATE:
+        log.info(
+            "Migrating the old default filename template to %r", _DEFAULT_FILENAME_TEMPLATE
+        )
+        overrides["filename_template"] = _DEFAULT_FILENAME_TEMPLATE
+    # The pre-theme-mode boolean: a config file from before the three-way
+    # theme setting has "dark_mode" instead of "theme_mode". false was the
+    # old default for everyone, so it maps to the NEW default ("system" --
+    # follow the OS dark-mode setting); true was an explicit choice and is
+    # honored as "dark". Anything non-bool there was already junk and also
+    # lands on "system".
+    if "theme_mode" not in data and "dark_mode" in data:
+        overrides["theme_mode"] = "dark" if data["dark_mode"] is True else "system"
+        log.info(
+            "Migrating the old dark_mode setting (%r) to theme_mode=%r",
+            data["dark_mode"],
+            overrides["theme_mode"],
+        )
     return overrides
 
 

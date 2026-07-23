@@ -70,3 +70,28 @@ def test_trigger_gallery_prints_response_and_exits_zero(running_server: IpcServe
 
     assert exit_code == 0
     assert "opening gallery window" in capsys.readouterr().out
+
+
+def test_trigger_stats_prints_payload_and_exits_zero(running_server: IpcServer, capsys) -> None:
+    running_server.register("STATS", lambda arg: "state=RECORDING|uptime=1.0")
+
+    exit_code = trigger.main(["stats", "--port", str(running_server.port)])
+
+    assert exit_code == 0
+    assert "state=RECORDING|uptime=1.0" in capsys.readouterr().out
+
+
+def test_trigger_screenshot_prints_path_and_exits_zero(running_server: IpcServer, capsys) -> None:
+    received_args = []
+
+    def handle_screenshot(arg):
+        received_args.append(arg)
+        return "/clips/screenshot-1.png"
+
+    running_server.register("SCREENSHOT", handle_screenshot)
+
+    exit_code = trigger.main(["screenshot", "--port", str(running_server.port)])
+
+    assert exit_code == 0
+    assert received_args == [None]  # no argument, unlike SAVE's trim
+    assert "/clips/screenshot-1.png" in capsys.readouterr().out

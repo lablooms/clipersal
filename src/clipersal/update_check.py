@@ -179,13 +179,16 @@ def check_for_update_once(
     now: float | None = None,
     cache_path: Path | None = None,
     fetch: FetchFn = _default_fetch,
+    force: bool = False,
 ) -> tuple[str, str] | None:
     """The one function cli.py calls, on a background thread, once per
     launch. Returns (version, url) to show a banner for, or None for
     "nothing to show" -- covers: repo unset, fetch failed, not actually
     newer, or already dismissed.
 
-    Throttled to at most one network call per _CHECK_INTERVAL_SECONDS, but
+    Throttled to at most one network call per _CHECK_INTERVAL_SECONDS
+    (`force=True` -- the Settings tab's "Check now" button -- bypasses the
+    throttle but still writes the cache), but
     throttling only suppresses the *network call* -- a found-but-undismissed
     update is re-derived from the cache and still returned on a same-day
     relaunch, since otherwise it would silently vanish before the user
@@ -204,7 +207,11 @@ def check_for_update_once(
         cache = load_cache(cache_path)
         now_ts = now if now is not None else time.time()
         last_checked = cache.get("last_checked")
-        throttled = isinstance(last_checked, (int, float)) and (now_ts - last_checked) < _CHECK_INTERVAL_SECONDS
+        throttled = (
+            not force
+            and isinstance(last_checked, (int, float))
+            and (now_ts - last_checked) < _CHECK_INTERVAL_SECONDS
+        )
 
         if throttled:
             return _cached_result(cache, current_version)

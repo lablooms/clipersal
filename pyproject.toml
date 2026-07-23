@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "clipersal"
-version = "0.1.2-beta"
+version = "0.1.1-beta"
 description = "Clipersal (by Lablooms) -- cross-platform instant replay / rolling screen-capture buffer tool. Catch the moment you bloomed."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "GPL-3.0-only" }
 dependencies = [
     "pynput>=1.7,<2",
     "PySide6>=6",

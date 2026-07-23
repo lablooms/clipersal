@@ -32,12 +32,14 @@ def _make_window(
     ipc_port: int = 1,
     app_signals=None,
     clips_dir_provider=None,
+    diagnostics_facts_provider=None,
 ) -> MainWindow:
     config = Config(buffer_dir=tmp_path / "buffer", clips_dir=tmp_path / "clips")
     return MainWindow(
         config, ipc_port, None, "libx264", lambda values: None, "ffmpeg",
         clips_dir_provider or (lambda: tmp_path / "clips"),
         tmp_path / "log.txt", tray_enabled, on_quit or (lambda: None), app_signals,
+        diagnostics_facts_provider=diagnostics_facts_provider,
     )
 
 
@@ -117,7 +119,13 @@ def test_close_event_cancels_a_mid_record_settings_hotkey_capture(tmp_path: Path
     win = _make_window(tmp_path, tray_enabled=True)
     win.select_tab("settings")
     win.show()
-    hotkey_field = win._tabs["settings"].hotkey_field
+    settings = win._tabs["settings"]
+    # The hotkey field lives on the "Saving" sub-tab now -- switch to it so
+    # the field is actually visible, as it would be for a real user (only a
+    # VISIBLE field gets the hideEvent that cancels the recording).
+    labels = [settings.tabs.tabText(i) for i in range(settings.tabs.count())]
+    settings.tabs.setCurrentIndex(labels.index("Saving"))
+    hotkey_field = settings.hotkey_field
     hotkey_field.record_button.click()
     listener = hotkey_field._listener
     assert hotkey_field.is_recording() is True
@@ -132,6 +140,29 @@ def test_close_event_cancels_a_mid_record_settings_hotkey_capture(tmp_path: Path
 # ---- status polling ---------------------------------------------------------
 
 
+def _stats_payload(state: str = "RECORDING", **overrides: str) -> str:
+    fields = {
+        "state": state,
+        "uptime": "3725.0",
+        "segments": "20",
+        "buffer_bytes": str(40 * (1 << 20)),
+        "encoder": "libx264",
+        "buffer_seconds": "60",
+        "clips_free_bytes": str(10 * (1 << 30)),
+        "clips_count": "3",
+    }
+    fields.update(overrides)
+    return "|".join(f"{key}={value}" for key, value in fields.items())
+
+
+def _stats_server(state: str = "RECORDING", **overrides: str) -> IpcServer:
+    payload = _stats_payload(state, **overrides)
+    server = IpcServer(port=0)
+    server.register("STATS", lambda arg: payload)
+    server.start()
+    return server
+
+
 def test_poll_status_recording(tmp_path: Path) -> None:
     server = IpcServer(port=0)
     server.register("STATUS", lambda arg: "RECORDING")
@@ -140,7 +171,8 @@ def test_poll_status_recording(tmp_path: Path) -> None:
         win = _make_window(tmp_path, ipc_port=server.port)
         win._poll_status()
         assert win._status_label.text() == "Recording"
-        assert win._pause_button.text() == "Pause"
+        assert win._pause_button.text() == "Pause capture"
+        assert win.windowTitle() == "Clipersal"
     finally:
         server.stop()
 
@@ -153,7 +185,8 @@ def test_poll_status_paused(tmp_path: Path) -> None:
         win = _make_window(tmp_path, ipc_port=server.port)
         win._poll_status()
         assert win._status_label.text() == "Paused"
-        assert win._pause_button.text() == "Resume"
+        assert win._pause_button.text() == "Resume capture"
+        assert win.windowTitle() == "Clipersal — Paused"
     finally:
         server.stop()
 
@@ -166,7 +199,68 @@ def test_poll_status_crashed(tmp_path: Path) -> None:
         win = _make_window(tmp_path, ipc_port=server.port)
         win._poll_status()
         assert win._status_label.text() == "Capture stopped -- see Logs"
-        assert win._pause_button.text() == "Resume"
+        assert win._pause_button.text() == "Resume capture"
+        assert win.windowTitle() == "Clipersal — Capture stopped"
+    finally:
+        server.stop()
+
+
+def test_poll_status_stats_drives_the_second_meta_line(tmp_path: Path) -> None:
+    server = _stats_server()
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        win._poll_status()
+        line = win._status_stats_label.text()
+        # uptime 3725s -> 1:02:05; fill = 20 segments x 2s segment_seconds.
+        assert "Up 1:02:05" in line
+        assert "Buffer fill ~40s/60s (20 segments, 40 MB)" in line
+        assert "libx264" in line
+        assert "10.0 GB free" in line
+        # Line 1 (buffer + clips dir) is untouched by the poll.
+        assert win._status_meta_prefix_label.text() + win._status_meta_label.text() == win._default_status_meta()
+    finally:
+        server.stop()
+
+
+def test_poll_status_stats_fill_is_capped_at_buffer_seconds(tmp_path: Path) -> None:
+    server = _stats_server(segments="50")  # 50 x 2s = 100s > 60s buffer
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        win._poll_status()
+        assert "Buffer fill ~60s/60s (50 segments" in win._status_stats_label.text()
+    finally:
+        server.stop()
+
+
+def test_poll_status_stats_omits_missing_fields_without_none(tmp_path: Path) -> None:
+    server = _stats_server(uptime="", segments="", buffer_bytes="", encoder="", clips_free_bytes="")
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        win._poll_status()
+        line = win._status_stats_label.text()
+        assert "None" not in line
+        # Only the state was known -- every stat field degraded away.
+        assert line == ""
+        assert win._status_label.text() == "Recording"
+    finally:
+        server.stop()
+
+
+def test_poll_status_pause_label_flips_with_stats_state(tmp_path: Path) -> None:
+    state = {"value": "RECORDING"}
+    server = IpcServer(port=0)
+    server.register("STATS", lambda arg: _stats_payload(state["value"]))
+    server.start()
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        win._poll_status()
+        assert win._pause_button.text() == "Pause capture"
+        state["value"] = "PAUSED"
+        win._poll_status()
+        assert win._pause_button.text() == "Resume capture"
+        state["value"] = "RECORDING"
+        win._poll_status()
+        assert win._pause_button.text() == "Pause capture"
     finally:
         server.stop()
 
@@ -192,16 +286,295 @@ def test_poll_status_unreachable_leaves_state_unchanged(tmp_path: Path) -> None:
     assert win._status_label.text() == "Recording"
 
 
+# ---- crash banner -----------------------------------------------------------
+
+
+def test_crash_banner_follows_stats_state_and_title_recovers(tmp_path: Path) -> None:
+    state = {"value": "RECORDING"}
+    server = IpcServer(port=0)
+    server.register("STATS", lambda arg: _stats_payload(state["value"]))
+    server.start()
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        assert win._crash_banner.isHidden() is True
+
+        state["value"] = "CRASHED"
+        win._poll_status()
+        assert win._crash_banner.isHidden() is False
+        assert win.windowTitle() == "Clipersal — Capture stopped"
+
+        state["value"] = "PAUSED"
+        win._poll_status()
+        assert win._crash_banner.isHidden() is True
+        assert win.windowTitle() == "Clipersal — Paused"
+
+        state["value"] = "RECORDING"
+        win._poll_status()
+        assert win._crash_banner.isHidden() is True
+        assert win.windowTitle() == "Clipersal"
+    finally:
+        server.stop()
+
+
+def test_crash_banner_restart_button_sends_resume(tmp_path: Path) -> None:
+    received = []
+    server = IpcServer(port=0)
+    server.register("STATS", lambda arg: _stats_payload("CRASHED"))
+    server.register("RESUME", lambda arg: received.append("RESUME") or "resumed")
+    server.start()
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        win._poll_status()
+        assert win._crash_banner.isHidden() is False
+
+        win._crash_restart_button.click()
+        assert _wait_for(lambda: received == ["RESUME"])
+    finally:
+        server.stop()
+
+
+def test_crash_banner_view_logs_button_selects_logs_tab(tmp_path: Path) -> None:
+    win = _make_window(tmp_path)
+    win._crash_banner.setVisible(True)
+    buttons = win._crash_banner.findChildren(type(win._crash_restart_button))
+    view_logs = next(b for b in buttons if b.text() == "View logs")
+    view_logs.click()
+    assert win._active_tab == "logs"
+
+
+# ---- crash-report prompt -----------------------------------------------------
+
+
+def _prompt_button(win: MainWindow, text: str):
+    return next(b for b in win._crash_prompt.buttons() if b.text() == text)
+
+
+def test_crash_prompt_shows_once_per_episode_and_rearms(tmp_path: Path) -> None:
+    state = {"value": "RECORDING"}
+    server = IpcServer(port=0)
+    server.register("STATS", lambda arg: _stats_payload(state["value"]))
+    server.start()
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        win._poll_status()
+        assert win._crash_prompt is None
+
+        state["value"] = "CRASHED"
+        win._poll_status()
+        first = win._crash_prompt
+        assert first is not None
+        assert first.windowTitle() == "Capture stopped"
+
+        win._poll_status()  # still crashed: no second prompt for this episode
+        assert win._crash_prompt is first
+
+        state["value"] = "RECORDING"  # episode over -> the edge re-arms
+        win._poll_status()
+        assert win._crash_prompt is first  # untouched while open
+
+        state["value"] = "CRASHED"
+        win._poll_status()
+        assert win._crash_prompt is not None
+        assert win._crash_prompt is not first  # a new episode gets a new prompt
+    finally:
+        server.stop()
+
+
+def test_crash_prompt_not_now_just_closes(tmp_path: Path) -> None:
+    server = IpcServer(port=0)
+    server.register("STATS", lambda arg: _stats_payload("CRASHED"))
+    server.start()
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        win._poll_status()
+        assert win._crash_prompt is not None
+        _prompt_button(win, "Not now").click()
+        assert win._crash_prompt is None
+    finally:
+        server.stop()
+
+
+def test_crash_prompt_restart_sends_resume(tmp_path: Path) -> None:
+    received = []
+    server = IpcServer(port=0)
+    server.register("STATS", lambda arg: _stats_payload("CRASHED"))
+    server.register("RESUME", lambda arg: received.append("RESUME") or "resumed")
+    server.start()
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        win._poll_status()
+        _prompt_button(win, "Restart capture").click()
+        assert _wait_for(lambda: received == ["RESUME"])
+    finally:
+        server.stop()
+
+
+def test_crash_prompt_export_zip_calls_the_shared_helper(tmp_path: Path, monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(MainWindow, "_export_diagnostics_with_dialog", lambda self: calls.append(True))
+    server = IpcServer(port=0)
+    server.register("STATS", lambda arg: _stats_payload("CRASHED"))
+    server.start()
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        win._poll_status()
+        _prompt_button(win, "Export zip").click()
+        assert calls == [True]
+    finally:
+        server.stop()
+
+
+def test_crash_prompt_send_report_opens_a_prefilled_issue(tmp_path: Path, monkeypatch) -> None:
+    import urllib.parse
+
+    from PySide6.QtGui import QDesktopServices
+
+    opened = []
+    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(url.toString()))
+
+    (tmp_path / "log.txt").write_text(
+        "".join(f"app log line {i}\n" for i in range(300)), encoding="utf-8"
+    )
+    buffer_dir = tmp_path / "buffer"
+    buffer_dir.mkdir(exist_ok=True)
+    (buffer_dir / "ffmpeg.log").write_text(
+        "".join(f"ffmpeg log line {i}\n" for i in range(200)), encoding="utf-8"
+    )
+
+    server = IpcServer(port=0)
+    server.register("STATS", lambda arg: _stats_payload("CRASHED"))
+    server.start()
+    try:
+        win = _make_window(
+            tmp_path,
+            ipc_port=server.port,
+            diagnostics_facts_provider=lambda: {"os": "test-os", "encoder": "libx264"},
+        )
+        win._poll_status()
+        _prompt_button(win, "Send report").click()
+    finally:
+        server.stop()
+
+    assert len(opened) == 1
+    url = opened[0]
+    assert url.startswith(main_window_qt.CRASH_REPORT_ISSUES_URL + "?")
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    assert query["title"] == ["Crash report"]
+    body = query["body"][0]
+    assert "os: test-os" in body
+    assert "encoder: libx264" in body
+    assert "app log line 299" in body  # the app log tail made it in
+    assert "ffmpeg log line 199" in body  # and the ffmpeg log tail
+
+
+def test_crash_report_body_is_capped_and_keeps_the_newest_lines() -> None:
+    facts = {"os": "test-os"}
+    app_lines = [f"app log line {i} " + "x" * 90 for i in range(500)]  # ~50 KB of log
+    body = main_window_qt._build_crash_report_body(facts, app_lines, [])
+    assert len(body) <= main_window_qt._CRASH_REPORT_BODY_LIMIT
+    assert "os: test-os" in body  # the facts header always survives
+    assert "app log line 499" in body  # the newest lines survive the cap
+    assert "app log line 0 " not in body  # the oldest are dropped first
+
+
+def test_tail_lines_reads_only_the_end_of_a_big_log(tmp_path: Path) -> None:
+    path = tmp_path / "big.log"
+    line_count = 20_000
+    # Binary write: exactly 16 bytes per line, no platform newline translation.
+    path.write_bytes(b"".join(f"log-line-{i:06d}\n".encode() for i in range(line_count)))
+
+    lines = main_window_qt._tail_lines(path, 150)
+    assert len(lines) == 150
+    assert lines[-1] == f"log-line-{line_count - 1:06d}"
+    assert lines[0] == f"log-line-{line_count - 150:06d}"
+
+    # The size guard bounds the read window: with max_bytes far below the
+    # file size, only a slice of the end is ever read (one partial first
+    # line dropped).
+    lines = main_window_qt._tail_lines(path, 150, max_bytes=1024)
+    assert len(lines) == 63  # 1024/16 = 64 lines, minus the partial first
+    assert lines[-1] == f"log-line-{line_count - 1:06d}"
+
+
+def test_tail_lines_missing_file_returns_no_lines(tmp_path: Path) -> None:
+    assert main_window_qt._tail_lines(tmp_path / "nope.log", 150) == []
+
+
+# ---- low-disk banner ---------------------------------------------------------
+
+
+def test_disk_banner_shows_below_warn_threshold_with_free_space_text(tmp_path: Path) -> None:
+    server = _stats_server(clips_free_bytes=str((1 << 30) // 2))  # 0.5 GiB
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        win._poll_status()
+        assert win._disk_banner.isHidden() is False
+        assert "0.5 GB free" in win._disk_hint_label.text()
+    finally:
+        server.stop()
+
+
+def test_disk_banner_hysteresis_and_dismiss_rearm(tmp_path: Path) -> None:
+    free = {"value": 10 * (1 << 30)}
+    server = IpcServer(port=0)
+    server.register("STATS", lambda arg: _stats_payload(clips_free_bytes=str(free["value"])))
+    server.start()
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+
+        free["value"] = (1 << 30) // 2  # 0.5 GiB -> shows
+        win._poll_status()
+        assert win._disk_banner.isHidden() is False
+
+        free["value"] = int(1.2 * (1 << 30))  # dead band: stays shown
+        win._poll_status()
+        assert win._disk_banner.isHidden() is False
+
+        win._disk_dismiss_button.click()  # dismissed -> hides and stays hidden
+        assert win._disk_banner.isHidden() is True
+        win._poll_status()
+        assert win._disk_banner.isHidden() is True
+
+        free["value"] = (1 << 30) // 2  # still below warn while dismissed
+        win._poll_status()
+        assert win._disk_banner.isHidden() is True
+
+        free["value"] = 2 * (1 << 30)  # over the high-water mark: re-armed
+        win._poll_status()
+        assert win._disk_banner.isHidden() is True
+
+        free["value"] = int(1.2 * (1 << 30))  # dead band on the way down: stays hidden
+        win._poll_status()
+        assert win._disk_banner.isHidden() is True
+
+        free["value"] = (1 << 30) // 2  # below warn again -> shows again
+        win._poll_status()
+        assert win._disk_banner.isHidden() is False
+    finally:
+        server.stop()
+
+
+def test_disk_banner_untouched_when_free_space_unknown(tmp_path: Path) -> None:
+    server = _stats_server(clips_free_bytes="")
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        win._disk_banner.setVisible(True)
+        win._poll_status()
+        assert win._disk_banner.isHidden() is False  # no data -> left as-is
+    finally:
+        server.stop()
+
+
 def test_toggle_pause_sends_pause_when_recording(tmp_path: Path) -> None:
     server = IpcServer(port=0)
     received = []
-    server.register("STATUS", lambda arg: "RECORDING")
     server.register("PAUSE", lambda arg: received.append("PAUSE") or "paused")
     server.start()
     try:
         win = _make_window(tmp_path, ipc_port=server.port)
+        win._capture_state = "RECORDING"
         win._on_toggle_pause()
-        assert received == ["PAUSE"]
+        assert _wait_for(lambda: received == ["PAUSE"])
     finally:
         server.stop()
 
@@ -209,13 +582,13 @@ def test_toggle_pause_sends_pause_when_recording(tmp_path: Path) -> None:
 def test_toggle_pause_sends_resume_when_paused(tmp_path: Path) -> None:
     server = IpcServer(port=0)
     received = []
-    server.register("STATUS", lambda arg: "PAUSED")
     server.register("RESUME", lambda arg: received.append("RESUME") or "resumed")
     server.start()
     try:
         win = _make_window(tmp_path, ipc_port=server.port)
+        win._capture_state = "PAUSED"
         win._on_toggle_pause()
-        assert received == ["RESUME"]
+        assert _wait_for(lambda: received == ["RESUME"])
     finally:
         server.stop()
 
@@ -223,13 +596,29 @@ def test_toggle_pause_sends_resume_when_paused(tmp_path: Path) -> None:
 def test_toggle_pause_sends_resume_when_crashed(tmp_path: Path) -> None:
     server = IpcServer(port=0)
     received = []
-    server.register("STATUS", lambda arg: "CRASHED")
     server.register("RESUME", lambda arg: received.append("RESUME") or "resumed")
     server.start()
     try:
         win = _make_window(tmp_path, ipc_port=server.port)
+        win._capture_state = "CRASHED"
         win._on_toggle_pause()
-        assert received == ["RESUME"]
+        assert _wait_for(lambda: received == ["RESUME"])
+    finally:
+        server.stop()
+
+
+def test_pause_button_click_uses_the_polled_state(tmp_path: Path) -> None:
+    received = []
+    server = IpcServer(port=0)
+    server.register("STATS", lambda arg: _stats_payload("PAUSED"))
+    server.register("RESUME", lambda arg: received.append("RESUME") or "resumed")
+    server.start()
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        win._poll_status()
+        assert win._pause_button.text() == "Resume capture"
+        win._pause_button.click()
+        assert _wait_for(lambda: received == ["RESUME"])
     finally:
         server.stop()
 
@@ -277,20 +666,21 @@ def test_save_now_button_sends_save_on_worker_with_raised_timeout(tmp_path: Path
     assert sent[0]["thread"] is not threading.current_thread()  # not the GUI thread
 
 
-def test_save_30s_button_sends_trim_argument(tmp_path: Path, monkeypatch) -> None:
-    sent = []
-
-    def fake_send(command, arg=None, host="127.0.0.1", port=51525, timeout=5.0):
-        sent.append((command, arg))
-        return "OK C:/clips/clip-1.mp4"
-
-    monkeypatch.setattr(main_window_qt.ipc_client, "send_command", fake_send)
+def test_home_actions_row_has_only_pause_and_save_now(tmp_path: Path) -> None:
+    # The 15/30/60s quick-saves were decluttered off Home (they stay on the
+    # tray menu, the quick-save hotkeys, and `clipersal-trigger save --trim N`).
+    from PySide6.QtWidgets import QPushButton
 
     win = _make_window(tmp_path)
-    win._save_30s_button.click()
-
-    assert _wait_for(lambda: len(sent) == 1)
-    assert sent == [("SAVE", "30")]
+    assert not hasattr(win, "_save_15s_button")
+    assert not hasattr(win, "_save_30s_button")
+    assert not hasattr(win, "_save_60s_button")
+    home_button_texts = [b.text() for b in win._tabs["home"].findChildren(QPushButton)]
+    assert "Save last 15s" not in home_button_texts
+    assert "Save last 30s" not in home_button_texts
+    assert "Save last 60s" not in home_button_texts
+    assert win._pause_button.text() == "Pause capture"
+    assert win._save_now_button.objectName() == "primary"
 
 
 def test_failed_save_is_shown_in_status_meta(tmp_path: Path, monkeypatch) -> None:
@@ -311,17 +701,40 @@ def test_failed_save_is_shown_in_status_meta(tmp_path: Path, monkeypatch) -> Non
     text = win._status_meta_label.text()
     assert "Save failed" in text
     assert "Not enough has been captured" in text
+    # The failure takes over the whole meta line, prefix included.
+    assert win._status_meta_prefix_label.text() == ""
 
 
 def test_save_completed_restores_status_meta_after_failure(tmp_path: Path) -> None:
     win = _make_window(tmp_path)
     default_meta = win._status_meta_label.text()
+    default_prefix = win._status_meta_prefix_label.text()
 
     win.on_save_failed("boom")
     assert "Save failed" in win._status_meta_label.text()
 
     win.on_save_completed()
     assert win._status_meta_label.text() == default_meta
+    assert win._status_meta_prefix_label.text() == default_prefix
+
+
+def test_status_meta_elides_only_the_clips_dir_middle(tmp_path: Path) -> None:
+    # The old single middle-elided label chopped into the buffer text itself
+    # ("60…ight\clips"). Now the "Buffer: Ns ·" prefix is a fixed label and
+    # only the clips_dir label elides -- middle, keeping the path's both ends.
+    from PySide6.QtWidgets import QLabel
+
+    win = _make_window(tmp_path)
+    assert win._status_meta_prefix_label.text() == f"Buffer: {win._config.buffer_seconds}s   ·   "
+    full_path = str(tmp_path / "clips")
+    assert win._status_meta_label.text() == full_path
+
+    win._status_meta_label.resize(60, 20)  # far narrower than the path
+    displayed = QLabel.text(win._status_meta_label)  # the elided on-screen text
+
+    assert displayed != full_path
+    assert "…" in displayed
+    assert win._status_meta_prefix_label.text().startswith("Buffer:")  # never elided
 
 
 # ---- save-completed slot ----------------------------------------------------
@@ -347,7 +760,9 @@ def test_pulse_settles_back_to_recording(tmp_path: Path) -> None:
 def test_refresh_recent_clips_shows_empty_message(tmp_path: Path) -> None:
     win = _make_window(tmp_path)
     assert win._recent_thumb_labels == {}
-    assert win._recent_strip.count() == 3  # sprig accent + "no clips yet" label + stretch
+    assert win._recent_strip.count() == 3  # sprig accent + empty-hint label + stretch
+    hint = win._recent_strip.itemAt(1).widget()
+    assert hint.text() == "no record of your bloom-bloom moments, yet."
 
 
 def test_refresh_recent_clips_lists_clips_newest_first(tmp_path: Path) -> None:
@@ -427,6 +842,143 @@ def test_apply_recent_thumbnail_sets_pixmap(tmp_path: Path) -> None:
     assert not win._recent_thumb_labels[clip_path].pixmap().isNull()
 
 
+class _FakeSignal:
+    """Stand-in for a Qt signal on a fake dialog: connect/emit, nothing else
+    (mirrors test_gallery_window_qt.py's fake-player pattern)."""
+
+    def __init__(self) -> None:
+        self._callbacks = []
+
+    def connect(self, callback) -> None:
+        self._callbacks.append(callback)
+
+    def emit(self, *args) -> None:
+        for callback in self._callbacks:
+            callback(*args)
+
+
+class _FakePlayerDialog:
+    """PlayerDialog replacement: records construction, exposes the two
+    signals the window connects, and never touches QtMultimedia."""
+
+    instances = []
+
+    def __init__(self, clip_path, ffmpeg_path=None, parent=None):
+        self.clip_path = clip_path
+        self.ffmpeg_path = ffmpeg_path
+        self.parent_widget = parent
+        self.trim_exported = _FakeSignal()
+        self.destroyed = _FakeSignal()
+        self.delete_on_close = False
+        self.shown = False
+        _FakePlayerDialog.instances.append(self)
+
+    def setAttribute(self, attribute) -> None:
+        from PySide6.QtCore import Qt
+
+        if attribute == Qt.WidgetAttribute.WA_DeleteOnClose:
+            self.delete_on_close = True
+
+    def show(self) -> None:
+        self.shown = True
+
+
+@pytest.fixture()
+def fake_player(monkeypatch):
+    _FakePlayerDialog.instances = []
+    monkeypatch.setattr(main_window_qt.player_qt, "PlayerDialog", _FakePlayerDialog)
+    monkeypatch.setattr(main_window_qt.player_qt, "multimedia_available", lambda: True)
+    return _FakePlayerDialog
+
+
+def _recent_cards(win: MainWindow) -> list:
+    return [
+        win._recent_strip.itemAt(i).widget()
+        for i in range(win._recent_strip.count())
+        if isinstance(win._recent_strip.itemAt(i).widget(), main_window_qt._ClickableCard)
+    ]
+
+
+def test_recent_card_click_opens_the_in_app_player(tmp_path: Path, fake_player) -> None:
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True)
+    clip_path = clips_dir / "clip.mp4"
+    clip_path.write_bytes(b"x")
+
+    win = _make_window(tmp_path)
+    cards = _recent_cards(win)
+    assert len(cards) == 1
+    cards[0]._on_click()
+
+    assert len(fake_player.instances) == 1
+    dialog = fake_player.instances[0]
+    assert dialog.clip_path == clip_path
+    assert dialog.delete_on_close is True
+    assert dialog.shown is True
+    # Kept referenced so the GC can't collect the modal-less dialog.
+    assert win._players == [dialog]
+
+
+def test_recent_card_click_falls_back_to_open_file_without_multimedia(tmp_path: Path, monkeypatch) -> None:
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True)
+    clip_path = clips_dir / "clip.mp4"
+    clip_path.write_bytes(b"x")
+    opened = []
+    monkeypatch.setattr(main_window_qt.player_qt, "multimedia_available", lambda: False)
+    monkeypatch.setattr(main_window_qt.player_qt, "open_file", lambda path: opened.append(path))
+
+    win = _make_window(tmp_path)
+    _recent_cards(win)[0]._on_click()
+
+    assert opened == [clip_path]
+    assert win._players == []
+
+
+def test_home_player_trim_export_refreshes_the_recent_strip(tmp_path: Path, fake_player) -> None:
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True)
+    clip_path = clips_dir / "clip.mp4"
+    clip_path.write_bytes(b"x")
+
+    win = _make_window(tmp_path)
+    _recent_cards(win)[0]._on_click()
+
+    trimmed = clips_dir / "clip-trimmed.mp4"
+    trimmed.write_bytes(b"x")
+    fake_player.instances[0].trim_exported.emit(trimmed)
+
+    assert trimmed in win._recent_thumb_labels
+
+
+def test_recent_refresh_button_rereads_the_clips_dir(tmp_path: Path) -> None:
+    win = _make_window(tmp_path)
+    assert win._recent_thumb_labels == {}
+
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    clip_path = clips_dir / "clip.mp4"
+    clip_path.write_bytes(b"x")
+    win._recent_refresh_button.click()
+
+    assert clip_path in win._recent_thumb_labels
+
+
+def test_gallery_clips_changed_refreshes_the_recent_strip(tmp_path: Path) -> None:
+    # Wired in MainWindow.__init__: a gallery-side edit (delete, rename, a
+    # trim/compress export) must show up on Home without waiting for a save.
+    win = _make_window(tmp_path)
+    assert win._recent_thumb_labels == {}
+
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    clip_path = clips_dir / "clip.mp4"
+    clip_path.write_bytes(b"x")
+    win._tabs["clips"].clips_changed.emit()
+
+    assert clip_path in win._recent_thumb_labels
+
+
 # ---- update banner -------------------------------------------------------------
 
 
@@ -478,7 +1030,269 @@ def test_dismiss_update_without_a_pending_version_does_not_touch_cache(tmp_path:
     monkeypatch.setattr(main_window_qt.update_check, "load_cache", lambda: called.append(True))
 
     win = _make_window(tmp_path)
+    called.clear()  # building the window already read the cache once -- the Settings tab's "last checked" label
+
     win._on_dismiss_update()
 
     assert win._update_banner.isHidden() is True
     assert called == []
+
+
+# ---- quick-save buttons ------------------------------------------------------
+# The Home 15/30/60s buttons are gone; quick-saves stay available via the
+# Ctrl+Shift+S shortcut (covered below), the tray menu, and the trigger CLI.
+
+
+# ---- keyboard shortcuts ------------------------------------------------------
+
+
+def _shortcut_by_key(win: MainWindow) -> dict:
+    from PySide6.QtGui import QShortcut
+
+    return {shortcut.key().toString(): shortcut for shortcut in win.findChildren(QShortcut)}
+
+
+def test_all_shortcuts_exist_with_window_context(tmp_path: Path) -> None:
+    from PySide6.QtCore import Qt
+
+    win = _make_window(tmp_path)
+    shortcuts = _shortcut_by_key(win)
+    assert set(shortcuts) == {"Ctrl+S", "Ctrl+Shift+S", "Ctrl+P", "F5", "Ctrl+,", "Ctrl+1", "Ctrl+2", "Ctrl+3", "Ctrl+4"}
+    assert all(s.context() == Qt.ShortcutContext.WindowShortcut for s in shortcuts.values())
+
+
+def test_tab_shortcuts_switch_tabs(tmp_path: Path) -> None:
+    win = _make_window(tmp_path)
+    shortcuts = _shortcut_by_key(win)
+    shortcuts["Ctrl+2"].activated.emit()
+    assert win._active_tab == "clips"
+    shortcuts["Ctrl+3"].activated.emit()
+    assert win._active_tab == "settings"
+    shortcuts["Ctrl+4"].activated.emit()
+    assert win._active_tab == "logs"
+    shortcuts["Ctrl+1"].activated.emit()
+    assert win._active_tab == "home"
+    shortcuts["Ctrl+,"].activated.emit()
+    assert win._active_tab == "settings"
+
+
+def test_ctrl_s_shortcut_sends_save_via_the_worker_path(tmp_path: Path, monkeypatch) -> None:
+    sent = []
+    monkeypatch.setattr(
+        main_window_qt.ipc_client,
+        "send_command",
+        lambda command, arg=None, **kwargs: sent.append((command, arg)) or "OK C:/clips/clip-1.mp4",
+    )
+
+    win = _make_window(tmp_path)
+    _shortcut_by_key(win)["Ctrl+S"].activated.emit()
+    assert _wait_for(lambda: sent == [("SAVE", None)])
+
+    _shortcut_by_key(win)["Ctrl+Shift+S"].activated.emit()
+    assert _wait_for(lambda: sent == [("SAVE", None), ("SAVE", "30")])
+
+
+def test_ctrl_p_shortcut_toggles_pause(tmp_path: Path) -> None:
+    received = []
+    server = IpcServer(port=0)
+    server.register("PAUSE", lambda arg: received.append("PAUSE") or "paused")
+    server.start()
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        win._capture_state = "RECORDING"
+        _shortcut_by_key(win)["Ctrl+P"].activated.emit()
+        assert _wait_for(lambda: received == ["PAUSE"])
+    finally:
+        server.stop()
+
+
+def test_f5_shortcut_refreshes_the_gallery(tmp_path: Path, monkeypatch) -> None:
+    win = _make_window(tmp_path)
+    called = []
+    monkeypatch.setattr(win._tabs["clips"], "refresh", lambda: called.append(True))
+    _shortcut_by_key(win)["F5"].activated.emit()
+    assert called == [True]
+
+
+# ---- logs tab: search / level filter / copy ----------------------------------
+
+
+def _write_log(log_path: Path) -> None:
+    log_path.write_text(
+        "2026-07-22 01:00:00,000 INFO clipersal.cli: capture started\n"
+        "2026-07-22 01:00:01,000 WARNING clipersal.capture: ffmpeg restarted\n"
+        "2026-07-22 01:00:02,000 INFO clipersal.cli: save completed\n"
+        "2026-07-22 01:00:03,000 ERROR clipersal.concat: remux failed\n",
+        encoding="utf-8",
+    )
+
+
+def test_logs_tab_search_filters_case_insensitively(tmp_path: Path) -> None:
+    _write_log(tmp_path / "log.txt")
+    win = _make_window(tmp_path)
+    win._log_search_edit.setText("FFMPEG")  # textChanged triggers the refresh
+    content = win._log_textbox.toPlainText()
+    assert "ffmpeg restarted" in content
+    assert "capture started" not in content
+
+
+def test_logs_tab_level_filter_matches_the_level_token(tmp_path: Path) -> None:
+    _write_log(tmp_path / "log.txt")
+    win = _make_window(tmp_path)
+    win._log_level_combo.setCurrentText("ERROR")
+    content = win._log_textbox.toPlainText()
+    assert "remux failed" in content
+    assert "capture started" not in content
+    assert "ffmpeg restarted" not in content
+
+
+def test_logs_tab_search_and_level_combine(tmp_path: Path) -> None:
+    _write_log(tmp_path / "log.txt")
+    win = _make_window(tmp_path)
+    win._log_search_edit.setText("save")
+    win._log_level_combo.setCurrentText("INFO")
+    content = win._log_textbox.toPlainText()
+    assert "save completed" in content
+    assert "capture started" not in content
+
+
+def test_logs_tab_shows_placeholder_when_nothing_matches(tmp_path: Path) -> None:
+    _write_log(tmp_path / "log.txt")
+    win = _make_window(tmp_path)
+    win._log_search_edit.setText("no-such-text-anywhere")
+    assert win._log_textbox.toPlainText() == "(no log lines match)"
+
+
+def test_logs_tab_missing_log_file_message(tmp_path: Path) -> None:
+    win = _make_window(tmp_path)  # no log.txt written
+    win._refresh_log_tail()
+    assert "log file not found" in win._log_textbox.toPlainText()
+
+
+def test_logs_tab_copy_puts_the_filtered_text_on_the_clipboard(tmp_path: Path) -> None:
+    _write_log(tmp_path / "log.txt")
+    win = _make_window(tmp_path)
+    win._log_level_combo.setCurrentText("WARNING")
+    win._on_copy_logs()
+    from PySide6.QtGui import QGuiApplication
+
+    assert QGuiApplication.clipboard().text() == win._log_textbox.toPlainText()
+    assert "ffmpeg restarted" in QGuiApplication.clipboard().text()
+
+
+def test_logs_tab_autoscroll_off_keeps_scroll_position(tmp_path: Path) -> None:
+    _write_log(tmp_path / "log.txt")
+    win = _make_window(tmp_path)
+    win._log_autoscroll_switch.setChecked(False)
+    scrollbar = win._log_textbox.verticalScrollBar()
+    scrollbar.setValue(0)
+    win._refresh_log_tail()
+    assert scrollbar.value() == 0
+
+
+# ---- logs tab: export diagnostics --------------------------------------------
+
+
+def test_export_diagnostics_writes_zip_and_reports_success(tmp_path: Path, monkeypatch) -> None:
+    from PySide6.QtWidgets import QFileDialog
+
+    (tmp_path / "log.txt").write_text("log line\n", encoding="utf-8")
+    target = tmp_path / "diag.zip"
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(target), "Zip files (*.zip)"))
+    )
+
+    win = _make_window(tmp_path, diagnostics_facts_provider=lambda: {"os": "test-os"})
+    win._on_export_diagnostics()
+
+    assert target.exists()
+    assert win._diagnostics_status_label.property("state") == "success"
+    assert str(target) in win._diagnostics_status_label.text()
+
+
+def test_export_diagnostics_reports_failure(tmp_path: Path, monkeypatch) -> None:
+    from PySide6.QtWidgets import QFileDialog
+
+    (tmp_path / "log.txt").write_text("log line\n", encoding="utf-8")
+    # A directory where the zip should go -> export_diagnostics_zip fails.
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(tmp_path), "Zip files (*.zip)"))
+    )
+
+    win = _make_window(tmp_path, diagnostics_facts_provider=lambda: {})
+    win._on_export_diagnostics()
+
+    assert win._diagnostics_status_label.property("state") == "error"
+    assert "Export failed" in win._diagnostics_status_label.text()
+
+
+def test_export_diagnostics_cancelled_dialog_does_nothing(tmp_path: Path, monkeypatch) -> None:
+    from PySide6.QtWidgets import QFileDialog
+
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: ("", "")))
+
+    win = _make_window(tmp_path)
+    win._on_export_diagnostics()
+
+    assert win._diagnostics_status_label.text() == ""
+
+
+
+def test_export_diagnostics_survives_a_failing_facts_provider(tmp_path: Path, monkeypatch) -> None:
+    from PySide6.QtWidgets import QFileDialog
+
+    (tmp_path / "log.txt").write_text("log line\n", encoding="utf-8")
+    target = tmp_path / "diag.zip"
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (str(target), "Zip files (*.zip)"))
+    )
+
+    def boom():
+        raise RuntimeError("facts unavailable (fake)")
+
+    win = _make_window(tmp_path, diagnostics_facts_provider=boom)
+    win._on_export_diagnostics()  # must not raise -- facts are best-effort
+
+    assert target.exists()
+    assert win._diagnostics_status_label.property("state") == "success"
+
+
+# ---- sidebar footer: Lablooms identity + Support ------------------------------
+
+
+def test_sidebar_lablooms_row_has_brand_mark_and_label(tmp_path: Path) -> None:
+    from PySide6.QtWidgets import QLabel
+
+    win = _make_window(tmp_path)
+    marks = win._lablooms_row.findChildren(main_window_qt.brand.BrandMark)
+    assert len(marks) == 1
+    assert marks[0].width() == 16
+    labels = [label for label in win._lablooms_row.findChildren(QLabel) if label.text() == "Lablooms"]
+    assert len(labels) == 1
+
+
+def test_sidebar_lablooms_row_click_opens_the_lablooms_url(tmp_path: Path, monkeypatch) -> None:
+    from PySide6.QtGui import QDesktopServices
+
+    opened = []
+    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(url.toString()))
+
+    win = _make_window(tmp_path)
+    win._lablooms_row._on_click()
+
+    assert opened == [main_window_qt.brand.LABLOOMS_URL]
+
+
+def test_sidebar_support_button_opens_the_support_url(tmp_path: Path, monkeypatch) -> None:
+    from PySide6.QtGui import QDesktopServices
+
+    opened = []
+    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(url.toString()))
+
+    win = _make_window(tmp_path)
+    assert win._support_button.objectName() == "supportButton"
+    assert "♥" in win._support_button.text()
+
+    win._support_button.click()
+
+    assert opened == [main_window_qt.brand.SUPPORT_URL]

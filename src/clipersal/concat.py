@@ -24,8 +24,12 @@ from clipersal.subprocess_utils import NO_WINDOW_KWARGS
 log = logging.getLogger(__name__)
 
 _CONCAT_TIMEOUT = 60  # seconds; generous since this is a fast stream copy
-_TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{(date|time|datetime)\}")
+_TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{(date|time|datetime|window)\}")
 _INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*]')
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
+# A window title can run to hundreds of characters; capped so the {window}
+# placeholder can't blow past filename length limits on its own.
+_WINDOW_TITLE_MAX_CHARS = 40
 # Windows reserves these device basenames in EVERY folder, case-insensitively
 # and ignoring any extension: "NUL.mp4" opens the null device, not a file. A
 # template rendering to one of these would make ffmpeg "succeed" while writing
@@ -47,20 +51,39 @@ class TrimRangeError(RuntimeError):
     pass
 
 
-def render_filename(template: str, now: datetime | None = None) -> str:
+def _sanitize_window_title(window_title: str | None) -> str:
+    """The {window} placeholder's value: the title with invalid filename
+    characters replaced by "_", whitespace runs collapsed to single spaces,
+    stripped, and capped at _WINDOW_TITLE_MAX_CHARS. Case is preserved
+    ("Valorant", not "valorant"). None or empty (Wayland, an unreadable
+    foreground window) renders as "clip", so "{window}-{date}-{time}"
+    degrades to exactly the pre-{window} default name.
+    """
+    if not window_title:
+        return "clip"
+    title = _INVALID_FILENAME_CHARS_RE.sub("_", window_title)
+    title = _WHITESPACE_RUN_RE.sub(" ", title).strip()
+    title = title[:_WINDOW_TITLE_MAX_CHARS].strip()
+    return title or "clip"
+
+
+def render_filename(template: str, now: datetime | None = None, window_title: str | None = None) -> str:
     """Render a clip filename (without extension) from a template like
-    "clip-{date}-{time}" -- the default reproduces the original hardcoded
-    "clip-YYYYMMDD-HHMMSS" name exactly, so existing configs/scripts see no
-    behavior change. Falls back to "clip" for a template that renders empty,
-    to nothing but dots/invalid characters, or to a Windows reserved device
-    name, rather than producing an unusable filename from a bad hand-edited
-    config.
+    "{window}-{date}-{time}" (the default). Placeholders: {date}, {time},
+    {datetime}, and {window} -- the active window's title, sanitized by
+    _sanitize_window_title ("Valorant-20260717-011351"); with no title
+    (Wayland, an unreadable foreground window) {window} renders as "clip",
+    reproducing the original hardcoded "clip-YYYYMMDD-HHMMSS" name. Falls
+    back to "clip" for a template that renders empty, to nothing but
+    dots/invalid characters, or to a Windows reserved device name, rather
+    than producing an unusable filename from a bad hand-edited config.
     """
     now = now or datetime.now()
     values = {
         "date": now.strftime("%Y%m%d"),
         "time": now.strftime("%H%M%S"),
         "datetime": now.strftime("%Y%m%d-%H%M%S"),
+        "window": _sanitize_window_title(window_title),
     }
     name = _TEMPLATE_PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], template)
     name = _INVALID_FILENAME_CHARS_RE.sub("_", name).strip().strip(".")
@@ -119,10 +142,13 @@ def save_clip(
     clips_dir: Path,
     filename_template: str = "clip-{date}-{time}",
     trim_seconds: float | None = None,
+    window_title: str | None = None,
 ) -> Path:
     """Concat currently-retained segments into a clip in clips_dir, named per
     filename_template. trim_seconds, if given, saves only the last N seconds
-    of the buffer instead of the whole thing.
+    of the buffer instead of the whole thing. window_title feeds the
+    template's {window} placeholder (None = the placeholder's "clip"
+    fallback -- exactly the pre-{window} behavior for other callers).
 
     Raises EmptyBufferError if not enough has been captured yet (within the
     trim window, if one was given), or ConcatFailedError if ffmpeg's remux
@@ -148,7 +174,7 @@ def save_clip(
             "Not enough has been captured yet to save a clip -- wait a few seconds and try again."
         )
 
-    output_path = _unique_output_path(clips_dir, render_filename(filename_template))
+    output_path = _unique_output_path(clips_dir, render_filename(filename_template, window_title=window_title))
     list_file = buffer_dir / f".concat-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.txt"
 
     with open(list_file, "w", encoding="utf-8") as f:
@@ -274,7 +300,12 @@ def trim_clip(
     return output_path
 
 
-def enforce_clip_retention(clips_dir: Path, retention_days: int, now: float | None = None) -> list[Path]:
+def enforce_clip_retention(
+    clips_dir: Path,
+    retention_days: int,
+    now: float | None = None,
+    protected: set[str] | None = None,
+) -> list[Path]:
     """Delete saved clips older than retention_days. retention_days <= 0
     disables this entirely (the default -- clips are kept forever, so a
     fresh install never surprises anyone by deleting something).
@@ -283,12 +314,20 @@ def enforce_clip_retention(clips_dir: Path, retention_days: int, now: float | No
     itself wrote -- there's no manifest tracking that, so this assumes
     clips_dir is a dedicated folder for saved clips, the same assumption
     the Settings window's folder picker already makes.
+
+    protected is a set of clip filenames (full names, not stems -- the
+    exact keys clip_metadata.py uses) that must survive the sweep no
+    matter their age; cli.py passes the current favorites so starring a
+    clip means "keep this", never "delete it in N days". None (the
+    default) is exactly the pre-favorites behavior.
     """
     if retention_days <= 0:
         return []
     cutoff = (now if now is not None else time.time()) - retention_days * 86400
     deleted = []
     for path in sorted(clips_dir.glob("*.mp4")):
+        if protected and path.name in protected:
+            continue
         try:
             if path.stat().st_mtime < cutoff:
                 path.unlink()
@@ -299,4 +338,73 @@ def enforce_clip_retention(clips_dir: Path, retention_days: int, now: float | No
             log.warning("Could not delete old clip %s: %s", path, exc)
     if deleted:
         log.info("Clip retention: deleted %d clip(s) older than %d day(s)", len(deleted), retention_days)
+    return deleted
+
+
+def enforce_size_cap(
+    clips_dir: Path,
+    max_bytes: int,
+    protected: set[str] | None = None,
+) -> list[Path]:
+    """Delete the oldest saved clips until the clips folder's total .mp4
+    size fits within max_bytes. max_bytes <= 0 disables this entirely (the
+    default -- unlimited, same opt-in philosophy as enforce_clip_retention:
+    a fresh install never deletes anything).
+
+    protected is a set of clip filenames (full names, not stems -- the same
+    exact-match keys enforce_clip_retention uses) that must survive no
+    matter their size; cli.py passes the current favorites plus, on the save
+    path, the clip just saved -- a save must never delete the clip it just
+    produced. Deletion stops when only protected clips remain, even if the
+    folder is still over the cap.
+
+    Same dedicated-folder assumption and vanish-tolerance as the retention
+    sweep (a clip deleted externally mid-sweep is skipped, not an error);
+    never raises.
+    """
+    if max_bytes <= 0:
+        return []
+    protected = protected or set()
+
+    # Stat everything once, up front: the oldest-first deletion order below
+    # is by mtime, and a clip vanishing between the glob and its stat (the
+    # retention sweep, the user cleaning up by hand) is skipped rather than
+    # fatal.
+    clips: list[tuple[float, Path, int]] = []
+    total_bytes = 0
+    try:
+        candidates = sorted(clips_dir.glob("*.mp4"))
+    except OSError as exc:
+        log.warning("Could not list clips folder %s for the size-cap sweep: %s", clips_dir, exc)
+        return []
+    for path in candidates:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning("Could not stat clip %s for the size-cap sweep: %s", path, exc)
+        else:
+            clips.append((stat.st_mtime, path, stat.st_size))
+            total_bytes += stat.st_size
+
+    deleted = []
+    for _mtime, path, size in sorted(clips):
+        if total_bytes <= max_bytes:
+            break
+        if path.name in protected:
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            # Gone already -- its bytes no longer count against the cap even
+            # though it isn't ours to report as deleted.
+            total_bytes -= size
+        except OSError as exc:
+            log.warning("Could not delete clip %s for the size cap: %s", path, exc)
+        else:
+            total_bytes -= size
+            deleted.append(path)
+    if deleted:
+        log.info("Clips size cap: deleted %d clip(s) to fit %.1f GB", len(deleted), max_bytes / (1 << 30))
     return deleted

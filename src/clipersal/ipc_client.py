@@ -3,6 +3,13 @@
 Used by the hotkey listener's callback and by the `clipersal-trigger`
 CLI script -- both just send a command line and print/act on the response,
 with no knowledge of capture/concat internals.
+
+Also home to the client-side parser for the STATS command's payload: one
+line of pipe-separated key=value pairs, e.g.
+"state=RECORDING|uptime=123.4|segments=27|buffer_bytes=12345678|encoder=h264_nvenc|buffer_seconds=60|clips_free_bytes=123456789|clips_count=5".
+The server degrades individual fields to empty strings on failure rather
+than failing the whole command, so a missing or empty value is normal and
+must never raise here.
 """
 
 from __future__ import annotations
@@ -55,3 +62,21 @@ def send_command(
     if not response:
         raise IpcClientError("Empty response from clipersal's IPC server")
     return response
+
+
+def parse_stats_payload(line: str) -> dict[str, str]:
+    """Parse a STATS response into a {key: value} dict (see the format in the
+    module docstring above). Accepts either a full send_command() response
+    ("OK state=RECORDING|uptime=...") or the bare payload, so GUI code can
+    feed the response straight in. Empty values stay empty strings; parts
+    without a "=" are ignored.
+    """
+    payload = line.strip()
+    if payload.startswith("OK "):
+        payload = payload[len("OK ") :]
+    fields: dict[str, str] = {}
+    for part in payload.split("|"):
+        key, sep, value = part.partition("=")
+        if sep and key:
+            fields[key] = value
+    return fields

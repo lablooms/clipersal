@@ -8,14 +8,15 @@ pytest.importorskip("PySide6")
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QFileDialog
+from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QMessageBox, QPushButton
 
-from clipersal import settings_window_qt
-from clipersal.config import Config
+from clipersal import __version__, settings_window_qt
+from clipersal.config import Config, _default_clips_dir
 from clipersal.ffmpeg_utils import AudioSource
+from clipersal.hotkey import DEFAULT_COMBO
 from clipersal.monitors import MonitorInfo
 from clipersal.platform_detect import OS, LinuxSessionType
-from clipersal.settings_window_qt import SettingsFrame, bitrate_string_to_mbps
+from clipersal.settings_window_qt import SettingsFrame, bitrate_string_to_mbps, default_settings_payload
 from clipersal.window_capture import WindowInfo
 
 
@@ -49,12 +50,44 @@ def _make_config(tmp_path: Path, **overrides) -> Config:
     return Config(**kwargs)
 
 
-def _build(tmp_path: Path, on_apply=None, **config_overrides) -> SettingsFrame:
+def _build(tmp_path: Path, on_apply=None, on_update_found=None, **config_overrides) -> SettingsFrame:
     config = _make_config(tmp_path, **config_overrides)
     return SettingsFrame(
         config, ipc_port=51525, save_events=None, current_encoder="libx264",
         on_apply=on_apply or (lambda values: None), ffmpeg_path="ffmpeg",
+        on_update_found=on_update_found,
     )
+
+
+def _apply(frame: SettingsFrame) -> None:
+    """Fire the autosave debounce immediately. Payload/validation tests don't
+    care about the 500 ms wait, only about what the fire produces."""
+    frame._apply_timer.stop()
+    frame._apply_now()
+
+
+def _flush_autosave(frame: SettingsFrame) -> None:
+    """Pretend the debounce elapsed: demand that a change actually scheduled
+    an apply, then fire it."""
+    assert frame._apply_timer.isActive(), "expected a scheduled autosave"
+    frame._apply_timer.stop()
+    frame._apply_now()
+
+
+def _wait_for(predicate, timeout: float = 5.0) -> bool:
+    """Wait for an async (worker-thread) condition, e.g. the check-now
+    worker's answer arriving via the queued check_now_responded signal.
+    Pumps sendPostedEvents(), NOT processEvents() -- see test_main_window_qt.py's
+    _wait_for for why."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        QApplication.sendPostedEvents()
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
 
 
 # ---- pure bitrate parsing (identical to settings_window.py's own tests) ---
@@ -133,7 +166,7 @@ def test_out_of_range_config_values_show_the_same_clamped_number_everywhere(tmp_
 def test_save_persists_the_clamped_displayed_value(tmp_path: Path) -> None:
     captured = {}
     frame = _build(tmp_path, buffer_seconds=600, on_apply=lambda values: captured.update(values) or None)
-    frame._on_save()
+    _apply(frame)
     assert captured["buffer_seconds"] == 300
 
 
@@ -224,7 +257,7 @@ def test_save_payload_collects_both_volumes(tmp_path: Path, monkeypatch) -> None
     frame = _build(tmp_path, mic_device="Mic A", on_apply=lambda values: captured.update(values) or None)
     frame.desktop_volume_slider.setValue(150)
     frame.mic_volume_slider.setValue(50)
-    frame._on_save()
+    _apply(frame)
     assert captured["desktop_volume"] == 150
     assert captured["mic_volume"] == 50
 
@@ -325,9 +358,12 @@ def test_toggling_autodetect_off_enables_encoder_picker(tmp_path: Path) -> None:
 def test_browse_updates_clips_dir_when_a_folder_is_chosen(tmp_path: Path, monkeypatch) -> None:
     chosen_dir = str(tmp_path / "new_clips")
     monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: chosen_dir))
-    frame = _build(tmp_path)
+    captured = {}
+    frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None)
     frame._browse_clips_dir()
     assert frame.clips_dir_edit.text() == chosen_dir
+    _flush_autosave(frame)  # a confirmed pick autosaves like any other edit
+    assert captured["clips_dir"] == chosen_dir
 
 
 def test_browse_leaves_clips_dir_unchanged_when_dialog_cancelled(tmp_path: Path, monkeypatch) -> None:
@@ -336,54 +372,151 @@ def test_browse_leaves_clips_dir_unchanged_when_dialog_cancelled(tmp_path: Path,
     original = frame.clips_dir_edit.text()
     frame._browse_clips_dir()
     assert frame.clips_dir_edit.text() == original
+    assert frame._apply_timer.isActive() is False  # a cancelled dialog schedules nothing
 
 
-# ---- save validation and payload --------------------------------------------
+# ---- apply validation and payload --------------------------------------------
 
 
-def test_save_rejects_empty_hotkey(tmp_path: Path) -> None:
-    frame = _build(tmp_path)
+def test_apply_rejects_empty_hotkey(tmp_path: Path) -> None:
+    applied = []
+    frame = _build(tmp_path, on_apply=lambda values: applied.append(values) or None)
     frame.hotkey_field.entry.setText("")
-    frame._on_save()
+    _apply(frame)
+    assert applied == []  # a guard rejection never reaches on_apply
     assert frame.status_label.text() == "Hotkey cannot be empty."
     assert frame.status_label.property("state") == "error"
+    # ...and the field keeps its text -- the user may still be mid-edit.
+    assert frame.hotkey_field.combo() == ""
 
 
-def test_save_rejects_empty_clips_dir(tmp_path: Path) -> None:
-    frame = _build(tmp_path)
+def test_apply_rejects_empty_clips_dir(tmp_path: Path) -> None:
+    applied = []
+    frame = _build(tmp_path, on_apply=lambda values: applied.append(values) or None)
     frame.clips_dir_edit.setReadOnly(False)
     frame.clips_dir_edit.setText("   ")
-    frame._on_save()
+    _apply(frame)
+    assert applied == []
     assert frame.status_label.text() == "Clips folder cannot be empty."
 
 
-def test_save_rejects_empty_filename_template(tmp_path: Path) -> None:
-    frame = _build(tmp_path)
+def test_apply_rejects_empty_filename_template(tmp_path: Path) -> None:
+    applied = []
+    frame = _build(tmp_path, on_apply=lambda values: applied.append(values) or None)
     frame.filename_template_edit.setText("")
-    frame._on_save()
+    _apply(frame)
+    assert applied == []
     assert frame.status_label.text() == "Filename template cannot be empty."
+    assert frame.filename_template_edit.text() == ""  # left as-is, mid-edit
 
 
-def test_save_success_shows_confirmation_and_schedules_clear(tmp_path: Path) -> None:
+def test_apply_success_shows_confirmation_and_schedules_clear(tmp_path: Path) -> None:
     frame = _build(tmp_path)
-    frame._on_save()
-    assert frame.status_label.text() == "Settings saved."
+    _apply(frame)
+    assert frame.status_label.text() == "Saved ✓"
     assert frame.status_label.property("state") == "success"
     assert frame._status_clear_timer.isActive()
 
 
-def test_save_shows_error_returned_by_on_apply(tmp_path: Path) -> None:
+def test_apply_shows_error_returned_by_on_apply(tmp_path: Path) -> None:
     frame = _build(tmp_path, on_apply=lambda values: "could not restart capture")
-    frame._on_save()
+    _apply(frame)
     assert frame.status_label.text() == "could not restart capture"
     assert frame.status_label.property("state") == "error"
+
+
+# ---- autosave: footer, scheduling, debounce ------------------------------------
+
+
+def test_footer_has_no_save_button_and_shows_the_autosave_hint(tmp_path: Path) -> None:
+    frame = _build(tmp_path)
+    button_texts = [button.text() for button in frame.findChildren(QPushButton)]
+    assert "Save" not in button_texts
+    hints = [label for label in frame.findChildren(QLabel) if label.text() == "Changes save automatically."]
+    assert len(hints) == 1
+    assert hints[0].objectName() == "hint"
+
+
+def test_construction_never_applies(tmp_path: Path) -> None:
+    applied = []
+    frame = _build(tmp_path, on_apply=lambda values: applied.append(values) or None)
+    assert applied == []
+    assert frame._apply_timer.isActive() is False
+
+
+def test_rapid_changes_across_fields_coalesce_into_one_debounced_apply(tmp_path: Path) -> None:
+    applied = []
+    frame = _build(tmp_path, on_apply=lambda values: applied.append(dict(values)) or None)
+
+    frame.framerate_combo.setCurrentIndex(frame.framerate_combo.findData(60))
+    frame.save_sound_switch.click()
+    frame.quick_save_seconds_1_spin.setValue(45)
+
+    assert applied == []  # still debouncing
+    _flush_autosave(frame)
+
+    assert len(applied) == 1  # three edits, ONE apply, full merged payload
+    payload = applied[0]
+    assert payload["framerate"] == 60
+    assert payload["save_sound_enabled"] is True
+    assert payload["quick_save_seconds_1"] == 45
+    assert set(payload) == set(default_settings_payload())
+
+
+def test_combo_change_schedules_an_apply(tmp_path: Path) -> None:
+    frame = _build(tmp_path)
+    frame.resolution_scale_combo.setCurrentIndex(frame.resolution_scale_combo.findData("720p"))
+    assert frame._apply_timer.isActive() is True
+
+
+def test_segmented_control_change_schedules_an_apply(tmp_path: Path) -> None:
+    frame = _build(tmp_path)
+    frame.target_control._buttons["Window"].click()
+    assert frame._apply_timer.isActive() is True
+
+
+def test_toggle_switch_change_schedules_an_apply(tmp_path: Path) -> None:
+    frame = _build(tmp_path)
+    frame.check_for_updates_switch.click()
+    assert frame._apply_timer.isActive() is True
+
+
+def test_slider_schedules_on_release_not_mid_drag(tmp_path: Path) -> None:
+    frame = _build(tmp_path)
+    frame.buffer_slider.setValue(90)  # valueChanged fires -- the mid-drag signal
+    assert frame._apply_timer.isActive() is False
+    frame.buffer_slider.sliderReleased.emit()
+    assert frame._apply_timer.isActive() is True
+
+
+def test_spinbox_change_schedules_an_apply(tmp_path: Path) -> None:
+    frame = _build(tmp_path)
+    frame.quick_save_seconds_2_spin.setValue(120)
+    assert frame._apply_timer.isActive() is True
+
+
+def test_filename_template_applies_on_editing_finished(tmp_path: Path) -> None:
+    applied = []
+    frame = _build(tmp_path, on_apply=lambda values: applied.append(dict(values)) or None)
+    frame.filename_template_edit.setText("clip-{date}")
+    frame.filename_template_edit.editingFinished.emit()
+    _flush_autosave(frame)
+    assert applied[-1]["filename_template"] == "clip-{date}"
+
+
+def test_editing_finished_without_an_actual_change_schedules_nothing(tmp_path: Path) -> None:
+    # A plain focus-out fires editingFinished too -- don't flash "Saved ✓" over nothing.
+    frame = _build(tmp_path)
+    frame.filename_template_edit.editingFinished.emit()
+    frame.hotkey_field.entry.editingFinished.emit()
+    assert frame._apply_timer.isActive() is False
 
 
 def test_save_payload_reflects_custom_preset_bitrate(tmp_path: Path) -> None:
     captured = {}
     frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None)
     frame.bitrate_slider.setValue(12)
-    frame._on_save()
+    _apply(frame)
     assert captured["quality_preset"] == "custom"
     assert captured["video_bitrate"] == "12M"
 
@@ -392,7 +525,7 @@ def test_save_payload_reflects_named_preset_bitrate(tmp_path: Path) -> None:
     captured = {}
     frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None)
     frame.preset_control._buttons["Performance"].click()
-    frame._on_save()
+    _apply(frame)
     assert captured["quality_preset"] == "performance"
     assert captured["video_bitrate"] == "4M"
 
@@ -400,7 +533,7 @@ def test_save_payload_reflects_named_preset_bitrate(tmp_path: Path) -> None:
 def test_save_payload_reflects_auto_encoder(tmp_path: Path) -> None:
     captured = {}
     frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None)
-    frame._on_save()
+    _apply(frame)
     assert captured["encoder_override"] is None
 
 
@@ -409,7 +542,7 @@ def test_save_payload_reflects_manual_encoder_override(tmp_path: Path) -> None:
     frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None)
     frame.autodetect_switch.click()
     frame.encoder_control._buttons["NVENC"].click()
-    frame._on_save()
+    _apply(frame)
     assert captured["encoder_override"] == "h264_nvenc"
 
 
@@ -423,7 +556,7 @@ def test_save_payload_window_mode_uses_selected_title(tmp_path: Path, monkeypatc
     frame.target_control._buttons["Window"].click()
     frame._refresh_windows()
     frame.window_combo.setCurrentText("My App")
-    frame._on_save()
+    _apply(frame)
     assert captured["capture_mode"] == "window"
     assert captured["window_title"] == "My App"
 
@@ -431,7 +564,7 @@ def test_save_payload_window_mode_uses_selected_title(tmp_path: Path, monkeypatc
 def test_save_payload_desktop_mode_keeps_prior_window_title(tmp_path: Path) -> None:
     captured = {}
     frame = _build(tmp_path, window_title="previously-saved-window", on_apply=lambda values: captured.update(values) or None)
-    frame._on_save()
+    _apply(frame)
     assert captured["capture_mode"] == "desktop"
     assert captured["window_title"] == "previously-saved-window"
 
@@ -439,7 +572,7 @@ def test_save_payload_desktop_mode_keeps_prior_window_title(tmp_path: Path) -> N
 def test_save_payload_mic_none_when_no_picker_shown(tmp_path: Path) -> None:
     captured = {}
     frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None)
-    frame._on_save()
+    _apply(frame)
     assert captured["mic_device"] is None
 
 
@@ -448,7 +581,7 @@ def test_save_payload_mic_selected_device(tmp_path: Path, monkeypatch) -> None:
     captured = {}
     frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None)
     frame.mic_combo.setCurrentText("Mic A")
-    frame._on_save()
+    _apply(frame)
     assert captured["mic_device"] == "Mic A"
 
 
@@ -457,7 +590,7 @@ def test_save_payload_launch_on_startup_reflects_switch(tmp_path: Path, monkeypa
     captured = {}
     frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None)
     frame.launch_on_startup_switch.click()
-    frame._on_save()
+    _apply(frame)
     assert captured["launch_on_startup"] is True
 
 
@@ -503,27 +636,35 @@ def test_save_payload_check_for_updates_reflects_switch(tmp_path: Path) -> None:
     captured = {}
     frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None, check_for_updates=False)
     frame.check_for_updates_switch.click()
-    frame._on_save()
+    _apply(frame)
     assert captured["check_for_updates"] is True
 
 
-# ---- appearance (dark mode) ---------------------------------------------------
+# ---- appearance (theme mode) ----------------------------------------------------
 
 
-def test_dark_mode_switch_reflects_config(tmp_path: Path) -> None:
-    assert _build(tmp_path).dark_mode_switch.isChecked() is False
-    assert _build(tmp_path, dark_mode=True).dark_mode_switch.isChecked() is True
+def test_theme_control_reflects_config(tmp_path: Path) -> None:
+    assert _build(tmp_path).theme_control.current() == "System"
+    assert _build(tmp_path, theme_mode="light").theme_control.current() == "Light"
+    assert _build(tmp_path, theme_mode="dark").theme_control.current() == "Dark"
 
 
-def test_save_payload_dark_mode_reflects_switch(tmp_path: Path) -> None:
+def test_theme_control_unknown_mode_shows_system(tmp_path: Path) -> None:
+    # A hand-edited config value the control has no segment for falls back to
+    # "System" -- the mode apply_settings would reject anyway.
+    assert _build(tmp_path, theme_mode="blue").theme_control.current() == "System"
+
+
+def test_save_payload_theme_mode_reflects_control(tmp_path: Path) -> None:
     captured = {}
     frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None)
-    frame.dark_mode_switch.click()
-    frame._on_save()
-    assert captured["dark_mode"] is True
+    frame.theme_control._buttons["Dark"].click()
+    _apply(frame)
+    assert captured["theme_mode"] == "dark"
+    assert "dark_mode" not in captured
 
 
-# ---- saving while the hotkey recorder is mid-capture ------------------------
+# ---- autosave vs. the hotkey recorder -------------------------------------------
 
 
 class _FakeListener:
@@ -544,25 +685,162 @@ class _FakeListener:
         self.stopped = True
 
 
-def test_save_while_hotkey_recording_cancels_recorder_instead_of_persisting_placeholder(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_apply_fire_is_deferred_while_a_hotkey_recording_is_in_progress(tmp_path: Path, monkeypatch) -> None:
+    # Autosave never cancels (or reads) a recorder mid-capture: the fire
+    # reschedules instead, so the "Press keys..." placeholder can never be
+    # persisted as a combo.
     import pynput.keyboard
 
     monkeypatch.setattr(pynput.keyboard, "Listener", _FakeListener)
-    captured = {}
-    frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None)
+    applied = []
+    frame = _build(tmp_path, on_apply=lambda values: applied.append(dict(values)) or None)
 
+    frame.quick_save_seconds_1_spin.setValue(45)  # schedules the autosave
     frame.hotkey_field.record_button.click()  # entry now shows "Press keys..."
     assert frame.hotkey_field.is_recording() is True
 
-    frame._on_save()
+    frame._apply_timer.stop()
+    frame._apply_now()  # the debounce fires mid-record
 
-    # The recording was cancelled and the PRE-RECORD combo is what got
-    # applied -- not the placeholder text.
+    assert applied == []  # deferred, not fired
+    assert frame._apply_timer.isActive() is True  # re-armed for later
+
+    frame.hotkey_field.cancel_recording()
     assert frame.hotkey_field.is_recording() is False
-    assert captured["hotkey_combo"] == "<ctrl>+<alt>+r"
-    assert frame.status_label.text() == "Settings saved."
+    frame._apply_timer.stop()
+    frame._apply_now()
+
+    # The earlier field change applied, with the PRE-RECORD combo in the
+    # payload -- never the placeholder text.
+    assert len(applied) == 1
+    assert applied[0]["quick_save_seconds_1"] == 45
+    assert applied[0]["hotkey_combo"] == "<ctrl>+<alt>+r"
+
+
+def test_hotkey_recording_finished_with_a_new_combo_schedules_an_apply(tmp_path: Path, monkeypatch) -> None:
+    import pynput.keyboard
+
+    monkeypatch.setattr(pynput.keyboard, "Listener", _FakeListener)
+    applied = []
+    frame = _build(tmp_path, on_apply=lambda values: applied.append(dict(values)) or None)
+
+    field = frame.hotkey_field
+    field.record_button.click()
+    field._on_key_press("ctrl")
+    field._on_key_press("s")
+    field._on_key_release("s")
+    field._on_key_release("ctrl")
+
+    assert field.is_recording() is False
+    assert field.combo() == "<ctrl>+s"
+    _flush_autosave(frame)
+    assert applied[-1]["hotkey_combo"] == "<ctrl>+s"
+
+
+def test_cancelled_hotkey_recording_schedules_nothing(tmp_path: Path, monkeypatch) -> None:
+    import pynput.keyboard
+
+    monkeypatch.setattr(pynput.keyboard, "Listener", _FakeListener)
+    frame = _build(tmp_path)
+
+    frame.hotkey_field.record_button.click()  # start
+    frame.hotkey_field.record_button.click()  # cancel -- the pre-record combo is restored
+
+    assert frame.hotkey_field.is_recording() is False
+    assert frame.hotkey_field.combo() == "<ctrl>+<alt>+r"
+    assert frame._apply_timer.isActive() is False  # nothing changed, nothing to save
+
+
+def test_manually_typed_hotkey_applies_on_editing_finished(tmp_path: Path) -> None:
+    applied = []
+    frame = _build(tmp_path, on_apply=lambda values: applied.append(dict(values)) or None)
+    frame.hotkey_field.entry.setText("<ctrl>+<shift>+x")
+    frame.hotkey_field.entry.editingFinished.emit()
+    _flush_autosave(frame)
+    assert applied[-1]["hotkey_combo"] == "<ctrl>+<shift>+x"
+
+
+# ---- autosave: failure rollback, in-flight dirty -------------------------------
+
+
+def test_failed_apply_shows_error_and_restores_last_good_values(tmp_path: Path) -> None:
+    calls = []
+
+    def fail(values):
+        calls.append(dict(values))
+        return "could not restart capture"
+
+    frame = _build(tmp_path, on_apply=fail)
+    frame.theme_control._buttons["Dark"].click()
+    frame.quick_save_seconds_1_spin.setValue(45)
+    _flush_autosave(frame)
+
+    assert frame.status_label.text() == "could not restart capture"
+    assert frame.status_label.property("state") == "error"
+    # Every touched control rolled back to the last-known-good payload...
+    assert frame.theme_control.current() == "System"
+    assert frame.quick_save_seconds_1_spin.value() == 30
+    assert frame._last_good["theme_mode"] == "system"
+    # ...without re-triggering the autosave it undid.
+    assert frame._apply_timer.isActive() is False
+    assert len(calls) == 1
+
+
+def test_failed_apply_then_a_retried_change_applies_cleanly(tmp_path: Path) -> None:
+    attempts = []
+
+    def fail_once(values):
+        attempts.append(dict(values))
+        return "could not restart capture" if len(attempts) == 1 else None
+
+    frame = _build(tmp_path, on_apply=fail_once)
+    frame.quick_save_seconds_1_spin.setValue(45)
+    _flush_autosave(frame)
+    assert frame.quick_save_seconds_1_spin.value() == 30  # rolled back
+
+    frame.quick_save_seconds_1_spin.setValue(45)  # the user retries the same edit
+    _flush_autosave(frame)
+    assert frame.status_label.text() == "Saved ✓"
+    assert frame.quick_save_seconds_1_spin.value() == 45
+    assert frame._last_good["quick_save_seconds_1"] == 45
+
+
+def test_successful_apply_shows_saved_and_advances_the_snapshot(tmp_path: Path) -> None:
+    applied = []
+    frame = _build(tmp_path, on_apply=lambda values: applied.append(dict(values)) or None)
+    frame.theme_control._buttons["Dark"].click()
+    _flush_autosave(frame)
+    assert frame.status_label.text() == "Saved ✓"
+    assert frame.status_label.property("state") == "success"
+    assert frame._status_clear_timer.isActive()
+    assert frame._last_good["theme_mode"] == "dark"
+
+
+def test_change_during_an_in_flight_apply_gets_exactly_one_follow_up(tmp_path: Path) -> None:
+    calls = []
+    holder = {}
+
+    def apply_and_edit_midway(values):
+        calls.append(dict(values))
+        if len(calls) == 1:
+            # A field change landing while on_apply runs (it can restart
+            # capture -- synchronous and slow) must not be lost.
+            holder["frame"].quick_save_seconds_1_spin.setValue(99)
+        return None
+
+    frame = _build(tmp_path, on_apply=apply_and_edit_midway)
+    holder["frame"] = frame
+
+    frame.check_for_updates_switch.click()
+    _flush_autosave(frame)
+    assert len(calls) == 1
+    assert frame._apply_timer.isActive() is True  # the dirty follow-up is scheduled
+
+    frame._apply_timer.stop()
+    frame._apply_now()
+    assert len(calls) == 2  # exactly one follow-up...
+    assert calls[1]["quick_save_seconds_1"] == 99  # ...carrying the mid-apply edit
+    assert frame._apply_timer.isActive() is False  # and no third apply
 
 
 # ---- Wayland window-capture hint ----------------------------------------------
@@ -598,3 +876,427 @@ def test_x11_window_mode_keeps_title_entry_enabled_without_hint(tmp_path: Path, 
     assert frame.window_combo.isEnabled() is True
     assert frame.window_refresh_button.isEnabled() is True
     assert frame.window_wayland_hint is None
+
+
+# ---- capture card: frame rate + resolution scale ------------------------------
+
+
+def test_framerate_and_resolution_scale_combos_reflect_config(tmp_path: Path) -> None:
+    frame = _build(tmp_path, framerate=60, resolution_scale="720p")
+    assert frame.framerate_combo.currentData() == 60
+    assert frame.resolution_scale_combo.currentData() == "720p"
+
+
+def test_framerate_combo_offers_the_documented_choices(tmp_path: Path) -> None:
+    frame = _build(tmp_path)
+    values = [frame.framerate_combo.itemData(i) for i in range(frame.framerate_combo.count())]
+    assert values == [15, 24, 30, 60]
+    assert frame.framerate_combo.currentData() == 30  # default
+
+
+def test_framerate_combo_falls_back_to_30_for_a_non_choice_config_value(tmp_path: Path) -> None:
+    frame = _build(tmp_path, framerate=23)  # hand-edited config
+    assert frame.framerate_combo.currentData() == 30
+
+
+def test_resolution_scale_combo_defaults_to_native(tmp_path: Path) -> None:
+    frame = _build(tmp_path)
+    values = [frame.resolution_scale_combo.itemData(i) for i in range(frame.resolution_scale_combo.count())]
+    assert values == ["native", "1080p", "720p"]
+    assert frame.resolution_scale_combo.currentData() == "native"
+
+
+def test_save_payload_includes_framerate_and_resolution_scale(tmp_path: Path) -> None:
+    captured = {}
+    frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None)
+    frame.framerate_combo.setCurrentIndex(frame.framerate_combo.findData(24))
+    frame.resolution_scale_combo.setCurrentIndex(frame.resolution_scale_combo.findData("1080p"))
+    _apply(frame)
+    assert captured["framerate"] == 24
+    assert captured["resolution_scale"] == "1080p"
+
+
+# ---- save & hotkey card: quick-save + screenshot hotkeys -----------------------
+
+
+def test_quick_save_and_screenshot_fields_reflect_config(tmp_path: Path) -> None:
+    frame = _build(
+        tmp_path,
+        quick_save_hotkey_1="<ctrl>+1", quick_save_seconds_1=45,
+        quick_save_hotkey_2="<ctrl>+2", quick_save_seconds_2=120,
+        screenshot_hotkey="<ctrl>+<shift>+p",
+    )
+    assert frame.quick_save_hotkey_1_field.combo() == "<ctrl>+1"
+    assert frame.quick_save_seconds_1_spin.value() == 45
+    assert frame.quick_save_hotkey_2_field.combo() == "<ctrl>+2"
+    assert frame.quick_save_seconds_2_spin.value() == 120
+    assert frame.screenshot_hotkey_field.combo() == "<ctrl>+<shift>+p"
+
+
+def test_quick_save_spinboxes_cover_the_documented_range(tmp_path: Path) -> None:
+    frame = _build(tmp_path)
+    assert frame.quick_save_seconds_1_spin.minimum() == 5
+    assert frame.quick_save_seconds_1_spin.maximum() == 300
+    assert frame.quick_save_seconds_1_spin.suffix() == " s"
+
+
+def test_save_payload_includes_quick_save_and_screenshot_hotkeys(tmp_path: Path) -> None:
+    captured = {}
+    frame = _build(
+        tmp_path, on_apply=lambda values: captured.update(values) or None,
+        quick_save_hotkey_1="<ctrl>+1", quick_save_seconds_1=45,
+    )
+    frame.quick_save_seconds_2_spin.setValue(120)
+    frame.screenshot_hotkey_field.entry.setText("<ctrl>+<shift>+p")
+    _apply(frame)
+    assert captured["quick_save_hotkey_1"] == "<ctrl>+1"
+    assert captured["quick_save_seconds_1"] == 45
+    assert captured["quick_save_hotkey_2"] == ""  # empty = disabled, passed through
+    assert captured["quick_save_seconds_2"] == 120
+    assert captured["screenshot_hotkey"] == "<ctrl>+<shift>+p"
+
+
+def test_apply_settings_error_for_a_bad_extra_hotkey_surfaces_on_the_status_label(tmp_path: Path) -> None:
+    # Validation lives in apply_settings -- the frame shows its error string
+    # like any other failure, and rolls the field back to the last-good value.
+    frame = _build(
+        tmp_path,
+        on_apply=lambda values: "Invalid quick-save hotkey 1: 'bogus' -- use pynput format, e.g. <ctrl>+<alt>+r",
+    )
+    frame.quick_save_hotkey_1_field.entry.setText("bogus")
+    _apply(frame)
+    assert "Invalid quick-save hotkey 1" in frame.status_label.text()
+    assert frame.status_label.property("state") == "error"
+    assert frame.quick_save_hotkey_1_field.combo() == ""  # rolled back to the last-good (disabled)
+
+
+# ---- check now -----------------------------------------------------------------
+
+
+def test_last_checked_label_reads_the_update_cache(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(settings_window_qt.update_check, "load_cache", lambda: {})
+    assert _build(tmp_path).update_last_checked_label.text() == "Last checked: never"
+
+    monkeypatch.setattr(settings_window_qt.update_check, "load_cache", lambda: {"last_checked": 1_700_000_000.0})
+    label = _build(tmp_path).update_last_checked_label.text()
+    assert label.startswith("Last checked: 20")  # %Y-%m-%d %H:%M of the epoch value
+
+
+def test_check_now_update_found_raises_the_banner_callback(tmp_path: Path, monkeypatch) -> None:
+    seen_kwargs = {}
+
+    def fake_check(**kwargs):
+        seen_kwargs.update(kwargs)
+        return ("v9.9.9", "https://example.invalid/v9.9.9")
+
+    monkeypatch.setattr(settings_window_qt.update_check, "check_for_update_once", fake_check)
+    found = []
+    frame = _build(tmp_path, on_update_found=lambda version, url: found.append((version, url)))
+
+    frame._on_check_now()
+
+    assert _wait_for(lambda: len(found) == 1)
+    assert found == [("v9.9.9", "https://example.invalid/v9.9.9")]
+    assert seen_kwargs["force"] is True  # a manual check bypasses the 24h throttle
+    assert "9.9.9" in frame.status_label.text()
+    assert frame.status_label.property("state") == "success"
+    assert frame.check_now_button.isEnabled() is True  # re-enabled after the answer
+
+
+def test_check_now_up_to_date(tmp_path: Path, monkeypatch) -> None:
+    cache = {"last_checked": 1000.0}
+    monkeypatch.setattr(settings_window_qt.update_check, "load_cache", lambda: dict(cache))
+
+    def fake_check(**kwargs):
+        cache["last_checked"] = 2000.0  # a completed check stamps the cache
+        return None
+
+    monkeypatch.setattr(settings_window_qt.update_check, "check_for_update_once", fake_check)
+    frame = _build(tmp_path)
+
+    frame._on_check_now()
+
+    assert _wait_for(lambda: frame.status_label.text() == "You're up to date.")
+    assert frame.status_label.property("state") == "success"
+
+
+def test_check_now_network_failure_reports_check_failed(tmp_path: Path, monkeypatch) -> None:
+    # check_for_update_once returns None and never stamped last_checked:
+    # the fetch failed, which the worker distinguishes from "no update".
+    monkeypatch.setattr(settings_window_qt.update_check, "load_cache", lambda: {})
+    monkeypatch.setattr(settings_window_qt.update_check, "check_for_update_once", lambda **kwargs: None)
+    frame = _build(tmp_path)
+
+    frame._on_check_now()
+
+    assert _wait_for(lambda: frame.status_label.text() == "Check failed (network?)")
+    assert frame.status_label.property("state") == "error"
+    assert frame.check_now_button.isEnabled() is True
+
+
+def test_check_now_worker_raising_still_reports_failure(tmp_path: Path, monkeypatch) -> None:
+    def boom(**kwargs):
+        raise RuntimeError("unexpected (fake)")
+
+    monkeypatch.setattr(settings_window_qt.update_check, "check_for_update_once", boom)
+    frame = _build(tmp_path)
+
+    frame._on_check_now()
+
+    assert _wait_for(lambda: frame.status_label.text() == "Check failed (network?)")
+
+
+# ---- 0.1.4: size cap / save sound ---------------------------------------------------
+
+
+def test_initial_state_reflects_size_cap_and_sound(tmp_path: Path) -> None:
+    frame = _build(tmp_path, clips_max_gb=12, save_sound_enabled=True)
+    assert frame.size_cap_slider.value() == 12
+    assert frame.size_cap_value_label.text() == "12 GB"
+    assert frame.save_sound_switch.isChecked() is True
+
+
+def test_size_cap_zero_shows_unlimited_and_follows_the_slider(tmp_path: Path) -> None:
+    frame = _build(tmp_path, clips_max_gb=0)
+    assert frame.size_cap_slider.value() == 0
+    assert frame.size_cap_value_label.text() == "Unlimited"
+    frame.size_cap_slider.setValue(25)
+    assert frame.size_cap_value_label.text() == "25 GB"
+    frame.size_cap_slider.setValue(0)
+    assert frame.size_cap_value_label.text() == "Unlimited"
+
+
+def test_out_of_range_size_cap_is_clamped_like_the_other_sliders(tmp_path: Path) -> None:
+    frame = _build(tmp_path, clips_max_gb=99)
+    assert frame.size_cap_slider.value() == 50
+    assert frame.size_cap_value_label.text() == "50 GB"
+
+
+def test_save_payload_collects_size_cap_and_sound(tmp_path: Path) -> None:
+    captured = {}
+    frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None)
+    frame.size_cap_slider.setValue(20)
+    frame.save_sound_switch.setChecked(True)
+    _apply(frame)
+    assert captured["clips_max_gb"] == 20
+    assert captured["save_sound_enabled"] is True
+
+
+def test_save_payload_reports_defaults_when_untouched(tmp_path: Path) -> None:
+    captured = {}
+    frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None)
+    _apply(frame)
+    assert captured["clips_max_gb"] == 0
+    assert captured["save_sound_enabled"] is False
+
+
+# ---- tab structure --------------------------------------------------------------
+
+
+def _tab_labels(frame: SettingsFrame) -> list[str]:
+    return [frame.tabs.tabText(i) for i in range(frame.tabs.count())]
+
+
+def _tab_page(frame: SettingsFrame, label: str):
+    return frame.tabs.widget(_tab_labels(frame).index(label))
+
+
+def _is_descendant(widget, ancestor) -> bool:
+    node = widget
+    while node is not None:
+        if node is ancestor:
+            return True
+        node = node.parentWidget()
+    return False
+
+
+def test_settings_fields_are_grouped_into_the_expected_tabs(tmp_path: Path) -> None:
+    frame = _build(tmp_path)
+    assert _tab_labels(frame) == ["Capture", "Saving", "Encoder", "Clips", "Appearance", "About"]
+
+    for widget in (
+        frame.buffer_slider, frame.target_control, frame.window_combo,
+        frame.framerate_combo, frame.resolution_scale_combo,
+        frame.desktop_volume_slider, frame.mic_volume_slider,
+    ):
+        assert _is_descendant(widget, _tab_page(frame, "Capture")), widget
+
+    for widget in (
+        frame.clips_dir_edit, frame.hotkey_field,
+        frame.quick_save_hotkey_1_field, frame.quick_save_seconds_1_spin,
+        frame.quick_save_hotkey_2_field, frame.quick_save_seconds_2_spin,
+        frame.screenshot_hotkey_field, frame.save_sound_switch,
+        frame.launch_on_startup_switch,
+    ):
+        assert _is_descendant(widget, _tab_page(frame, "Saving")), widget
+
+    for widget in (frame.autodetect_switch, frame.encoder_control, frame.preset_control, frame.bitrate_slider):
+        assert _is_descendant(widget, _tab_page(frame, "Encoder")), widget
+
+    for widget in (frame.filename_template_edit, frame.retention_slider, frame.size_cap_slider):
+        assert _is_descendant(widget, _tab_page(frame, "Clips")), widget
+
+    assert _is_descendant(frame.theme_control, _tab_page(frame, "Appearance"))
+
+    for widget in (
+        frame.check_for_updates_switch, frame.check_now_button,
+        frame.update_last_checked_label, frame.about_version_label, frame.github_button,
+    ):
+        assert _is_descendant(widget, _tab_page(frame, "About")), widget
+
+
+def test_every_tab_page_scrolls(tmp_path: Path) -> None:
+    from PySide6.QtWidgets import QScrollArea
+
+    frame = _build(tmp_path)
+    for i in range(frame.tabs.count()):
+        assert isinstance(frame.tabs.widget(i), QScrollArea)
+
+
+def test_about_tab_shows_version_license_and_github_link(tmp_path: Path) -> None:
+    frame = _build(tmp_path)
+    assert __version__ in frame.about_version_label.text()
+    label_texts = [label.text() for label in _tab_page(frame, "About").findChildren(QLabel)]
+    assert any("GPL-3.0" in text for text in label_texts)
+    assert any("github.com/lablooms/clipersal" in text for text in label_texts)
+    assert frame.github_button.text() != ""
+
+
+def test_reset_button_is_a_plain_button_left_of_the_status_label(tmp_path: Path) -> None:
+    frame = _build(tmp_path)
+    # Resetting settings touches no files, so it is neither #primary nor #danger.
+    assert frame.reset_button.objectName() == ""
+    frame.resize(900, 600)
+    frame.show()
+    assert frame.reset_button.x() < frame.status_label.x()
+    frame.close()
+
+
+# ---- reset to defaults ----------------------------------------------------------
+
+
+def _stub_confirm(monkeypatch, answer) -> None:
+    monkeypatch.setattr(
+        settings_window_qt, "quiet_message", lambda *args, **kwargs: answer
+    )
+
+
+def test_default_settings_payload_matches_config_field_defaults() -> None:
+    payload = default_settings_payload()
+    assert payload["buffer_seconds"] == 60
+    assert payload["clips_dir"] == str(_default_clips_dir())
+    assert payload["hotkey_combo"] == DEFAULT_COMBO
+    assert payload["video_bitrate"] == "8M"
+    assert payload["quality_preset"] == "custom"
+    assert payload["capture_mode"] == "desktop"
+    assert payload["monitor_index"] == 0
+    assert payload["window_title"] == ""
+    assert payload["mic_device"] is None
+    assert payload["desktop_volume"] == 100
+    assert payload["mic_volume"] == 100
+    assert payload["encoder_override"] is None
+    assert payload["filename_template"] == "{window}-{date}-{time}"
+    assert payload["clip_retention_days"] == 0
+    assert payload["launch_on_startup"] is False
+    assert payload["check_for_updates"] is True
+    assert payload["theme_mode"] == "system"
+    assert payload["framerate"] == 30
+    assert payload["resolution_scale"] == "native"
+    assert payload["quick_save_hotkey_1"] == ""
+    assert payload["quick_save_seconds_1"] == 30
+    assert payload["quick_save_hotkey_2"] == ""
+    assert payload["quick_save_seconds_2"] == 60
+    assert payload["screenshot_hotkey"] == ""
+    assert payload["clips_max_gb"] == 0
+    assert payload["save_sound_enabled"] is False
+
+
+def test_default_payload_keys_match_the_apply_payload_keys(tmp_path: Path) -> None:
+    # Drift guard: a field added to the apply payload but not to the defaults
+    # table (or vice versa) would silently survive a reset.
+    captured = {}
+    frame = _build(tmp_path, on_apply=lambda values: captured.update(values) or None)
+    _apply(frame)
+    assert set(captured) == set(default_settings_payload())
+
+
+def test_reset_to_defaults_applies_defaults_and_repopulates_the_ui(tmp_path: Path, monkeypatch) -> None:
+    _stub_confirm(monkeypatch, QMessageBox.StandardButton.Yes)
+    captured = {}
+    frame = _build(
+        tmp_path,
+        on_apply=lambda values: captured.update(values) or None,
+        buffer_seconds=120, filename_template="custom-{date}", clip_retention_days=30,
+        theme_mode="dark", check_for_updates=False, clips_max_gb=25,
+    )
+    assert frame.buffer_slider.value() == 120  # starts at the configured value
+
+    frame.reset_button.click()
+
+    defaults = default_settings_payload()
+    assert captured == defaults
+    # ...and the REBUILT fields show the defaults, not the old values.
+    assert frame.buffer_slider.value() == defaults["buffer_seconds"]
+    assert frame.buffer_value_label.text() == f"{defaults['buffer_seconds']}s"
+    assert frame.filename_template_edit.text() == defaults["filename_template"]
+    assert frame.retention_slider.value() == defaults["clip_retention_days"]
+    assert frame.size_cap_slider.value() == defaults["clips_max_gb"]
+    assert frame.theme_control.current() == "System"
+    assert frame.check_for_updates_switch.isChecked() is True
+    assert frame.hotkey_field.combo() == defaults["hotkey_combo"]
+    assert frame.clips_dir_edit.text() == defaults["clips_dir"]
+    assert _tab_labels(frame) == ["Capture", "Saving", "Encoder", "Clips", "Appearance", "About"]
+    assert frame.status_label.text() == "Saved ✓"
+    assert frame.status_label.property("state") == "success"
+    # The reset payload is the new last-known-good snapshot...
+    assert frame._last_good == defaults
+    # ...and the rebuilt widgets are wired for autosave like the first build.
+    frame.check_for_updates_switch.click()
+    _flush_autosave(frame)
+    assert captured["check_for_updates"] is False
+
+
+def test_reset_to_defaults_cancelled_applies_nothing(tmp_path: Path, monkeypatch) -> None:
+    _stub_confirm(monkeypatch, QMessageBox.StandardButton.No)
+    applied = []
+    frame = _build(tmp_path, on_apply=lambda values: applied.append(values) or None, buffer_seconds=120)
+    old_tabs = frame.tabs
+    frame.reset_button.click()
+    assert applied == []
+    assert frame.tabs is old_tabs  # untouched
+    assert frame.buffer_slider.value() == 120
+
+
+def test_reset_to_defaults_apply_error_is_shown_without_rebuilding(tmp_path: Path, monkeypatch) -> None:
+    _stub_confirm(monkeypatch, QMessageBox.StandardButton.Yes)
+    frame = _build(tmp_path, on_apply=lambda values: "could not restart capture", buffer_seconds=120)
+    old_tabs = frame.tabs
+    frame.reset_button.click()
+    assert frame.status_label.text() == "could not restart capture"
+    assert frame.status_label.property("state") == "error"
+    assert frame.tabs is old_tabs  # no rebuild on failure
+    assert frame.buffer_slider.value() == 120  # old values still shown
+
+
+def test_reset_confirmation_calls_out_the_clips_folder_reset(tmp_path: Path, monkeypatch) -> None:
+    seen = {}
+
+    def fake_question(parent, title, text, *args, **kwargs):
+        seen["text"] = text
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(settings_window_qt, "quiet_message", fake_question)
+    frame = _build(tmp_path)
+    frame.reset_button.click()
+    assert str(_default_clips_dir()) in seen["text"]
+    assert "not deleted" in seen["text"]
+
+
+def test_tab_pages_do_not_autofill_an_unthemed_background(tmp_path: Path) -> None:
+    # QScrollArea.setWidget flips the page's autoFillBackground ON, which
+    # fills it with the unthemed palette Window grey in both modes -- the
+    # "rogue dark background" report. Every tab page must have it off.
+    frame = _build(tmp_path)
+    for i in range(frame.tabs.count()):
+        scroll = frame.tabs.widget(i)
+        assert scroll.widget().autoFillBackground() is False

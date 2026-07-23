@@ -1,10 +1,12 @@
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from clipersal import thumbnails
+from clipersal.subprocess_utils import NO_WINDOW_KWARGS
 
 FFMPEG_PATH = shutil.which("ffmpeg")
 
@@ -224,3 +226,108 @@ def test_ensure_thumbnail_returns_none_for_corrupt_file(tmp_path: Path) -> None:
     thumb = thumbnails.ensure_thumbnail(FFMPEG_PATH, clip, tmp_path / ".thumbnails")
 
     assert thumb is None
+
+
+# ---- get_video_info ------------------------------------------------------------
+
+
+def _fake_ffprobe_json(recorded: dict, stdout: str, returncode: int = 0):
+    def fake_run(cmd, **kwargs):
+        recorded["cmd"] = cmd
+        recorded["kwargs"] = kwargs
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+
+    return fake_run
+
+
+def test_get_video_info_parses_canned_ffprobe_payload(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake")
+    recorded = {}
+    monkeypatch.setattr(
+        thumbnails.subprocess,
+        "run",
+        _fake_ffprobe_json(
+            recorded,
+            '{"streams": [{"width": 1920, "height": 1080}], "format": {"duration": "12.345"}}',
+        ),
+    )
+
+    info = thumbnails.get_video_info("ffprobe", clip)
+
+    assert info == (12.345, 1920, 1080)
+    cmd, kwargs = recorded["cmd"], recorded["kwargs"]
+    assert cmd == [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        str(clip),
+    ]
+    assert kwargs["timeout"] == thumbnails._PROBE_TIMEOUT
+    for key, value in NO_WINDOW_KWARGS.items():
+        assert kwargs.get(key) == value
+
+
+def test_get_video_info_individual_fields_none_when_absent(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake")
+    recorded = {}
+
+    # No video stream (audio-only file): duration survives, dimensions don't.
+    monkeypatch.setattr(
+        thumbnails.subprocess,
+        "run",
+        _fake_ffprobe_json(recorded, '{"streams": [], "format": {"duration": "4.5"}}'),
+    )
+    assert thumbnails.get_video_info("ffprobe", clip) == (4.5, None, None)
+
+    # ffprobe reports an unknown duration as "N/A": dimensions survive.
+    monkeypatch.setattr(
+        thumbnails.subprocess,
+        "run",
+        _fake_ffprobe_json(recorded, '{"streams": [{"width": 640, "height": 360}], "format": {"duration": "N/A"}}'),
+    )
+    assert thumbnails.get_video_info("ffprobe", clip) == (None, 640, 360)
+
+
+def test_get_video_info_returns_none_on_probe_failure(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake")
+    recorded = {}
+
+    # Nonzero exit (corrupt file).
+    monkeypatch.setattr(
+        thumbnails.subprocess, "run", _fake_ffprobe_json(recorded, "not json at all", returncode=1)
+    )
+    assert thumbnails.get_video_info("ffprobe", clip) is None
+
+    # Zero exit but unparseable stdout (shouldn't happen with -of json; be safe).
+    monkeypatch.setattr(
+        thumbnails.subprocess, "run", _fake_ffprobe_json(recorded, "not json at all", returncode=0)
+    )
+    assert thumbnails.get_video_info("ffprobe", clip) is None
+
+
+def test_get_video_info_returns_none_on_timeout_and_oserror(tmp_path: Path, monkeypatch) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"fake")
+
+    def timeout_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout", 10))
+
+    monkeypatch.setattr(thumbnails.subprocess, "run", timeout_run)
+    assert thumbnails.get_video_info("ffprobe", clip) is None
+
+    def oserror_run(cmd, **kwargs):
+        raise OSError("ffprobe not found")
+
+    monkeypatch.setattr(thumbnails.subprocess, "run", oserror_run)
+    assert thumbnails.get_video_info("ffprobe", clip) is None

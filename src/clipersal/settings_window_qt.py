@@ -1,39 +1,67 @@
-"""Settings tab -- the biggest single tab. Cards are laid out in a
-two-column split (via two QVBoxLayouts inside a QHBoxLayout) -- Capture +
-Save & hotkey on the left, Encoder + Clip management + Appearance on the
-right -- for a roughly-16:9 panel shape.
+"""Settings tab -- a themed QTabWidget grouping the existing fields into
+Capture / Saving / Encoder / Clips / Appearance / About (the old two-column
+card scroll mixed unrelated concerns onto one long page; the update-check
+machinery moved off the hotkey card into About to declutter it). Every tab
+page scrolls, since Capture alone is taller than the window minimum.
 
 The Monitor/Window sub-panels under "Capture target" and the bitrate slider
 under "Quality preset" are shown/hidden with plain `.setVisible(bool)`; Qt's
 QVBoxLayout keeps widgets at a fixed index regardless of visibility, so
 toggling one panel never disturbs the position of the others.
+
+There is no Save button: every field AUTOSAVES. Settled-change signals (a
+combo pick, a toggled switch, a released slider, a finished hotkey
+recording, ...) restart a ~500 ms debounce QTimer whose fire applies the
+whole payload through the same on_apply the old Save button used -- so
+capture-restarting fields can never restart ffmpeg mid-drag or mid-
+keystroke. A failed apply rolls every control back to the last-known-good
+payload; an invalid one (empty hotkey / clips folder / filename template)
+just shows the guard's error and waits for the next edit.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import re
+import threading
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSlider,
+    QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from clipersal import autostart, config_store, ffmpeg_utils, monitors, platform_detect, window_capture
-from clipersal.config import Config
+from clipersal import (
+    __version__,
+    autostart,
+    config_store,
+    ffmpeg_utils,
+    monitors,
+    platform_detect,
+    theme,
+    update_check,
+    window_capture,
+)
+from clipersal.config import Config, _default_clips_dir
 from clipersal.hotkey_widget_qt import HotkeyField
-from clipersal.qt_widgets import SegmentedControl, ToggleSwitch
+from clipersal.qt_widgets import SegmentedControl, ToggleSwitch, quiet_message
 from clipersal.theme import qfont as _qfont
 from clipersal.tray import open_folder
 
@@ -44,7 +72,16 @@ _BUFFER_RANGE = (10, 300)
 _BITRATE_RANGE_MBPS = (2, 20)
 _RETENTION_RANGE_DAYS = (0, 90)
 _VOLUME_RANGE_PERCENT = (0, 200)
+_QUICK_SAVE_SECONDS_RANGE = (5, 300)
 _SAVED_MESSAGE_CLEAR_MS = 2500
+# How long after the last field change the autosave fires. Long enough that
+# spinbox arrow repeats and line-edit typing coalesce into one apply, short
+# enough that a change feels immediate.
+_AUTOSAVE_DEBOUNCE_MS = 500
+
+_FRAMERATE_CHOICES = (15, 24, 30, 60)
+_RESOLUTION_SCALE_CHOICES = [("Native", "native"), ("1080p", "1080p"), ("720p", "720p")]
+_SIZE_CAP_RANGE_GB = (0, 50)
 
 _QUALITY_PRESET_CHOICES = [
     ("Performance", "performance"),
@@ -60,8 +97,42 @@ _QUALITY_PRESET_DESCRIPTIONS = {
 
 _CAPTURE_TARGET_LABELS = {"desktop": "Desktop", "monitor": "Monitor", "window": "Window"}
 _CAPTURE_TARGET_MODES = {label: mode for mode, label in _CAPTURE_TARGET_LABELS.items()}
+_THEME_MODE_LABELS = {"system": "System", "light": "Light", "dark": "Dark"}
+_THEME_MODES = {label: mode for mode, label in _THEME_MODE_LABELS.items()}
 _NO_WINDOW_SELECTED = "(none selected)"
 _NO_WINDOWS_FOUND = "(no windows found)"
+
+# The Settings-editable Config fields, i.e. exactly the keys of the
+# _build_payload dict -- the reset-to-defaults payload is built from the same
+# list so the two can never drift apart.
+_PAYLOAD_FIELD_NAMES = (
+    "buffer_seconds",
+    "clips_dir",
+    "hotkey_combo",
+    "video_bitrate",
+    "quality_preset",
+    "capture_mode",
+    "monitor_index",
+    "window_title",
+    "mic_device",
+    "desktop_volume",
+    "mic_volume",
+    "encoder_override",
+    "filename_template",
+    "clip_retention_days",
+    "launch_on_startup",
+    "check_for_updates",
+    "theme_mode",
+    "framerate",
+    "resolution_scale",
+    "quick_save_hotkey_1",
+    "quick_save_seconds_1",
+    "quick_save_hotkey_2",
+    "quick_save_seconds_2",
+    "screenshot_hotkey",
+    "clips_max_gb",
+    "save_sound_enabled",
+)
 
 
 def bitrate_string_to_mbps(text: str) -> int:
@@ -92,22 +163,60 @@ def _format_retention_label(days: int) -> str:
     return "Forever" if days <= 0 else f"{days}d"
 
 
+def _format_size_cap_label(gb: int) -> str:
+    return "Unlimited" if gb <= 0 else f"{gb} GB"
+
+
 def _clamped(value: int, bounds: tuple[int, int]) -> int:
     """What's shown must be what's saved: an out-of-range config value
     (e.g. --buffer-seconds 600 against the slider's 10-300) is clamped
     HERE, for the value label and the slider alike -- not left for Qt's
     setValue to clamp only the slider, which would display the original
-    number while the next Save silently persists the clamp.
+    number while the next apply silently persists the clamp.
     """
     low, high = bounds
     return max(low, min(high, value))
 
 
-class SettingsFrame(QWidget):
-    """on_apply(new_values) is called with the validated field values on
-    Save; it should live-apply what it can, persist to the config file, and
-    return None on success or an error string to display on failure.
+def default_settings_payload() -> dict:
+    """The Reset-to-defaults payload: every Settings-editable field at its
+    hardcoded Config default. Read from the dataclass's field metadata rather
+    than by instantiating Config() -- Config.__post_init__ mkdirs clips_dir
+    and a temp buffer_dir, which answering "what are the defaults?" must not
+    do. Keyed by _PAYLOAD_FIELD_NAMES so it carries exactly what
+    _build_payload would.
     """
+    defaults: dict = {}
+    for field_info in dataclasses.fields(Config):
+        if field_info.name not in _PAYLOAD_FIELD_NAMES:
+            continue
+        if field_info.default is not dataclasses.MISSING:
+            value = field_info.default
+        else:
+            value = field_info.default_factory()
+        defaults[field_info.name] = value
+    # The payload carries the clips folder as a string, like _build_payload's.
+    defaults["clips_dir"] = str(defaults["clips_dir"])
+    return defaults
+
+
+class SettingsFrame(QWidget):
+    """on_apply(new_values) is called -- debounced, on every settled field
+    change -- with the validated field values; it should live-apply what it
+    can, persist to the config file, and return None on success or an error
+    string to display on failure. A failed apply rolls every control back to
+    the last-known-good payload.
+
+    on_update_found(version, url), when given, is the main window's
+    show_update_banner -- the "Check now" button raises the Home tab's
+    banner through it when a newer release turns up.
+    """
+
+    # ("update", (version, url)) / ("ok", None) / ("failed", None) from the
+    # check-now worker thread -- the network call must stay off the GUI
+    # thread, so the result comes back through this queued signal (the same
+    # cross-thread rule as signals.py's AppSignals).
+    check_now_responded = Signal(object)
 
     def __init__(
         self,
@@ -118,10 +227,15 @@ class SettingsFrame(QWidget):
         on_apply: Callable[[dict], str | None],
         ffmpeg_path: str,
         parent: QWidget | None = None,
+        on_update_found: Callable[[str, str], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self._config = config
         self._on_apply = on_apply
+        self._on_update_found = on_update_found
+        self._ffmpeg_path = ffmpeg_path
+        self._current_encoder = current_encoder
+        self.check_now_responded.connect(self._on_check_now_responded)
         self._os = platform_detect.get_os()
         # On Wayland the window-title picker can't work: window capture goes
         # through the desktop portal's own share-dialog, which picks the
@@ -136,73 +250,160 @@ class SettingsFrame(QWidget):
         self._encoder_value_by_label = {label: value for label, value in _ENCODER_CHOICES}
         self._monitor_index_by_label: dict[str, int] = {}
 
-        outer_layout = QVBoxLayout(self)
-        outer_layout.setContentsMargins(18, 18, 18, 18)
-        outer_layout.setSpacing(8)
+        # Autosave machinery -- created BEFORE the tabs are built so the
+        # per-field signal wiring (connected at the end of _build_tabs, once
+        # every initial value is in place) always has a timer to restart.
+        self._apply_timer = QTimer(self)
+        self._apply_timer.setSingleShot(True)
+        self._apply_timer.setInterval(_AUTOSAVE_DEBOUNCE_MS)
+        self._apply_timer.timeout.connect(self._apply_now)
+        # on_apply runs synchronously on the GUI thread and can be slow (a
+        # capture restart smoke-encodes). Changes landing mid-apply only mark
+        # _dirty and get exactly one follow-up pass when it returns.
+        self._applying = False
+        self._dirty = False
+        # The last successfully applied payload -- a failed apply rolls every
+        # control back to it. Filled from the initial fields at the end of
+        # __init__; construction itself never applies.
+        self._last_good: dict = {}
 
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        outer_layout.addWidget(scroll, 1)
+        self._outer_layout = QVBoxLayout(self)
+        self._outer_layout.setContentsMargins(18, 18, 18, 18)
+        self._outer_layout.setSpacing(8)
 
-        columns_container = QWidget()
-        columns_layout = QHBoxLayout(columns_container)
-        columns_layout.setContentsMargins(0, 0, 0, 0)
-        columns_layout.setSpacing(18)
-        scroll.setWidget(columns_container)
+        self.tabs = QTabWidget(self)
+        self._outer_layout.addWidget(self.tabs, 1)
+        self._build_tabs(config)
 
-        left_container = QWidget()
-        left_layout = QVBoxLayout(left_container)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(14)
-        columns_layout.addWidget(left_container, 1)
+        footer = QHBoxLayout()
+        self._outer_layout.addLayout(footer)
 
-        right_container = QWidget()
-        right_layout = QVBoxLayout(right_container)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(14)
-        columns_layout.addWidget(right_container, 1)
-
-        self._build_capture_card(left_layout, config, ffmpeg_path)
-        self._build_save_hotkey_card(left_layout, config)
-        self._build_encoder_card(right_layout, config, current_encoder)
-        self._build_clip_management_card(right_layout, config)
-        self._build_appearance_card(right_layout, config)
-
-        left_layout.addStretch()
-        right_layout.addStretch()
+        # Plain (non-primary) button: resetting SETTINGS touches no files and
+        # every field simply autosaves again afterwards, so it gets neither
+        # the primary accent nor the destructive #danger look.
+        self.reset_button = QPushButton("Reset to defaults", self)
+        self.reset_button.setToolTip("Restore every setting to its factory default")
+        self.reset_button.clicked.connect(self._on_reset_to_defaults)
+        footer.addWidget(self.reset_button)
 
         self.status_label = QLabel("")
         self.status_label.setObjectName("statusLabel")
         self.status_label.setWordWrap(True)
-        outer_layout.addWidget(self.status_label)
+        footer.addWidget(self.status_label, 1)
 
-        footer = QHBoxLayout()
-        outer_layout.addLayout(footer)
+        autosave_hint = QLabel("Changes save automatically.", self)
+        autosave_hint.setObjectName("hint")
+        footer.addWidget(autosave_hint)
+
         view_logs_button = QPushButton("View logs", self)
         view_logs_button.clicked.connect(lambda: open_folder(config_store.default_log_path().parent))
         footer.addWidget(view_logs_button)
-        footer.addStretch()
-        save_button = QPushButton("Save", self)
-        save_button.setObjectName("primary")
-        save_button.clicked.connect(self._on_save)
-        footer.addWidget(save_button)
 
         self._status_clear_timer = QTimer(self)
         self._status_clear_timer.setSingleShot(True)
         self._status_clear_timer.timeout.connect(lambda: self.status_label.setText(""))
 
+        # The initial last-known-good snapshot. Doubles as construction-time
+        # proof the fields can produce a payload at all: a broken config
+        # (e.g. an emptied hotkey) leaves it empty, in which case a failed
+        # apply simply has nothing to roll back to. No apply is fired here --
+        # building the window must be inert.
+        self._last_good = self._build_payload() or {}
+
+    # ---- tab scaffolding ---------------------------------------------------
+
+    def _make_tab(self, title: str) -> QVBoxLayout:
+        """One scrollable tab page; returns the page's content layout. The
+        page widget itself stays transparent -- the pane and the cards paint
+        the surfaces (see build_stylesheet's scoped-background rule)."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(14)
+        scroll.setWidget(page)
+        # QScrollArea.setWidget flips the page's autoFillBackground ON, which
+        # fills it with the UNTHEMED palette Window grey in both modes -- the
+        # "rogue dark background" report. Turn it back off; the page stays
+        # transparent so the pane/cards paint the surfaces.
+        page.setAutoFillBackground(False)
+        self.tabs.addTab(scroll, title)
+        return layout
+
+    def _build_tabs(self, config) -> None:
+        """Populate self.tabs. `config` is the live Config on first build and
+        a SimpleNamespace of the just-applied payload on a reset rebuild --
+        the build methods only ever read attributes, so both fit (and
+        Config() itself must not be instantiated for a rebuild: its
+        __post_init__ mkdirs).
+        """
+        capture_tab = self._make_tab("Capture")
+        self._build_capture_card(capture_tab, config, self._ffmpeg_path)
+        self._build_audio_card(capture_tab, config, self._ffmpeg_path)
+        capture_tab.addStretch()
+
+        saving_tab = self._make_tab("Saving")
+        self._build_save_hotkey_card(saving_tab, config)
+        saving_tab.addStretch()
+
+        encoder_tab = self._make_tab("Encoder")
+        self._build_encoder_card(encoder_tab, config, self._current_encoder)
+        self._build_quality_card(encoder_tab, config)
+        encoder_tab.addStretch()
+
+        clips_tab = self._make_tab("Clips")
+        self._build_clip_management_card(clips_tab, config)
+        clips_tab.addStretch()
+
+        appearance_tab = self._make_tab("Appearance")
+        self._build_appearance_card(appearance_tab, config)
+        appearance_tab.addStretch()
+
+        about_tab = self._make_tab("About")
+        self._build_about_card(about_tab)
+        self._build_update_card(about_tab, config)
+        about_tab.addStretch()
+
+        # Wired LAST, once every field holds its initial value: the
+        # population above fires most of these very signals, so connecting
+        # any earlier would schedule applies off the constructor. _reload()
+        # re-wires its fresh widgets through this same call.
+        self._connect_autosave()
+
+    def _reload(self, values: dict) -> None:
+        """Rebuild the tab pages from `values` (the just-applied reset
+        payload) so every field shows the value now in effect. Rebuilding
+        reuses the exact build path -- including its clamping and probes --
+        rather than a second set-every-widget pass that could drift out of
+        sync with the first.
+        """
+        old_tabs = self.tabs
+        new_tabs = QTabWidget(self)
+        # replaceWidget() needs the old widget visible, and this frame sits
+        # hidden inside the main window's QStackedWidget half the time -- so
+        # swap manually (remove + insert at the same index).
+        index = self._outer_layout.indexOf(old_tabs)
+        self._outer_layout.removeWidget(old_tabs)
+        old_tabs.hide()
+        old_tabs.deleteLater()
+        self.tabs = new_tabs
+        self._outer_layout.insertWidget(index, new_tabs, 1)
+        self._build_tabs(SimpleNamespace(**values))
+
     # ---- small layout helpers -------------------------------------------
 
-    def _make_card(self, column_layout: QVBoxLayout, title: str) -> QVBoxLayout:
+    def _make_card(self, parent_layout: QVBoxLayout, title: str | None) -> QVBoxLayout:
         card = QFrame(self)
         card.setObjectName("card")
-        column_layout.addWidget(card)
+        parent_layout.addWidget(card)
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(16, 14, 16, 14)
         card_layout.setSpacing(6)
-        title_label = QLabel(title.upper(), card)
-        title_label.setObjectName("cardTitle")
-        card_layout.addWidget(title_label)
+        if title is not None:
+            title_label = QLabel(title.upper(), card)
+            title_label.setObjectName("cardTitle")
+            card_layout.addWidget(title_label)
         return card_layout
 
     def _bold_label(self, text: str, parent: QWidget) -> QLabel:
@@ -230,10 +431,10 @@ class SettingsFrame(QWidget):
         card_layout.addWidget(label)
         return label
 
-    # ---- Capture card ----------------------------------------------------
+    # ---- Capture tab ----------------------------------------------------
 
-    def _build_capture_card(self, left_layout: QVBoxLayout, config: Config, ffmpeg_path: str) -> None:
-        capture_layout = self._make_card(left_layout, "Capture")
+    def _build_capture_card(self, tab_layout: QVBoxLayout, config: Config, ffmpeg_path: str) -> None:
+        capture_layout = self._make_card(tab_layout, "Capture")
         card = capture_layout.parentWidget()
 
         initial_buffer = _clamped(config.buffer_seconds, _BUFFER_RANGE)
@@ -246,9 +447,34 @@ class SettingsFrame(QWidget):
         self._hint(capture_layout, "How much history stays in the rolling buffer (10s–300s)", card)
 
         self._build_capture_target(capture_layout, config, card)
-        self._build_microphone_picker(capture_layout, config, ffmpeg_path, card)
-        self._build_volume_controls(capture_layout, config, ffmpeg_path, card)
-        self._build_quality_preset(capture_layout, config, card)
+        self._build_framerate_and_scale(capture_layout, config, card)
+
+    def _build_audio_card(self, tab_layout: QVBoxLayout, config: Config, ffmpeg_path: str) -> None:
+        audio_layout = self._make_card(tab_layout, "Audio")
+        card = audio_layout.parentWidget()
+        self._build_microphone_picker(audio_layout, config, ffmpeg_path, card)
+        self._build_volume_controls(audio_layout, config, ffmpeg_path, card)
+
+    def _build_framerate_and_scale(self, capture_layout: QVBoxLayout, config: Config, card: QWidget) -> None:
+        capture_layout.addWidget(self._bold_label("Frame rate", card))
+        self.framerate_combo = QComboBox(card)
+        for fps in _FRAMERATE_CHOICES:
+            self.framerate_combo.addItem(str(fps), fps)
+        initial_fps = self.framerate_combo.findData(config.framerate)
+        # A hand-edited config with a non-choice framerate falls back to the
+        # 30 fps default rather than a blank combo.
+        self.framerate_combo.setCurrentIndex(initial_fps if initial_fps >= 0 else self.framerate_combo.findData(30))
+        capture_layout.addWidget(self.framerate_combo)
+        self._hint(capture_layout, "Frames per second captured (applies automatically; restarts capture)", card)
+
+        capture_layout.addWidget(self._bold_label("Resolution scale", card))
+        self.resolution_scale_combo = QComboBox(card)
+        for label, value in _RESOLUTION_SCALE_CHOICES:
+            self.resolution_scale_combo.addItem(label, value)
+        initial_scale = self.resolution_scale_combo.findData(config.resolution_scale)
+        self.resolution_scale_combo.setCurrentIndex(initial_scale if initial_scale >= 0 else 0)
+        capture_layout.addWidget(self.resolution_scale_combo)
+        self._hint(capture_layout, "Downscale the saved video -- Native keeps the capture resolution", card)
 
     def _build_capture_target(self, capture_layout: QVBoxLayout, config: Config, card: QWidget) -> None:
         detected_monitors = monitors.list_monitors(self._os)
@@ -325,12 +551,19 @@ class SettingsFrame(QWidget):
         found = window_capture.list_windows(self._os)
         titles = [w.title for w in found] or [_NO_WINDOWS_FOUND]
         current = self.window_combo.currentText() if self.window_combo.count() else None
-        self.window_combo.clear()
-        self.window_combo.addItems(titles)
-        if current in titles:
-            self.window_combo.setCurrentText(current)
-        else:
-            self.window_combo.setCurrentIndex(0)
+        # Repopulating fires currentIndexChanged -- block it so a Refresh
+        # click (or the build-time call) never schedules an autosave by
+        # itself. Only a genuine user pick should.
+        self.window_combo.blockSignals(True)
+        try:
+            self.window_combo.clear()
+            self.window_combo.addItems(titles)
+            if current in titles:
+                self.window_combo.setCurrentText(current)
+            else:
+                self.window_combo.setCurrentIndex(0)
+        finally:
+            self.window_combo.blockSignals(False)
 
     def _on_target_change(self, _choice: str | None = None) -> None:
         selected = self.target_control.current()
@@ -404,6 +637,11 @@ class SettingsFrame(QWidget):
             self.mic_volume_slider.setEnabled(True)
             self.mic_volume_hint.setText("Loudness of the microphone mixed into the recording (100% = unchanged).")
 
+    def _build_quality_card(self, tab_layout: QVBoxLayout, config: Config) -> None:
+        quality_layout = self._make_card(tab_layout, "Quality")
+        card = quality_layout.parentWidget()
+        self._build_quality_preset(quality_layout, config, card)
+
     def _build_quality_preset(self, capture_layout: QVBoxLayout, config: Config, card: QWidget) -> None:
         capture_layout.addWidget(self._bold_label("Quality preset", card))
 
@@ -447,10 +685,10 @@ class SettingsFrame(QWidget):
             self.preset_desc_label.setText(f"{_QUALITY_PRESET_DESCRIPTIONS[selected]} ({spec['bitrate_mbps']} Mbps)")
             self.bitrate_container.setVisible(False)
 
-    # ---- Save & hotkey card ----------------------------------------------
+    # ---- Saving tab ------------------------------------------------------
 
-    def _build_save_hotkey_card(self, left_layout: QVBoxLayout, config: Config) -> None:
-        save_layout = self._make_card(left_layout, "Save && hotkey")
+    def _build_save_hotkey_card(self, tab_layout: QVBoxLayout, config: Config) -> None:
+        save_layout = self._make_card(tab_layout, None)
         card = save_layout.parentWidget()
 
         save_layout.addWidget(self._bold_label("Clips folder", card))
@@ -471,6 +709,55 @@ class SettingsFrame(QWidget):
             save_layout, "Click Record and press a key combo, or type pynput format directly, e.g. <ctrl>+<alt>+r", card
         )
 
+        self.quick_save_hotkey_1_field, self.quick_save_seconds_1_spin = self._build_quick_save_row(
+            save_layout, "Quick-save hotkey 1", config.quick_save_hotkey_1, config.quick_save_seconds_1, card
+        )
+        self.quick_save_hotkey_2_field, self.quick_save_seconds_2_spin = self._build_quick_save_row(
+            save_layout, "Quick-save hotkey 2", config.quick_save_hotkey_2, config.quick_save_seconds_2, card
+        )
+
+        save_layout.addWidget(self._bold_label("Screenshot hotkey", card))
+        self.screenshot_hotkey_field = HotkeyField(config.screenshot_hotkey, card)
+        save_layout.addWidget(self.screenshot_hotkey_field)
+        self._hint(save_layout, "Grabs a still frame from the buffer -- leave empty to disable", card)
+
+        # Same toggle-row shape as the launch-on-startup row below;
+        # cli.py's toast path plays the beep.
+        sound_row = QHBoxLayout()
+        save_layout.addLayout(sound_row)
+        sound_text_col = QVBoxLayout()
+        sound_row.addLayout(sound_text_col, 1)
+        sound_text_col.addWidget(self._bold_label("Play a sound when a clip is saved", card))
+        sound_desc = QLabel("Short system beep on every successful save", card)
+        sound_desc.setObjectName("hint")
+        sound_text_col.addWidget(sound_desc)
+        self.save_sound_switch = ToggleSwitch(card, checked=config.save_sound_enabled)
+        sound_row.addWidget(self.save_sound_switch)
+
+        self._build_startup_row(save_layout, config, card)
+
+    def _build_quick_save_row(
+        self, save_layout: QVBoxLayout, label: str, combo: str, seconds: int, card: QWidget
+    ) -> tuple[HotkeyField, QSpinBox]:
+        """One HotkeyField + seconds spinbox row for a "save just the last N
+        seconds" binding. An empty combo means disabled (apply_settings
+        skips validation and pynput binding for it); the spinbox range
+        matches apply_settings' 5-300s clamp.
+        """
+        save_layout.addWidget(self._bold_label(label, card))
+        row = QHBoxLayout()
+        save_layout.addLayout(row)
+        field = HotkeyField(combo, card)
+        row.addWidget(field, 1)
+        spin = QSpinBox(card)
+        spin.setRange(*_QUICK_SAVE_SECONDS_RANGE)
+        spin.setSuffix(" s")
+        spin.setValue(max(_QUICK_SAVE_SECONDS_RANGE[0], min(_QUICK_SAVE_SECONDS_RANGE[1], seconds)))
+        row.addWidget(spin)
+        self._hint(save_layout, "One-tap save of just the last N seconds -- leave empty to disable", card)
+        return field, spin
+
+    def _build_startup_row(self, save_layout: QVBoxLayout, config: Config, card: QWidget) -> None:
         startup_supported = autostart.is_supported(self._os)
         startup_checked = config.launch_on_startup
         if startup_supported:
@@ -478,7 +765,7 @@ class SettingsFrame(QWidget):
                 # Reconcile the toggle with reality at build time: the OS
                 # registration is the source of truth, so a Run value /
                 # .desktop file deleted outside the app (or a registration
-                # that failed last Save) doesn't leave the toggle
+                # that failed last apply) doesn't leave the toggle
                 # permanently showing what we merely BELIEVE -- and an
                 # unchanged toggle position never re-triggers registration.
                 startup_checked = autostart.is_enabled(self._os)
@@ -501,16 +788,116 @@ class SettingsFrame(QWidget):
         if not startup_supported:
             self.launch_on_startup_switch.setEnabled(False)
 
+    # ---- About tab (app info + the update-check machinery) -----------------
+
+    def _build_about_card(self, tab_layout: QVBoxLayout) -> None:
+        about_layout = self._make_card(tab_layout, "About Clipersal")
+        card = about_layout.parentWidget()
+
+        name_label = QLabel("Clipersal", card)
+        name_label.setFont(_qfont(size=theme.FONT_H1))
+        about_layout.addWidget(name_label)
+        tagline_label = QLabel("Catch the moment you bloomed.", card)
+        tagline_label.setObjectName("hint")
+        about_layout.addWidget(tagline_label)
+
+        self.about_version_label = QLabel(f"Version {__version__}", card)
+        self.about_version_label.setObjectName("hint")
+        about_layout.addWidget(self.about_version_label)
+        # The license change itself lands separately -- this is just the label.
+        license_label = QLabel("License: GPL-3.0", card)
+        license_label.setObjectName("hint")
+        about_layout.addWidget(license_label)
+
+        github_row = QHBoxLayout()
+        about_layout.addLayout(github_row)
+        self.github_button = QPushButton("View on GitHub", card)
+        self.github_button.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(f"https://github.com/{update_check.GITHUB_REPO}"))
+        )
+        github_row.addWidget(self.github_button)
+        github_hint = QLabel(f"github.com/{update_check.GITHUB_REPO}", card)
+        github_hint.setObjectName("hint")
+        github_row.addWidget(github_hint, 1)
+
+    def _build_update_card(self, tab_layout: QVBoxLayout, config: Config) -> None:
+        update_layout = self._make_card(tab_layout, "Updates")
+        card = update_layout.parentWidget()
+
         update_row = QHBoxLayout()
-        save_layout.addLayout(update_row)
+        update_layout.addLayout(update_row)
         update_text_col = QVBoxLayout()
         update_row.addLayout(update_text_col, 1)
         update_text_col.addWidget(self._bold_label("Check for updates automatically", card))
         update_desc = QLabel("Check GitHub for a newer version once at startup", card)
         update_desc.setObjectName("hint")
         update_text_col.addWidget(update_desc)
+        self.update_last_checked_label = QLabel(self._last_checked_text(), card)
+        self.update_last_checked_label.setObjectName("hint")
+        update_text_col.addWidget(self.update_last_checked_label)
+        self.check_now_button = QPushButton("Check now", card)
+        self.check_now_button.clicked.connect(self._on_check_now)
+        update_row.addWidget(self.check_now_button)
         self.check_for_updates_switch = ToggleSwitch(card, checked=config.check_for_updates)
         update_row.addWidget(self.check_for_updates_switch)
+
+    def _last_checked_text(self) -> str:
+        try:
+            last_checked = update_check.load_cache().get("last_checked")
+        except Exception:  # noqa: BLE001 -- a cache hiccup must never break the Settings tab
+            last_checked = None
+        if not isinstance(last_checked, (int, float)):
+            return "Last checked: never"
+        return f"Last checked: {datetime.fromtimestamp(last_checked).strftime('%Y-%m-%d %H:%M')}"
+
+    # ---- check-now (manual update check) -------------------------------------
+
+    def _on_check_now(self) -> None:
+        self._status_clear_timer.stop()
+        # One check at a time -- the button is re-enabled when the worker's
+        # answer comes back through check_now_responded.
+        self.check_now_button.setEnabled(False)
+        self._set_status("Checking for updates...", "")
+        threading.Thread(target=self._check_now_worker, daemon=True).start()
+
+    def _check_now_worker(self) -> None:
+        # force=True bypasses the 24h throttle -- the user explicitly asked.
+        # check_for_update_once never raises and returns None for BOTH "no
+        # newer release" and "fetch failed"; the two are told apart via the
+        # cache's last_checked stamp, which is only written by a completed
+        # (i.e. successfully fetched) check.
+        try:
+            checked_before = update_check.load_cache().get("last_checked")
+            result = update_check.check_for_update_once(
+                repo=update_check.GITHUB_REPO,
+                current_version=__version__,
+                force=True,
+            )
+            checked_after = update_check.load_cache().get("last_checked")
+            if result is not None:
+                message = ("update", result)
+            elif isinstance(checked_after, (int, float)) and checked_after != checked_before:
+                message = ("ok", None)
+            else:
+                message = ("failed", None)
+        except Exception:  # noqa: BLE001 -- a manual check must never crash the Settings tab
+            log.exception("Manual update check failed")
+            message = ("failed", None)
+        self.check_now_responded.emit(message)
+
+    def _on_check_now_responded(self, message) -> None:
+        self.check_now_button.setEnabled(True)
+        self.update_last_checked_label.setText(self._last_checked_text())
+        kind, payload = message
+        if kind == "update":
+            version, url = payload
+            if self._on_update_found is not None:
+                self._on_update_found(version, url)
+            self._set_status(f"Clipersal {version} is available -- see the banner on the Home tab.", "success")
+        elif kind == "ok":
+            self._set_status("You're up to date.", "success")
+        else:
+            self._set_status("Check failed (network?)", "error")
 
     def _browse_clips_dir(self) -> None:
         from PySide6.QtWidgets import QFileDialog
@@ -520,11 +907,14 @@ class SettingsFrame(QWidget):
         )
         if chosen:
             self.clips_dir_edit.setText(chosen)
+            # The entry is read-only, so this is the one path that changes
+            # it -- treat a confirmed pick like any other field edit.
+            self._schedule_apply()
 
-    # ---- Encoder card ------------------------------------------------------
+    # ---- Encoder tab ------------------------------------------------------
 
-    def _build_encoder_card(self, right_layout: QVBoxLayout, config: Config, current_encoder: str) -> None:
-        encoder_layout = self._make_card(right_layout, "Encoder")
+    def _build_encoder_card(self, tab_layout: QVBoxLayout, config: Config, current_encoder: str) -> None:
+        encoder_layout = self._make_card(tab_layout, "Encoder")
         card = encoder_layout.parentWidget()
 
         autodetect_row = QHBoxLayout()
@@ -551,17 +941,17 @@ class SettingsFrame(QWidget):
     def _on_autodetect_toggle(self, enabled: bool) -> None:
         self.encoder_control.setEnabled(not enabled)
 
-    # ---- Clip management card ---------------------------------------------
+    # ---- Clips tab --------------------------------------------------------
 
-    def _build_clip_management_card(self, right_layout: QVBoxLayout, config: Config) -> None:
-        clips_layout = self._make_card(right_layout, "Clip management")
+    def _build_clip_management_card(self, tab_layout: QVBoxLayout, config: Config) -> None:
+        clips_layout = self._make_card(tab_layout, None)
         card = clips_layout.parentWidget()
 
         clips_layout.addWidget(self._bold_label("Filename template", card))
         self.filename_template_edit = QLineEdit(config.filename_template, card)
         self.filename_template_edit.setFont(_qfont(mono=True))
         clips_layout.addWidget(self.filename_template_edit)
-        self._hint(clips_layout, "Placeholders: {date}, {time}, {datetime}", card)
+        self._hint(clips_layout, "Placeholders: {date}, {time}, {datetime}, {window} (active window title)", card)
 
         initial_retention = _clamped(config.clip_retention_days, _RETENTION_RANGE_DAYS)
         self.retention_value_label = self._field_row(
@@ -576,33 +966,82 @@ class SettingsFrame(QWidget):
         clips_layout.addWidget(self.retention_slider)
         self._hint(clips_layout, "0 = keep forever; older clips are deleted automatically otherwise", card)
 
-    # ---- Appearance card ---------------------------------------------------
+        # Same slider + value-badge shape as "Keep clips for" above; the
+        # sweep itself (concat.enforce_size_cap) runs on save and on apply.
+        initial_size_cap = _clamped(config.clips_max_gb, _SIZE_CAP_RANGE_GB)
+        self.size_cap_value_label = self._field_row(
+            clips_layout, "Max clips folder size", _format_size_cap_label(initial_size_cap), card
+        )
+        self.size_cap_slider = QSlider(Qt.Orientation.Horizontal, card)
+        self.size_cap_slider.setRange(*_SIZE_CAP_RANGE_GB)
+        self.size_cap_slider.setValue(initial_size_cap)
+        self.size_cap_slider.valueChanged.connect(
+            lambda v: self.size_cap_value_label.setText(_format_size_cap_label(v))
+        )
+        clips_layout.addWidget(self.size_cap_slider)
+        self._hint(
+            clips_layout,
+            "0 = Unlimited; past the cap the oldest clips are deleted -- favorites are always protected",
+            card,
+        )
 
-    def _build_appearance_card(self, right_layout: QVBoxLayout, config: Config) -> None:
-        appearance_layout = self._make_card(right_layout, "Appearance")
+    # ---- Appearance tab ---------------------------------------------------
+
+    def _build_appearance_card(self, tab_layout: QVBoxLayout, config: Config) -> None:
+        appearance_layout = self._make_card(tab_layout, None)
         card = appearance_layout.parentWidget()
 
-        # Same row shape as the launch-on-startup / check-for-updates toggles
-        # in the Save & hotkey card. Applying the flip live (no app restart)
-        # is cli.py's apply_settings job via theme.apply_theme + the
-        # theme_changed signal -- from this widget's side it's just another
-        # field in the Save payload.
-        dark_row = QHBoxLayout()
-        appearance_layout.addLayout(dark_row)
-        dark_text_col = QVBoxLayout()
-        dark_row.addLayout(dark_text_col, 1)
-        dark_text_col.addWidget(self._bold_label("Dark mode", card))
-        dark_desc = QLabel("Warm dark variant of the gold theme", card)
-        dark_desc.setObjectName("hint")
-        # Word-wrap like the encoder card's description: an unwrapped hint
-        # this long inflates the right column's minimum width past the
-        # scroll viewport and pushes the switch itself out of view.
-        dark_desc.setWordWrap(True)
-        dark_text_col.addWidget(dark_desc)
-        self.dark_mode_switch = ToggleSwitch(card, checked=config.dark_mode)
-        dark_row.addWidget(self.dark_mode_switch)
+        # Applying the flip live (no app restart) is cli.py's apply_settings
+        # job via theme.apply_theme + the theme_changed signal -- from this
+        # widget's side it's just another field in the autosave payload. An
+        # unknown persisted mode (a hand-edited config) shows as "System",
+        # and the next apply normalizes it to a real mode.
+        appearance_layout.addWidget(self._bold_label("Theme", card))
+        self.theme_control = SegmentedControl(list(_THEME_MODES), card)
+        self.theme_control.setFont(_qfont(mono=True))
+        self.theme_control.setCurrent(_THEME_MODE_LABELS.get(config.theme_mode, "System"))
+        appearance_layout.addWidget(self.theme_control)
+        self._hint(appearance_layout, "System follows your OS dark-mode setting", card)
 
-    # ---- save ---------------------------------------------------------------
+    # ---- reset to defaults --------------------------------------------------
+
+    def _on_reset_to_defaults(self) -> None:
+        answer = quiet_message(
+            self,
+            "Reset to defaults",
+            "Reset every setting to its factory default?\n\n"
+            "This resets: buffer length, capture target, microphone and volumes, "
+            "frame rate and resolution scale, quality preset and bitrate, encoder, "
+            "all hotkeys, filename template, clip retention and folder size cap, "
+            "save sound, theme (follows the system), launch on startup (turns off), "
+            "and update checks (turn on).\n\n"
+            "The clips folder also resets to the default:\n"
+            f"{_default_clips_dir()}\n\n"
+            "Your saved clips are not deleted.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._status_clear_timer.stop()
+        # A pending autosave would fire after the reload and re-apply
+        # whatever the OLD fields held -- the reset supersedes it.
+        self._apply_timer.stop()
+        self._dirty = False
+        payload = default_settings_payload()
+        error = self._on_apply(payload)
+        if error:
+            self._set_status(error, "error")
+            return
+        # The reset payload becomes the new last-known-good BEFORE the
+        # rebuild, so anything the fresh widgets report is compared against
+        # the values actually in effect.
+        self._last_good = payload
+        self._reload(payload)
+        self._set_status("Saved ✓", "success")
+        self._status_clear_timer.start(_SAVED_MESSAGE_CLEAR_MS)
+
+    # ---- autosave -------------------------------------------------------------
 
     def _set_status(self, text: str, state: str) -> None:
         self.status_label.setText(text)
@@ -611,27 +1050,234 @@ class SettingsFrame(QWidget):
         style.unpolish(self.status_label)
         style.polish(self.status_label)
 
-    def _on_save(self) -> None:
+    def _hotkey_fields(self) -> list[tuple[HotkeyField, str]]:
+        """Every HotkeyField on the tab, paired with its payload key."""
+        return [
+            (self.hotkey_field, "hotkey_combo"),
+            (self.quick_save_hotkey_1_field, "quick_save_hotkey_1"),
+            (self.quick_save_hotkey_2_field, "quick_save_hotkey_2"),
+            (self.screenshot_hotkey_field, "screenshot_hotkey"),
+        ]
+
+    def _connect_autosave(self) -> None:
+        """Wire every field's settled-change signal to the debounced autosave.
+
+        Signal choice per widget: settled values only -- a combo's
+        currentIndexChanged, a segmented control's currentTextChanged, a
+        switch's toggled, a spinbox's valueChanged (the debounce coalesces
+        arrow-key repeats and typed digits), a line edit's editingFinished.
+        Sliders use sliderReleased, NOT valueChanged: bitrate/buffer-class
+        fields restart capture on apply, and valueChanged fires per pixel of
+        drag. The "Check now" button is an action, not a field, and stays
+        unwired.
+        """
+        for slider in (
+            self.buffer_slider,
+            self.desktop_volume_slider,
+            self.mic_volume_slider,
+            self.bitrate_slider,
+            self.retention_slider,
+            self.size_cap_slider,
+        ):
+            slider.sliderReleased.connect(self._schedule_apply)
+
+        for combo in (self.framerate_combo, self.resolution_scale_combo, self.window_combo):
+            combo.currentIndexChanged.connect(self._schedule_apply)
+        if self.monitor_combo is not None:
+            self.monitor_combo.currentIndexChanged.connect(self._schedule_apply)
+        if self.mic_combo is not None:
+            self.mic_combo.currentIndexChanged.connect(self._schedule_apply)
+
+        for control in (self.target_control, self.preset_control, self.encoder_control, self.theme_control):
+            control.currentTextChanged.connect(self._schedule_apply)
+
+        for switch in (
+            self.autodetect_switch,
+            self.launch_on_startup_switch,
+            self.check_for_updates_switch,
+            self.save_sound_switch,
+        ):
+            switch.toggled.connect(self._schedule_apply)
+
+        self.quick_save_seconds_1_spin.valueChanged.connect(self._schedule_apply)
+        self.quick_save_seconds_2_spin.valueChanged.connect(self._schedule_apply)
+
+        self.filename_template_edit.editingFinished.connect(self._on_template_editing_finished)
+        for field, key in self._hotkey_fields():
+            field.recording_finished.connect(lambda f=field, k=key: self._on_hotkey_field_settled(f, k))
+            field.entry.editingFinished.connect(lambda f=field, k=key: self._on_hotkey_field_settled(f, k))
+
+    def _schedule_apply(self) -> None:
+        """(Re)start the debounce. Changes landing while an apply runs
+        synchronously can't be serviced re-entrantly, so they just mark the
+        dirty flag for one follow-up pass when the apply returns."""
+        if self._applying:
+            self._dirty = True
+            return
+        self._apply_timer.start()  # start() on a running single-shot timer restarts it
+
+    def _on_template_editing_finished(self) -> None:
+        # editingFinished also fires on a plain focus-out with no edit --
+        # don't apply (and flash "Saved ✓") over nothing.
+        if self.filename_template_edit.text().strip() != self._last_good.get("filename_template"):
+            self._schedule_apply()
+
+    def _on_hotkey_field_settled(self, field: HotkeyField, key: str) -> None:
+        # Same no-change skip as the template field. It doubles as the
+        # recorder's cancel path: a cancelled recording restores the
+        # pre-record text, which equals the snapshot when nothing changed.
+        if field.combo().strip() != self._last_good.get(key, ""):
+            self._schedule_apply()
+
+    def _apply_now(self) -> None:
+        """The debounce fire: validate, apply, then commit or roll back."""
+        if self._applying:  # re-entrant fire (an event pumped mid-apply)
+            self._dirty = True
+            return
+        # Never read a hotkey field mid-record -- its entry shows "Press
+        # keys..." or a half-captured combo, not a persistable value. Defer;
+        # the recorder's recording_finished reschedules if the combo actually
+        # changed, and this re-armed timer covers the cancel-unchanged case.
+        if any(field.is_recording() for field, _key in self._hotkey_fields()):
+            self._apply_timer.start()
+            return
         self._status_clear_timer.stop()
+        payload = self._build_payload()
+        if payload is None:
+            # A guard rejected the current values (the reason is already on
+            # the status label). The field keeps its text -- the user may
+            # still be mid-edit; the next settled change re-schedules.
+            return
+        self._applying = True
+        self._dirty = False
+        try:
+            error = self._on_apply(payload)
+        finally:
+            self._applying = False
+        if error:
+            # Roll every control back to the last-known-good payload so the
+            # fields show exactly what is in effect; whatever was touched
+            # during the failed apply goes with it.
+            self._dirty = False
+            self._set_status(error, "error")
+            self._restore_controls(self._last_good)
+            return
+        self._last_good = payload
+        self._set_status("Saved ✓", "success")
+        self._status_clear_timer.start(_SAVED_MESSAGE_CLEAR_MS)
+        if self._dirty:
+            self._dirty = False
+            self._apply_timer.start()
 
-        # Saving while the recorder is mid-capture would read (and persist)
-        # its "Press keys..." placeholder as the combo -- cancel the
-        # recording first so the pre-record text is what gets read below.
-        if self.hotkey_field.is_recording():
-            self.hotkey_field.cancel_recording()
+    def _restore_controls(self, values: dict) -> None:
+        """Roll every control back to the last-known-good payload after a
+        failed apply. Signals are blocked per widget so the rollback can't
+        re-trigger the autosave it undoes; the value labels and dependent
+        panels those signals would have refreshed are updated by hand (the
+        same handlers the build path primes after connecting).
+        """
+        if not values:
+            return
 
+        def set_blocked(widget, setter) -> None:
+            widget.blockSignals(True)
+            try:
+                setter()
+            finally:
+                widget.blockSignals(False)
+
+        set_blocked(self.buffer_slider, lambda: self.buffer_slider.setValue(values["buffer_seconds"]))
+        self.buffer_value_label.setText(f"{values['buffer_seconds']}s")
+        set_blocked(self.clips_dir_edit, lambda: self.clips_dir_edit.setText(values["clips_dir"]))
+        for field, key in self._hotkey_fields():
+            set_blocked(field.entry, lambda f=field, k=key: f.entry.setText(values[k]))
+        set_blocked(
+            self.quick_save_seconds_1_spin,
+            lambda: self.quick_save_seconds_1_spin.setValue(values["quick_save_seconds_1"]),
+        )
+        set_blocked(
+            self.quick_save_seconds_2_spin,
+            lambda: self.quick_save_seconds_2_spin.setValue(values["quick_save_seconds_2"]),
+        )
+
+        preset_label_by_value = {value: label for label, value in _QUALITY_PRESET_CHOICES}
+        # SegmentedControl.setCurrent never emits, so no blocking needed there.
+        self.preset_control.setCurrent(preset_label_by_value.get(values["quality_preset"], "Custom"))
+        self._on_preset_change()
+        mbps = bitrate_string_to_mbps(values["video_bitrate"])
+        set_blocked(self.bitrate_slider, lambda: self.bitrate_slider.setValue(mbps))
+        self.bitrate_value_label.setText(f"{mbps} Mbps")
+
+        self.target_control.setCurrent(_CAPTURE_TARGET_LABELS.get(values["capture_mode"], "Desktop"))
+        self._on_target_change()
+        if self.monitor_combo is not None:
+            label_by_index = {index: label for label, index in self._monitor_index_by_label.items()}
+            monitor_label = label_by_index.get(values["monitor_index"])
+            if monitor_label is not None:
+                set_blocked(self.monitor_combo, lambda: self.monitor_combo.setCurrentText(monitor_label))
+        if values["capture_mode"] == "window":
+            title = values["window_title"] or _NO_WINDOW_SELECTED
+            if self.window_combo.findText(title) >= 0:
+                set_blocked(self.window_combo, lambda: self.window_combo.setCurrentText(title))
+        if self.mic_combo is not None:
+            mic_label = values["mic_device"] or "None"
+            if self.mic_combo.findText(mic_label) >= 0:
+                set_blocked(self.mic_combo, lambda: self.mic_combo.setCurrentText(mic_label))
+        self._on_mic_volume_state_change()
+        set_blocked(self.desktop_volume_slider, lambda: self.desktop_volume_slider.setValue(values["desktop_volume"]))
+        self.desktop_volume_value_label.setText(f"{values['desktop_volume']}%")
+        set_blocked(self.mic_volume_slider, lambda: self.mic_volume_slider.setValue(values["mic_volume"]))
+        self.mic_volume_value_label.setText(f"{values['mic_volume']}%")
+
+        is_auto = values["encoder_override"] is None
+        # The silent variant keeps the switch's own toggled->knob animation
+        # from being swallowed by the signal block.
+        self.autodetect_switch.set_checked_silently(is_auto)
+        self.encoder_control.setCurrent(
+            self._encoder_label_by_value.get(values["encoder_override"] or self._current_encoder, "libx264")
+        )
+        self._on_autodetect_toggle(is_auto)
+
+        set_blocked(
+            self.filename_template_edit,
+            lambda: self.filename_template_edit.setText(values["filename_template"]),
+        )
+        set_blocked(self.retention_slider, lambda: self.retention_slider.setValue(values["clip_retention_days"]))
+        self.retention_value_label.setText(_format_retention_label(values["clip_retention_days"]))
+        set_blocked(self.size_cap_slider, lambda: self.size_cap_slider.setValue(values["clips_max_gb"]))
+        self.size_cap_value_label.setText(_format_size_cap_label(values["clips_max_gb"]))
+        self.launch_on_startup_switch.set_checked_silently(values["launch_on_startup"])
+        self.check_for_updates_switch.set_checked_silently(values["check_for_updates"])
+        self.save_sound_switch.set_checked_silently(values["save_sound_enabled"])
+        self.theme_control.setCurrent(_THEME_MODE_LABELS.get(values["theme_mode"], "System"))
+        framerate_index = self.framerate_combo.findData(values["framerate"])
+        if framerate_index >= 0:
+            set_blocked(self.framerate_combo, lambda: self.framerate_combo.setCurrentIndex(framerate_index))
+        scale_index = self.resolution_scale_combo.findData(values["resolution_scale"])
+        if scale_index >= 0:
+            set_blocked(self.resolution_scale_combo, lambda: self.resolution_scale_combo.setCurrentIndex(scale_index))
+
+    def _build_payload(self) -> dict | None:
+        """Assemble the full settings payload from the current control
+        values -- the one and only place the field->payload mapping lives
+        (the autosave fire and its last-known-good snapshot both read
+        through here). Returns None when a guard rejects the current values;
+        the guard has already put the reason on the status label, and the
+        field is left as-is (the user may still be mid-edit -- never revert
+        an empty field under their fingers).
+        """
         hotkey_text = self.hotkey_field.combo().strip()
         if not hotkey_text:
             self._set_status("Hotkey cannot be empty.", "error")
-            return
+            return None
         clips_text = self.clips_dir_edit.text().strip()
         if not clips_text:
             self._set_status("Clips folder cannot be empty.", "error")
-            return
+            return None
         filename_template_text = self.filename_template_edit.text().strip()
         if not filename_template_text:
             self._set_status("Filename template cannot be empty.", "error")
-            return
+            return None
 
         is_auto = self.autodetect_switch.isChecked()
         encoder_override = None if is_auto else self._encoder_value_by_label.get(self.encoder_control.current())
@@ -661,33 +1307,37 @@ class SettingsFrame(QWidget):
         else:
             mic_device_value = self._config.mic_device
 
-        error = self._on_apply(
-            {
-                "buffer_seconds": self.buffer_slider.value(),
-                "clips_dir": clips_text,
-                "hotkey_combo": hotkey_text,
-                "video_bitrate": video_bitrate_value,
-                "quality_preset": selected_preset,
-                "capture_mode": capture_mode_value,
-                "monitor_index": monitor_index_value,
-                "window_title": window_title_value,
-                "mic_device": mic_device_value,
-                "desktop_volume": self.desktop_volume_slider.value(),
-                "mic_volume": self.mic_volume_slider.value(),
-                "encoder_override": encoder_override,
-                "filename_template": filename_template_text,
-                "clip_retention_days": self.retention_slider.value(),
-                "launch_on_startup": self.launch_on_startup_switch.isChecked(),
-                "check_for_updates": self.check_for_updates_switch.isChecked(),
-                "dark_mode": self.dark_mode_switch.isChecked(),
-            }
-        )
-        if error:
-            self._set_status(error, "error")
-            return
-
-        self._set_status("Settings saved.", "success")
-        self._status_clear_timer.start(_SAVED_MESSAGE_CLEAR_MS)
+        return {
+            "buffer_seconds": self.buffer_slider.value(),
+            "clips_dir": clips_text,
+            "hotkey_combo": hotkey_text,
+            "video_bitrate": video_bitrate_value,
+            "quality_preset": selected_preset,
+            "capture_mode": capture_mode_value,
+            "monitor_index": monitor_index_value,
+            "window_title": window_title_value,
+            "mic_device": mic_device_value,
+            "desktop_volume": self.desktop_volume_slider.value(),
+            "mic_volume": self.mic_volume_slider.value(),
+            "encoder_override": encoder_override,
+            "filename_template": filename_template_text,
+            "clip_retention_days": self.retention_slider.value(),
+            "launch_on_startup": self.launch_on_startup_switch.isChecked(),
+            "check_for_updates": self.check_for_updates_switch.isChecked(),
+            "theme_mode": _THEME_MODES.get(self.theme_control.current(), "system"),
+            "framerate": self.framerate_combo.currentData(),
+            "resolution_scale": self.resolution_scale_combo.currentData(),
+            # Empty combos pass through as "" (= disabled); validating
+            # non-empty ones is apply_settings' job, and its error string
+            # lands on the status label like any other failure.
+            "quick_save_hotkey_1": self.quick_save_hotkey_1_field.combo().strip(),
+            "quick_save_seconds_1": self.quick_save_seconds_1_spin.value(),
+            "quick_save_hotkey_2": self.quick_save_hotkey_2_field.combo().strip(),
+            "quick_save_seconds_2": self.quick_save_seconds_2_spin.value(),
+            "screenshot_hotkey": self.screenshot_hotkey_field.combo().strip(),
+            "clips_max_gb": self.size_cap_slider.value(),
+            "save_sound_enabled": self.save_sound_switch.isChecked(),
+        }
 
 
 def build_settings_frame(
@@ -698,8 +1348,12 @@ def build_settings_frame(
     current_encoder: str,
     on_apply: Callable[[dict], str | None],
     ffmpeg_path: str,
+    on_update_found: Callable[[str, str], None] | None = None,
 ) -> SettingsFrame:
     """Thin factory function kept for API parity with the CustomTkinter
     original's `build_settings_frame(...)` shape.
     """
-    return SettingsFrame(config, ipc_port, save_events, current_encoder, on_apply, ffmpeg_path, parent)
+    return SettingsFrame(
+        config, ipc_port, save_events, current_encoder, on_apply, ffmpeg_path, parent,
+        on_update_found=on_update_found,
+    )

@@ -430,7 +430,7 @@ loads the persisted overrides once and uses them as argparse *defaults* -- so a 
 user explicitly passes on the command line always wins, but otherwise a saved Settings
 value beats the hardcoded fallback.
 
-**Applying a change** (`cli.py`'s `apply_settings`, called from the Save button) differs
+**Applying a change** (`cli.py`'s `apply_settings`) differs
 per field, because not everything can change without touching the running ffmpeg process:
 
 - **Buffer length**, **clips folder**, **filename template**, and **retention days** are
@@ -442,8 +442,9 @@ per field, because not everything can change without touching the running ffmpeg
   `clips_dir_provider` lambda instead of a frozen `Path`, so the Clips tab and "Open clips
   folder" also follow a folder change without a restart.
 - **Hotkey combo** is validated with pynput's own parser before anything is touched -- an
-  unparseable combo (including the recorder's "Press keys..." placeholder, which the
-  Settings/wizard Save paths cancel out of first) is rejected with an inline error and
+  unparseable combo (including the recorder's "Press keys..." placeholder -- the Settings
+  autosave defers until the recorder finishes, and the wizard's Save path cancels out of
+  it first) is rejected with an inline error and
   never persisted, because a broken combo would otherwise silently leave the hotkey dead
   on every launch. A valid change rebinds `HotkeyListener` (`rebind_hotkey()`),
   constructing the new binding before tearing down the old one; a bind failure (e.g. the
@@ -463,6 +464,24 @@ per field, because not everything can change without touching the running ffmpeg
   preserves whichever paused/running state
   was already in effect and reuses the same `buffer_dir` (segment filenames are
   timestamped, so there's no collision with segments from before the restart).
+
+The Settings tab has **no Save button** -- every field autosaves. Each widget's
+settled-change signal (a combo's `currentIndexChanged`, a switch's `toggled`, a
+slider's `sliderReleased` -- deliberately NOT `valueChanged`, so a drag can't restart
+capture per pixel -- a spinbox's `valueChanged`, a line edit's `editingFinished`, a
+hotkey field's `recording_finished`) restarts a single 500 ms debounce `QTimer`
+(`settings_window_qt.py`), whose fire applies the whole payload assembled from every
+field (`_build_payload`) -- so a burst of edits is one apply, and capture-restarting
+fields never fire mid-gesture. The apply runs synchronously on the GUI thread (a
+capture restart smoke-encodes), so a change landing mid-apply only marks a dirty flag
+and gets exactly one follow-up pass. On failure the error shows inline and every
+control rolls back to the last-known-good payload with signals blocked (the rollback
+must not re-trigger the autosave it undoes); on a guard rejection (empty hotkey /
+clips folder / filename template) nothing is applied and the field is left as-is,
+since the user may still be mid-edit. A firing debounce never reads a hotkey field
+mid-record -- it re-arms and waits for `recording_finished`, which fires on accept
+and cancel alike (a cancel restores the pre-record text, so "nothing changed" hosts
+skip the apply by comparing against the snapshot).
 
 Because encoder/bitrate changes replace `state.session` and `state.setup` outright,
 `cli.py` keeps them behind a small `_AppState` container that IPC handler closures read
@@ -645,6 +664,13 @@ Produces `dist/Clipersal/Clipersal.exe` (onedir, windowed, `assets/icon.ico`) an
 `pyinstaller-hooks-contrib`, needed for `pynput`'s hook. PySide6 doesn't need it --
 modern PyInstaller (>=6) ships first-party PySide6 hooks internally.
 
+The spec shrinks the bundle by excluding unused PySide6 submodules (QtQml, QtQuick,
+QtWebEngine, ...). `QtMultimedia`/`QtMultimediaWidgets` were on that list until the
+in-app player (`player_qt.py`) landed — they're kept now: the few extra MB buy
+double-click playback and playhead-driven trimming, and the runtime import guard in
+`player_qt.py` keeps the source-tree fallback (OS default player) working on installs
+where the multimedia backend is missing anyway.
+
 ### A real bug packaging found: `CTRL_BREAK_EVENT` needs a console
 
 `capture.SegmentedCapture._stop_process` used to send `signal.CTRL_BREAK_EVENT` to stop
@@ -744,6 +770,14 @@ of the script is a hand-maintained constant kept in sync with `pyproject.toml`'s
 (Inno has no built-in way to read a TOML file at compile time); `AppId` is a fixed GUID
 that must never change across versions, since Windows uses it to recognize "this is an
 upgrade of the same app" rather than a separate parallel install.
+
+The installer also carries an `installffmpeg` task (on by default): on `ssPostInstall`,
+if ffmpeg isn't already on `PATH`, it tries `winget install --id Gyan.FFmpeg` and, if
+that fails or winget is absent, offers to open the ffmpeg download page in the browser.
+Downloading at install time is deliberately not bundling -- the ffmpeg binary never
+ships inside `ClipersalSetup-*.exe`, so the size/licensing/maintenance reasoning in
+"Why ffmpeg is not bundled" above is untouched; winget is simply the most convenient
+way to satisfy the same system dependency.
 
 Verified end-to-end on this machine, not just written: a silent install
 (`/VERYSILENT /SUPPRESSMSGBOXES`) placed files under

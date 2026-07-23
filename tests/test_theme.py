@@ -209,3 +209,89 @@ def test_value_badge_keeps_its_raised_track_background(qapp) -> None:
     window.close()
 
     assert pixel.name() == theme.LIGHT_TOKENS["TRACK"].lower()
+
+
+# ---- stylesheet structure guards -----------------------------------------------
+
+
+def test_stylesheet_has_settings_tab_styling() -> None:
+    sheet = theme.build_stylesheet()
+    assert "QTabWidget::pane" in sheet
+    assert "QTabBar::tab:selected" in sheet
+    # The selected tab's indicator is the accent top edge on both palettes.
+    assert f"border-top: 2px solid {theme.LIGHT_TOKENS['ACCENT']}" in sheet
+    theme.apply_theme(True)
+    dark_sheet = theme.build_stylesheet()
+    assert f"border-top: 2px solid {theme.DARK_TOKENS['ACCENT']}" in dark_sheet
+
+
+def test_stylesheet_has_scroll_viewport_transparency_rule() -> None:
+    # Regression pin: an unthemed scroll viewport painted a platform-grey /
+    # dark box behind scrolled pages (the "rogue dark background" report).
+    assert "QScrollArea QWidget#qt_scrollarea_viewport" in theme.build_stylesheet()
+    assert "background: transparent;" in theme.build_stylesheet()
+
+
+def test_stylesheet_pins_disabled_input_colors() -> None:
+    sheet = theme.build_stylesheet()
+    assert "QLineEdit:disabled" in sheet
+    assert "QPlainTextEdit:disabled" in sheet
+
+
+def test_stylesheet_has_themed_idle_video_surface() -> None:
+    sheet = theme.build_stylesheet()
+    assert "QVideoWidget#videoSurface" in sheet
+    assert theme.LIGHT_TOKENS["SURFACE_RAISED"] in sheet
+
+
+def test_pushbuttons_have_a_legibility_min_height() -> None:
+    sheet = theme.build_stylesheet()
+    assert "min-height: 28px" in sheet
+    # ...but compact controls are explicitly exempt from the floor.
+    assert "min-height: 0" in sheet
+
+
+# ---- typography scale ----------------------------------------------------------
+
+
+def test_typography_scale_values() -> None:
+    assert theme.FONT_H1 == 18
+    assert theme.FONT_H2 == 14
+    assert theme.FONT_BODY == 12
+    assert theme.FONT_HINT == 11
+    assert theme.FONT_MONO == 11
+
+
+def test_qfont_defaults_to_body_size() -> None:
+    assert theme.qfont().pointSize() == theme.FONT_BODY
+
+
+def test_stylesheet_themes_horizontal_scrollbars_too() -> None:
+    # The Logs textbox's horizontal scrollbar painted a platform-default
+    # white/grey strip in dark mode until it got the vertical rules' twin.
+    sheet = theme.build_stylesheet()
+    assert "QScrollBar:horizontal" in sheet
+    assert "QScrollBar::handle:horizontal" in sheet
+
+
+def test_heart_button_has_no_side_padding_to_clip_its_glyph() -> None:
+    # 14px side-padding inside a 32px-fixed glyph button clipped the heart;
+    # only a small bottom padding remains, for optical centering.
+    heart_block = theme.build_stylesheet().split("QPushButton#heartButton")[1].split("}")[0]
+    assert "padding: 0 0 2px 0;" in heart_block
+
+
+def test_menu_button_is_exempt_from_the_legibility_floor() -> None:
+    # The gallery row's "⋯" overflow button: tight glyph sizing, not the
+    # base QPushButton 28px min-height / 14px side-padding.
+    menu_block = theme.build_stylesheet().split("QPushButton#menuButton")[1].split("}")[0]
+    assert "padding: 0 0 4px 0;" in menu_block
+    assert "min-height: 0;" in menu_block
+
+
+def test_support_button_hover_uses_accent_text() -> None:
+    # The sidebar's "♥ Support" link: navButton-shaped, accent text on hover.
+    sheet = theme.build_stylesheet()
+    assert "QPushButton#supportButton" in sheet
+    hover_block = sheet.split("QPushButton#supportButton:hover")[1].split("}")[0]
+    assert f"color: {theme.ACCENT};" in hover_block

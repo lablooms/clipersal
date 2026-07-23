@@ -21,6 +21,8 @@ from PySide6.QtCore import Property, QEasingCurve, QPropertyAnimation, QRectF, Q
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import QWidget
 
+from clipersal import theme
+
 _PULSE_DURATION_MS = 700
 _SATELLITE_COUNT = 3
 
@@ -30,7 +32,7 @@ class StatusDot(QWidget):
         self,
         size: int = 28,
         dot_diameter: int | None = None,
-        color: str = "#3fae4a",
+        color: str | None = None,
         parent: QWidget | None = None,
     ) -> None:
         # `size` is the widget's own bounding box, deliberately larger than
@@ -40,11 +42,16 @@ class StatusDot(QWidget):
         # clipped away invisibly the instant they moved past the resting
         # dot's own radius. The extra padding is transparent background, not
         # a visible box, so it just reads as breathing room around the dot.
+        #
+        # `color` defaults to the CURRENT theme.GOOD, resolved here (at call
+        # time) rather than as a frozen default-argument hex: a literal
+        # default is evaluated once at import and would ignore whichever
+        # palette apply_theme() last installed.
         super().__init__(parent)
         self.setFixedSize(size, size)
         self._dot_diameter = dot_diameter if dot_diameter is not None else size / 2
-        self._color = QColor(color)
-        self._pulse_color = QColor(color)
+        self._color = QColor(color if color is not None else theme.GOOD)
+        self._pulse_color = QColor(self._color)
         self._progress = 0.0
         self._pulse_anim: QPropertyAnimation | None = None
 

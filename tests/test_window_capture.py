@@ -182,6 +182,8 @@ def test_user32_prototypes_use_real_handle_types() -> None:
     assert user32.GetWindowRect.restype == wintypes.BOOL
     assert user32.IsIconic.argtypes == [wintypes.HWND]
     assert user32.IsIconic.restype == wintypes.BOOL
+    assert user32.GetForegroundWindow.argtypes == []
+    assert user32.GetForegroundWindow.restype == wintypes.HWND
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="ctypes.windll is Windows-only")
@@ -226,3 +228,138 @@ def test_minimized_windows_are_excluded_from_the_picker(monkeypatch) -> None:
     result = window_capture._list_windows_windows()
 
     assert [w.title for w in result] == ["Visible App"]
+
+
+# ---- active_window_title ({window} filename placeholder) -------------------------
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="ctypes.windll is Windows-only")
+def test_active_window_title_windows_reads_the_foreground_window(monkeypatch) -> None:
+    class FakeUser32:
+        def GetForegroundWindow(self):
+            return 123
+
+        def GetWindowTextLengthW(self, hwnd):
+            assert hwnd == 123
+            return len("My Game")
+
+        def GetWindowTextW(self, hwnd, buf, _count):
+            buf.value = "My Game"
+            return len("My Game")
+
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(user32=FakeUser32()))
+
+    assert window_capture.active_window_title(OS.WINDOWS) == "My Game"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="ctypes.windll is Windows-only")
+def test_active_window_title_windows_none_without_a_foreground_window_or_title(monkeypatch) -> None:
+    class FakeUser32:
+        def __init__(self, hwnd, length):
+            self._hwnd = hwnd
+            self._length = length
+
+        def GetForegroundWindow(self):
+            return self._hwnd
+
+        def GetWindowTextLengthW(self, hwnd):
+            return self._length
+
+    # No foreground window (NULL handle)...
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(user32=FakeUser32(None, 10)))
+    assert window_capture.active_window_title(OS.WINDOWS) is None
+    # ...and a foreground window with no title both read as "no title".
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(user32=FakeUser32(123, 0)))
+    assert window_capture.active_window_title(OS.WINDOWS) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="ctypes.windll is Windows-only")
+def test_active_window_title_windows_never_raises_on_a_failed_probe(monkeypatch) -> None:
+    class FakeUser32:
+        def GetForegroundWindow(self):
+            raise OSError("win32 error (fake)")
+
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(user32=FakeUser32()))
+
+    assert window_capture.active_window_title(OS.WINDOWS) is None
+
+
+def test_active_window_title_x11_parses_the_two_xprop_probes(monkeypatch) -> None:
+    outputs = {
+        ("xprop", "-root", "_NET_ACTIVE_WINDOW"): "_NET_ACTIVE_WINDOW(WINDOW): window id # 0x03a00011\n",
+        ("xprop", "-id", "0x03a00011", "_NET_WM_NAME"): '_NET_WM_NAME(UTF8_STRING) = "My Browser Tab"\n',
+    }
+    captured_kwargs = {}
+
+    def fake_run(cmd, **kwargs):
+        captured_kwargs.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout=outputs[tuple(cmd)], stderr="")
+
+    monkeypatch.setattr("clipersal.window_capture.subprocess.run", fake_run)
+
+    assert window_capture.active_window_title(OS.LINUX, LinuxSessionType.X11) == "My Browser Tab"
+    # Same never-raises decoding as the other xprop call in this module.
+    assert captured_kwargs["encoding"] == "utf-8"
+    assert captured_kwargs["errors"] == "replace"
+    assert captured_kwargs["timeout"] == window_capture._XPROP_TIMEOUT
+
+
+def test_active_window_title_x11_none_when_nothing_has_focus(monkeypatch) -> None:
+    # _NET_ACTIVE_WINDOW of 0x0 = no active window -- the second probe must
+    # not even run.
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="_NET_ACTIVE_WINDOW(WINDOW): window id # 0x0\n", stderr="")
+
+    monkeypatch.setattr("clipersal.window_capture.subprocess.run", fake_run)
+
+    assert window_capture.active_window_title(OS.LINUX, LinuxSessionType.X11) is None
+    assert len(calls) == 1
+
+
+def test_active_window_title_x11_none_for_a_missing_or_blank_wm_name(monkeypatch) -> None:
+    def make_run(name_stdout):
+        def fake_run(cmd, **kwargs):
+            if cmd[1] == "-root":
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="_NET_ACTIVE_WINDOW(WINDOW): window id # 0x03a00011\n", stderr=""
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout=name_stdout, stderr="")
+
+        return fake_run
+
+    monkeypatch.setattr("clipersal.window_capture.subprocess.run", make_run("_NET_WM_NAME:  not found.\n"))
+    assert window_capture.active_window_title(OS.LINUX, LinuxSessionType.X11) is None
+
+    monkeypatch.setattr("clipersal.window_capture.subprocess.run", make_run('_NET_WM_NAME(UTF8_STRING) = "   "\n'))
+    assert window_capture.active_window_title(OS.LINUX, LinuxSessionType.X11) is None
+
+
+def test_active_window_title_x11_never_raises_when_xprop_fails(monkeypatch) -> None:
+    def missing_run(cmd, **kwargs):
+        raise FileNotFoundError("xprop not found")
+
+    monkeypatch.setattr("clipersal.window_capture.subprocess.run", missing_run)
+    assert window_capture.active_window_title(OS.LINUX, LinuxSessionType.X11) is None
+
+    def slow_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, 5)
+
+    monkeypatch.setattr("clipersal.window_capture.subprocess.run", slow_run)
+    assert window_capture.active_window_title(OS.LINUX, LinuxSessionType.X11) is None
+
+
+def test_active_window_title_returns_none_on_wayland_and_unsupported_os(monkeypatch) -> None:
+    # No probe may even run: Wayland's portal deliberately doesn't expose
+    # other apps' titles, and macOS capture isn't started.
+    def run_must_not_happen(*a, **k):
+        raise AssertionError("no subprocess probe expected on this platform")
+
+    monkeypatch.setattr("clipersal.window_capture.subprocess.run", run_must_not_happen)
+
+    assert window_capture.active_window_title(OS.LINUX, LinuxSessionType.WAYLAND) is None
+    assert window_capture.active_window_title(OS.LINUX, LinuxSessionType.UNKNOWN) is None
+    assert window_capture.active_window_title(OS.MACOS) is None
+    assert window_capture.active_window_title(OS.OTHER) is None

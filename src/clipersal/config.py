@@ -53,11 +53,37 @@ class Config:
     hotkey_combo: str = _DEFAULT_HOTKEY_COMBO
     hotkey_enabled: bool = True
     tray_enabled: bool = True
-    filename_template: str = "clip-{date}-{time}"
+    filename_template: str = "{window}-{date}-{time}"
     clip_retention_days: int = 0  # 0 = keep saved clips forever
     launch_on_startup: bool = False
     check_for_updates: bool = True
-    dark_mode: bool = False  # False = the original light Pollen Gold theme (pre-dark-mode behavior)
+    # Three-way theme selection: "system" (the default) follows the OS
+    # dark-mode setting via platform_detect.system_dark_preferred; "light" /
+    # "dark" force the Pollen Gold variant. "system" is the new default on
+    # purpose -- the old boolean's false-for-everyone maps to it (see the
+    # config_store migration).
+    theme_mode: str = "system"  # "system" | "light" | "dark"
+    # Output downscale: "native" (default) keeps the capture resolution and
+    # adds nothing to the ffmpeg filter chain (the Phase 8 byte-identical
+    # rule); "1080p"/"720p" insert a scale=-2:<height> stage -- see
+    # capture._build_command.
+    resolution_scale: str = "native"  # "native" | "1080p" | "720p"
+    # One-tap "save the last N seconds" and screenshot hotkeys, on top of the
+    # main save combo. Empty string = disabled (the default -- a fresh config
+    # binds exactly the one pre-existing hotkey).
+    quick_save_hotkey_1: str = ""
+    quick_save_seconds_1: int = 30
+    quick_save_hotkey_2: str = ""
+    quick_save_seconds_2: int = 60
+    screenshot_hotkey: str = ""
+    # Clips folder size cap in GiB: 0 (the default) = unlimited, so an old
+    # config file never deletes anything (same opt-in rule as
+    # clip_retention_days). Swept by concat.enforce_size_cap after every
+    # save and on Settings apply.
+    clips_max_gb: int = 0
+    # Save-sound toggle. Defaults off, preserving the exact pre-0.1.4
+    # behavior.
+    save_sound_enabled: bool = False
 
     def __post_init__(self) -> None:
         self.clips_dir = Path(self.clips_dir).expanduser()
@@ -113,7 +139,17 @@ def build_arg_parser(persisted: dict[str, Any] | None = None) -> argparse.Argume
         help="Target video bitrate, e.g. 8M (default: 8M)",
     )
     parser.add_argument(
-        "--framerate", type=int, default=30, help="Capture framerate (default: 30)"
+        "--framerate",
+        type=int,
+        default=persisted.get("framerate", 30),
+        help="Capture framerate (default: 30)",
+    )
+    parser.add_argument(
+        "--resolution-scale",
+        type=str,
+        choices=["native", "1080p", "720p"],
+        default=persisted.get("resolution_scale", "native"),
+        help="Downscale the saved video to this height, or 'native' to keep the capture resolution (default: native)",
     )
     parser.add_argument(
         "--capture-mode",
@@ -190,8 +226,11 @@ def build_arg_parser(persisted: dict[str, Any] | None = None) -> argparse.Argume
     parser.add_argument(
         "--filename-template",
         type=str,
-        default=persisted.get("filename_template", "clip-{date}-{time}"),
-        help="Saved clip filename pattern -- {date}, {time}, {datetime} placeholders (default: clip-{date}-{time})",
+        default=persisted.get("filename_template", "{window}-{date}-{time}"),
+        help=(
+            "Saved clip filename pattern -- {date}, {time}, {datetime}, {window} "
+            "(active window title) placeholders (default: {window}-{date}-{time})"
+        ),
     )
     parser.add_argument(
         "--clip-retention-days",
@@ -212,10 +251,60 @@ def build_arg_parser(persisted: dict[str, Any] | None = None) -> argparse.Argume
         help="Check GitHub Releases for a newer version at startup and show a notice if found (default: %(default)s)",
     )
     parser.add_argument(
+        "--theme-mode",
+        type=str,
+        choices=["system", "light", "dark"],
+        default=persisted.get("theme_mode", "system"),
+        help="Which theme to use: follow the OS dark-mode setting, or force light/dark (default: %(default)s)",
+    )
+    parser.add_argument(
         "--dark-mode",
+        action="store_const",
+        const="dark",
+        dest="theme_mode",
+        help="Deprecated alias for --theme-mode=dark",
+    )
+    parser.add_argument(
+        "--quick-save-hotkey-1",
+        type=str,
+        default=persisted.get("quick_save_hotkey_1", ""),
+        help="Extra hotkey combo that saves just the last --quick-save-seconds-1 seconds (default: disabled)",
+    )
+    parser.add_argument(
+        "--quick-save-seconds-1",
+        type=int,
+        default=persisted.get("quick_save_seconds_1", 30),
+        help="Seconds saved by --quick-save-hotkey-1 (default: 30)",
+    )
+    parser.add_argument(
+        "--quick-save-hotkey-2",
+        type=str,
+        default=persisted.get("quick_save_hotkey_2", ""),
+        help="Extra hotkey combo that saves just the last --quick-save-seconds-2 seconds (default: disabled)",
+    )
+    parser.add_argument(
+        "--quick-save-seconds-2",
+        type=int,
+        default=persisted.get("quick_save_seconds_2", 60),
+        help="Seconds saved by --quick-save-hotkey-2 (default: 60)",
+    )
+    parser.add_argument(
+        "--screenshot-hotkey",
+        type=str,
+        default=persisted.get("screenshot_hotkey", ""),
+        help="Hotkey combo that grabs a screenshot from the buffer (default: disabled)",
+    )
+    parser.add_argument(
+        "--clips-max-gb",
+        type=int,
+        default=persisted.get("clips_max_gb", 0),
+        help="Delete the oldest clips when the clips folder exceeds this many GiB; 0 = unlimited (default: 0)",
+    )
+    parser.add_argument(
+        "--save-sound-enabled",
         action=argparse.BooleanOptionalAction,
-        default=persisted.get("dark_mode", False),
-        help="Use the dark Pollen Gold theme instead of the light one (default: %(default)s)",
+        default=persisted.get("save_sound_enabled", False),
+        help="Play a system beep when a clip is saved (default: %(default)s)",
     )
     return parser
 
@@ -242,7 +331,15 @@ def config_from_args(args: argparse.Namespace) -> Config:
         clip_retention_days=args.clip_retention_days,
         launch_on_startup=args.launch_on_startup,
         check_for_updates=args.check_for_updates,
-        dark_mode=args.dark_mode,
+        theme_mode=args.theme_mode,
+        resolution_scale=args.resolution_scale,
+        quick_save_hotkey_1=args.quick_save_hotkey_1,
+        quick_save_seconds_1=args.quick_save_seconds_1,
+        quick_save_hotkey_2=args.quick_save_hotkey_2,
+        quick_save_seconds_2=args.quick_save_seconds_2,
+        screenshot_hotkey=args.screenshot_hotkey,
+        clips_max_gb=args.clips_max_gb,
+        save_sound_enabled=args.save_sound_enabled,
     )
     if args.buffer_dir is not None:
         kwargs["buffer_dir"] = args.buffer_dir

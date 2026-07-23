@@ -28,15 +28,19 @@ from clipersal import (
     __version__,
     autostart,
     capture,
+    clip_metadata,
     concat,
     config_store,
+    diagnostics,
     hotkey as hotkey_module,
     ipc,
     ipc_client,
     platform_detect,
+    screenshots,
     theme,
     thumbnails,
     update_check,
+    window_capture,
 )
 from clipersal.config import build_arg_parser, config_from_args
 from clipersal.ffmpeg_utils import WAYLAND_PORTAL_KIND, FfmpegNotFoundError, NoWorkingEncoderError
@@ -94,6 +98,32 @@ def _configure_logging() -> Path:
     return log_path
 
 
+def _configure_app_identity(app) -> None:
+    """Window icon + (Windows) AppUserModelID for the shared QApplication.
+
+    The icon comes from assets/icon.png (sys._MEIPASS under a frozen build --
+    brand.app_icon owns that lookup) and is inherited by every top-level
+    window/dialog. The explicit AppUserModelID makes Windows group the
+    taskbar button with the installed/pinned exe's icon instead of deriving
+    one from the python.exe process. Both halves are best-effort, exactly
+    like the WheelGuard install below -- an identity hiccup must never block
+    startup.
+    """
+    try:
+        from clipersal import brand
+
+        app.setWindowIcon(brand.app_icon())
+    except Exception:  # noqa: BLE001 -- an icon must never be a startup failure
+        log.exception("Could not set the application window icon")
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Lablooms.Clipersal")
+        except Exception:  # noqa: BLE001
+            log.debug("Could not set the AppUserModelID", exc_info=True)
+
+
 def _ensure_qapplication():
     """Returns the shared QApplication instance, constructing it (and
     applying the app's stylesheet, built from theme.py's CURRENT tokens --
@@ -106,6 +136,19 @@ def _ensure_qapplication():
     if app is None:
         app = QApplication(sys.argv)
         app.setStyleSheet(theme.build_stylesheet())
+        # At construction time, so the first-run wizard / startup-error
+        # dialogs that may follow already carry the icon.
+        _configure_app_identity(app)
+    if getattr(app, "_wheel_guard", None) is None:
+        # Scroll-wheel edits on unfocused combos/spinboxes/sliders are a
+        # silent-settings-corruption footgun -- the filter lives on the app
+        # object so Settings AND every dialog are covered (see WheelGuard).
+        # Parented to the app so it isn't garbage-collected.
+        from clipersal.qt_widgets import WheelGuard
+
+        guard = WheelGuard(app)
+        app.installEventFilter(guard)
+        app._wheel_guard = guard
     return app
 
 
@@ -157,9 +200,22 @@ def _show_already_running_message(port: int) -> None:
     try:
         _ensure_qapplication()
         if QMessageBox is not None:
-            QMessageBox.information(None, "Clipersal", message)
+            from clipersal.qt_widgets import quiet_message
+
+            quiet_message(None, "Clipersal", message)
     except Exception:  # noqa: BLE001 -- stderr above is the guaranteed fallback
         pass
+
+
+def _effective_dark(config, os_: OS) -> bool:
+    """Resolve the three-way theme_mode to the bool theme.apply_theme wants:
+    "dark" is always dark, "light" always light, and "system" defers to the
+    OS's own dark-mode setting (platform_detect.system_dark_preferred -- a
+    best-effort hint that reads as light wherever there is no such setting).
+    """
+    return config.theme_mode == "dark" or (
+        config.theme_mode == "system" and platform_detect.system_dark_preferred(os_)
+    )
 
 
 class _AppState:
@@ -181,12 +237,18 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     config = config_from_args(args)
 
+    # Platform detection is pure stdlib probing (no Qt), so it happens up
+    # here: the "system" theme mode needs os_ to resolve, before the palette
+    # is applied below.
+    os_ = platform_detect.get_os()
+    session_type = platform_detect.get_linux_session_type() if os_ == OS.LINUX else None
+
     # The palette must be settled BEFORE the shared QApplication exists:
     # _ensure_qapplication builds the global stylesheet from theme.py's
     # current tokens the first time it constructs the app, so applying the
     # configured mode up here means a dark-mode launch never flashes light.
     # theme.py imports no Qt at runtime, so this is safe headless too.
-    theme.apply_theme(config.dark_mode)
+    theme.apply_theme(_effective_dark(config, os_))
     app = _ensure_qapplication()
 
     if _another_instance_running(config.ipc_port):
@@ -253,9 +315,6 @@ def main(argv: list[str] | None = None) -> int:
     pause_lock = threading.Lock()
     save_lock = threading.Lock()
 
-    os_ = platform_detect.get_os()
-    session_type = platform_detect.get_linux_session_type() if os_ == OS.LINUX else None
-
     # Cross-thread UI notifications -- IPC handlers and the tray callback
     # (both off the GUI thread) emit these; connected to actual slots further
     # down, once main_window exists. Real Qt signals replace the old
@@ -286,21 +345,52 @@ def main(argv: list[str] | None = None) -> int:
         # IpcServer is a ThreadingTCPServer, so two SAVEs landing together
         # (a hotkey double-press, hotkey + tray click, two trigger calls) run
         # this handler concurrently -- and concat._unique_output_path is
-        # check-then-act, so both would see the same clip-{date}-{time} name
-        # (1-second template resolution) as free and remux into one path with
-        # `ffmpeg -y`: interleaved corruption on Linux, a file-lock failure
-        # on Windows. A plain lock -- not a try-lock; the second save should
+        # check-then-act, so both would see the same {window}-{date}-{time}
+        # name (1-second template resolution) as free and remux into one
+        # path with `ffmpeg -y`: interleaved corruption on Linux, a
+        # file-lock failure on Windows. A plain lock -- not a try-lock; the second save should
         # wait its turn, not be dropped -- serializes them, and the later one
         # then gets a "-1" suffixed name.
         with save_lock:
+            # Resolve the {window} placeholder's title once per save: in
+            # window-capture mode the captured window IS the subject, so its
+            # configured title names the clip; otherwise ask the OS for the
+            # foreground window (None on Wayland or any probe failure --
+            # render_filename then falls back to "clip").
+            window_title = (
+                config.window_title
+                if config.capture_mode == "window"
+                else window_capture.active_window_title(os_, session_type)
+            )
             output_path = concat.save_clip(
                 state.setup.ffmpeg_path,
                 config.buffer_dir,
                 config.clips_dir,
                 filename_template=config.filename_template,
                 trim_seconds=trim_seconds,
+                window_title=window_title,
             )
-            concat.enforce_clip_retention(config.clips_dir, config.clip_retention_days)
+            # Favorited clips are protected from the sweep (clip_metadata
+            # sidecar) -- a star must mean "keep this", never "delete in N
+            # days". favorites() never raises, so a corrupt sidecar just
+            # means an unprotected sweep, like before favorites existed.
+            concat.enforce_clip_retention(
+                config.clips_dir,
+                config.clip_retention_days,
+                protected=clip_metadata.favorites(config.clips_dir),
+            )
+            # The size-cap sweep runs after retention so already-expired
+            # clips don't count against the cap. The just-saved clip is
+            # protected alongside the favorites: a save must never delete
+            # the very clip it produced (it would also be the NEWEST file,
+            # but with the cap deleting oldest-first an explicit protection
+            # is the honest guarantee, not an ordering assumption).
+            if config.clips_max_gb > 0:
+                concat.enforce_size_cap(
+                    config.clips_dir,
+                    config.clips_max_gb * (1 << 30),
+                    protected=clip_metadata.favorites(config.clips_dir) | {output_path.name},
+                )
             # Only signaled on success -- the main window's status badge and the
             # save toast both use this to know a save actually happened, and a
             # failed save shouldn't look like one.
@@ -336,6 +426,90 @@ def main(argv: list[str] | None = None) -> int:
         if state.session.gave_up_restarting():
             return "CRASHED"
         return "PAUSED" if state.paused else "RECORDING"
+
+    def handle_stats(arg: str | None = None) -> str:
+        """One-line pipe-separated key=value payload (parsed client-side by
+        ipc_client.parse_stats_payload), e.g.:
+        state=RECORDING|uptime=123.4|segments=27|buffer_bytes=12345678|encoder=h264_nvenc|buffer_seconds=60|clips_free_bytes=123456789|clips_count=5
+
+        Every field is computed independently behind its own guard: a probe
+        failing (a segment vanishing mid-glob, the clips folder missing)
+        degrades that field to an empty string rather than failing the whole
+        command -- the main window polls this on a timer, so it must be as
+        never-crash as STATUS is.
+        """
+        try:
+            state_value = "CRASHED" if state.session.gave_up_restarting() else ("PAUSED" if state.paused else "RECORDING")
+        except Exception:  # noqa: BLE001 -- degrade the field, not the command
+            state_value = ""
+
+        uptime_value = ""
+        try:
+            uptime = state.session.uptime_seconds()
+            if uptime is not None:
+                uptime_value = f"{uptime:.1f}"
+        except Exception:  # noqa: BLE001
+            pass
+
+        segments_value = ""
+        buffer_bytes_value = ""
+        try:
+            count = 0
+            total = 0
+            for segment in config.buffer_dir.glob(capture.SEGMENT_GLOB):
+                try:
+                    total += segment.stat().st_size
+                    count += 1
+                except OSError:
+                    pass  # swept by the cleanup thread mid-glob -- skip it
+            segments_value = str(count)
+            buffer_bytes_value = str(total)
+        except OSError:
+            pass
+
+        try:
+            encoder_value = state.setup.encoder or ""
+        except Exception:  # noqa: BLE001
+            encoder_value = ""
+
+        try:
+            clips_free_value = str(shutil.disk_usage(config.clips_dir).free)
+        except OSError:
+            clips_free_value = ""
+
+        try:
+            clips_count_value = str(sum(1 for _ in config.clips_dir.glob("*.mp4")))
+        except OSError:
+            clips_count_value = ""
+
+        fields = [
+            ("state", state_value),
+            ("uptime", uptime_value),
+            ("segments", segments_value),
+            ("buffer_bytes", buffer_bytes_value),
+            ("encoder", encoder_value),
+            ("buffer_seconds", str(config.buffer_seconds)),
+            ("clips_free_bytes", clips_free_value),
+            ("clips_count", clips_count_value),
+        ]
+        return "|".join(f"{key}={value}" for key, value in fields)
+
+    def handle_screenshot(arg: str | None = None) -> str:
+        # Serialized under the same lock as SAVE: two screenshots landing
+        # together would race the 1-second-resolution output name exactly
+        # like two saves would (see handle_save's comment).
+        with save_lock:
+            output_path = screenshots.save_screenshot(
+                state.setup.ffmpeg_path,
+                config.buffer_dir,
+                config.clips_dir,
+            )
+            # Its own signal, not toast_requested: the screenshot toast's
+            # title reads "Screenshot saved", and the GUI side shows the PNG
+            # itself rather than an ffmpeg-grabbed thumbnail.
+            if app_signals is not None and main_window is not None:
+                app_signals.screenshot_saved.emit(output_path)
+            return str(output_path)
 
     def handle_quit(arg: str | None = None) -> str:
         stop_event.set()
@@ -376,6 +550,8 @@ def main(argv: list[str] | None = None) -> int:
     server.register("PAUSE", handle_pause)
     server.register("RESUME", handle_resume)
     server.register("STATUS", handle_status)
+    server.register("STATS", handle_stats)
+    server.register("SCREENSHOT", handle_screenshot)
     server.register("SHOW", handle_show)
     server.register("SETTINGS", handle_settings)
     server.register("GALLERY", handle_gallery)
@@ -388,14 +564,29 @@ def main(argv: list[str] | None = None) -> int:
                 state.hotkey_listener.stop()
                 state.hotkey_listener = None
             return
+        # One GlobalHotKeys map for every configured combo: the main save,
+        # the two quick-saves (last-N-seconds), and the screenshot. Empty
+        # combos mean "disabled" and never reach pynput (apply_settings also
+        # rejects duplicates, so keys can't collapse here in normal use).
+        mapping = {
+            config.hotkey_combo: lambda: _trigger_command_via_ipc("SAVE", config.ipc_port),
+        }
+        if config.quick_save_hotkey_1:
+            mapping[config.quick_save_hotkey_1] = (
+                lambda: _trigger_command_via_ipc(f"SAVE {config.quick_save_seconds_1}", config.ipc_port)
+            )
+        if config.quick_save_hotkey_2:
+            mapping[config.quick_save_hotkey_2] = (
+                lambda: _trigger_command_via_ipc(f"SAVE {config.quick_save_seconds_2}", config.ipc_port)
+            )
+        if config.screenshot_hotkey:
+            mapping[config.screenshot_hotkey] = lambda: _trigger_command_via_ipc("SCREENSHOT", config.ipc_port)
         # Construct AND start the new binding before dropping the old one:
         # if the new combo can't be bound, the old listener stays alive
         # instead of leaving no hotkey at all. (apply_settings validates the
         # combo before it can get this far, so a start() failure here means
         # something environmental, e.g. the X connection dropping.)
-        listener = hotkey_module.HotkeyListener(
-            config.hotkey_combo, callback=lambda: _trigger_save_via_ipc(config.ipc_port)
-        )
+        listener = hotkey_module.HotkeyListener.from_mapping(mapping)
         try:
             listener.start()
         except hotkey_module.HotkeyUnsupportedError as exc:
@@ -450,6 +641,63 @@ def main(argv: list[str] | None = None) -> int:
                 "use pynput format, e.g. <ctrl>+<alt>+r"
             )
 
+        # New-in-0.1.3 fields are read with .get(..., current) so the
+        # 17-key payload from a pre-quick-save Settings UI keeps applying
+        # cleanly; once the Settings tab sends them, the provided values win.
+        new_framerate = new_values.get("framerate", config.framerate)
+        new_resolution_scale = new_values.get("resolution_scale", config.resolution_scale)
+        new_quick_save_hotkey_1 = new_values.get("quick_save_hotkey_1", config.quick_save_hotkey_1)
+        new_quick_save_seconds_1 = new_values.get("quick_save_seconds_1", config.quick_save_seconds_1)
+        new_quick_save_hotkey_2 = new_values.get("quick_save_hotkey_2", config.quick_save_hotkey_2)
+        new_quick_save_seconds_2 = new_values.get("quick_save_seconds_2", config.quick_save_seconds_2)
+        new_screenshot_hotkey = new_values.get("screenshot_hotkey", config.screenshot_hotkey)
+        new_clips_max_gb = new_values.get("clips_max_gb", config.clips_max_gb)
+        new_save_sound_enabled = new_values.get("save_sound_enabled", config.save_sound_enabled)
+        new_theme_mode = new_values.get("theme_mode", config.theme_mode)
+
+        # The only free-typed-ish theme value (a hand-edited payload could
+        # hold anything -- the Settings segmented control can't) must be one
+        # of the three modes, or effective_dark would silently read it as
+        # light and persist the junk.
+        if new_theme_mode not in ("system", "light", "dark"):
+            return f"Invalid theme mode: {new_theme_mode!r} -- expected 'system', 'light', or 'dark'"
+
+        # Same free-typed-combo gate as the main hotkey, for every non-empty
+        # extra binding (empty = disabled, never validated or bound).
+        for label, combo in (
+            ("quick-save hotkey 1", new_quick_save_hotkey_1),
+            ("quick-save hotkey 2", new_quick_save_hotkey_2),
+            ("screenshot hotkey", new_screenshot_hotkey),
+        ):
+            if combo and not hotkey_module.is_valid_combo(combo):
+                return f"Invalid {label}: {combo!r} -- use pynput format, e.g. <ctrl>+<alt>+r"
+
+        # No two actions may share a combo: pynput's GlobalHotKeys is a plain
+        # dict, so a duplicate would silently shadow one of the bindings.
+        seen_combos: dict[str, str] = {}
+        for label, combo in (
+            ("save hotkey", new_values["hotkey_combo"]),
+            ("quick-save hotkey 1", new_quick_save_hotkey_1),
+            ("quick-save hotkey 2", new_quick_save_hotkey_2),
+            ("screenshot hotkey", new_screenshot_hotkey),
+        ):
+            if not combo:
+                continue
+            normalized = combo.strip().lower()
+            if normalized in seen_combos:
+                return f"Hotkey combo {combo!r} is assigned to both {seen_combos[normalized]} and {label}."
+            seen_combos[normalized] = label
+
+        # Out-of-range quick-save windows (only reachable via a hand-edited
+        # config -- the Settings spinboxes are bounded) are clamped into the
+        # documented 5-300 s range rather than failing the whole apply.
+        new_quick_save_seconds_1 = max(5, min(300, new_quick_save_seconds_1))
+        new_quick_save_seconds_2 = max(5, min(300, new_quick_save_seconds_2))
+
+        # A negative size cap (hand-edited config) reads as "unlimited" --
+        # 0 -- rather than failing the whole apply.
+        new_clips_max_gb = max(0, new_clips_max_gb)
+
         needs_capture_restart = (
             new_values["video_bitrate"] != config.video_bitrate
             or new_values["quality_preset"] != config.quality_preset
@@ -460,10 +708,19 @@ def main(argv: list[str] | None = None) -> int:
             or new_values["mic_volume"] != config.mic_volume
             or new_values["capture_mode"] != config.capture_mode
             or new_values["window_title"] != config.window_title
+            or new_framerate != config.framerate
+            or new_resolution_scale != config.resolution_scale
         )
-        needs_hotkey_rebind = new_values["hotkey_combo"] != config.hotkey_combo
+        needs_hotkey_rebind = (
+            new_values["hotkey_combo"] != config.hotkey_combo
+            or new_quick_save_hotkey_1 != config.quick_save_hotkey_1
+            or new_quick_save_seconds_1 != config.quick_save_seconds_1
+            or new_quick_save_hotkey_2 != config.quick_save_hotkey_2
+            or new_quick_save_seconds_2 != config.quick_save_seconds_2
+            or new_screenshot_hotkey != config.screenshot_hotkey
+        )
         needs_autostart_change = new_values["launch_on_startup"] != config.launch_on_startup
-        needs_theme_change = new_values["dark_mode"] != config.dark_mode
+        needs_theme_change = new_theme_mode != config.theme_mode
 
         # Resolve the new capture setup BEFORE mutating config or stopping
         # the running session. Resolution is where a bad capture setting
@@ -485,6 +742,8 @@ def main(argv: list[str] | None = None) -> int:
                 mic_volume=new_values["mic_volume"],
                 capture_mode=new_values["capture_mode"],
                 window_title=new_values["window_title"],
+                framerate=new_framerate,
+                resolution_scale=new_resolution_scale,
             )
             try:
                 new_setup = capture.resolve_setup(candidate)
@@ -507,7 +766,20 @@ def main(argv: list[str] | None = None) -> int:
         config.clip_retention_days = new_values["clip_retention_days"]
         config.launch_on_startup = new_values["launch_on_startup"]
         config.check_for_updates = new_values["check_for_updates"]
-        config.dark_mode = new_values["dark_mode"]
+        config.theme_mode = new_theme_mode
+        config.framerate = new_framerate
+        config.resolution_scale = new_resolution_scale
+        config.quick_save_hotkey_1 = new_quick_save_hotkey_1
+        config.quick_save_seconds_1 = new_quick_save_seconds_1
+        config.quick_save_hotkey_2 = new_quick_save_hotkey_2
+        config.quick_save_seconds_2 = new_quick_save_seconds_2
+        config.screenshot_hotkey = new_screenshot_hotkey
+        # Both are live-mutate class (like buffer_seconds): the size cap is
+        # consulted by the save/apply sweeps below and the save sound is
+        # played on the toast path -- neither touches the ffmpeg command
+        # line, so no capture restart.
+        config.clips_max_gb = new_clips_max_gb
+        config.save_sound_enabled = new_save_sound_enabled
 
         autostart_error = None
         if needs_autostart_change and autostart.is_supported(os_):
@@ -544,12 +816,26 @@ def main(argv: list[str] | None = None) -> int:
             # capture restart. apply_theme() rewrites theme.py's token
             # constants in place; the _on_theme_changed slot connected in
             # main() then rebuilds the global stylesheet and repaints, so
-            # the whole app switches without a relaunch.
-            theme.apply_theme(config.dark_mode)
+            # the whole app switches without a relaunch. A "system" pick
+            # re-reads the OS's dark-mode setting right here.
+            theme.apply_theme(_effective_dark(config, os_))
             if app_signals is not None:
                 app_signals.theme_changed.emit()
 
-        concat.enforce_clip_retention(config.clips_dir, config.clip_retention_days)
+        # Same favorite-protection as handle_save's sweep (see above).
+        concat.enforce_clip_retention(
+            config.clips_dir,
+            config.clip_retention_days,
+            protected=clip_metadata.favorites(config.clips_dir),
+        )
+        # Lowering the size cap takes effect immediately, not on the next
+        # save -- same "Settings apply runs the sweep" pattern as retention.
+        if config.clips_max_gb > 0:
+            concat.enforce_size_cap(
+                config.clips_dir,
+                config.clips_max_gb * (1 << 30),
+                protected=clip_metadata.favorites(config.clips_dir),
+            )
 
         config_store.save_overrides(
             {
@@ -569,12 +855,21 @@ def main(argv: list[str] | None = None) -> int:
                 "clip_retention_days": config.clip_retention_days,
                 "launch_on_startup": config.launch_on_startup,
                 "check_for_updates": config.check_for_updates,
-                "dark_mode": config.dark_mode,
+                "theme_mode": config.theme_mode,
+                "framerate": config.framerate,
+                "resolution_scale": config.resolution_scale,
+                "quick_save_hotkey_1": config.quick_save_hotkey_1,
+                "quick_save_seconds_1": config.quick_save_seconds_1,
+                "quick_save_hotkey_2": config.quick_save_hotkey_2,
+                "quick_save_seconds_2": config.quick_save_seconds_2,
+                "screenshot_hotkey": config.screenshot_hotkey,
+                "clips_max_gb": config.clips_max_gb,
+                "save_sound_enabled": config.save_sound_enabled,
             }
         )
         # Everything else applied cleanly; a failed autostart registration
         # still surfaces as an error so the Settings tab doesn't show a
-        # hollow "Settings saved." over a toggle that didn't take effect.
+        # hollow "Saved ✓" over a toggle that didn't take effect.
         return autostart_error
 
     # The main window is built once, eagerly, right here -- Clipersal is a
@@ -604,6 +899,17 @@ def main(argv: list[str] | None = None) -> int:
                 tray_enabled=config.tray_enabled,
                 on_quit=stop_event.set,
                 app_signals=app_signals,
+                # Live facts for the Logs tab's diagnostics zip: the encoder
+                # (and potentially the ffmpeg path) changes when Settings
+                # restarts capture, so collect them at export time from the
+                # current state, not from launch-time values.
+                diagnostics_facts_provider=lambda: diagnostics.collect_facts(
+                    state.setup.ffmpeg_path, state.setup.encoder
+                ),
+                # Live encoder for the Clips tab's Compress dialog -- the
+                # same apply_settings-can-swap-it reasoning as the facts
+                # provider above.
+                encoder_provider=lambda: state.setup.encoder,
             )
         except Exception as exc:  # noqa: BLE001 -- never let a GUI hiccup block startup
             log.warning(
@@ -623,6 +929,17 @@ def main(argv: list[str] | None = None) -> int:
         if tab is not None:
             main_window.select_tab(tab)
 
+    def _maybe_play_save_sound() -> None:
+        # QApplication.beep(): the zero-dependency, cross-platform save
+        # chime. Guarded like every other best-effort notification in this
+        # file -- a sound failure must never read as a save failure.
+        if not config.save_sound_enabled or QApplication is None:
+            return
+        try:
+            QApplication.beep()
+        except Exception:  # noqa: BLE001
+            log.exception("Failed to play the save sound")
+
     def _on_toast_requested(clip_path: Path) -> None:
         try:
             from clipersal import toast_qt
@@ -632,12 +949,29 @@ def main(argv: list[str] | None = None) -> int:
             )
         except Exception:  # noqa: BLE001 -- a toast failure must never break a save
             log.exception("Failed to show save toast")
+        _maybe_play_save_sound()
+
+    def _on_screenshot_saved(screenshot_path: Path) -> None:
+        try:
+            from clipersal import toast_qt
+
+            toast_qt.show_save_toast(
+                main_window,
+                state.setup.ffmpeg_path,
+                screenshot_path,
+                config.clips_dir / thumbnails.THUMBNAIL_DIR_NAME,
+                title="Screenshot saved",
+            )
+        except Exception:  # noqa: BLE001 -- a toast failure must never break a save
+            log.exception("Failed to show screenshot toast")
+        _maybe_play_save_sound()
 
     if app_signals is not None and main_window is not None:
         app_signals.show_requested.connect(_on_show_requested)
         app_signals.save_completed.connect(main_window.on_save_completed)
         app_signals.save_failed.connect(main_window.on_save_failed)
         app_signals.toast_requested.connect(_on_toast_requested)
+        app_signals.screenshot_saved.connect(_on_screenshot_saved)
         app_signals.update_available.connect(main_window.show_update_banner)
         main_window.show()  # visible on launch, like OBS
 
@@ -683,7 +1017,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  audio:     {setup.audio_source.description if setup.audio_source else 'none (video-only)'}")
     print(
         f"  ipc:       127.0.0.1:{server.port}  "
-        "(commands: SAVE, PAUSE, RESUME, STATUS, SHOW, SETTINGS, GALLERY, LOGS, PING, QUIT)"
+        "(commands: SAVE, PAUSE, RESUME, STATUS, STATS, SCREENSHOT, SHOW, SETTINGS, GALLERY, LOGS, PING, QUIT)"
     )
     if state.hotkey_listener is not None:
         print(f"  hotkey:    {config.hotkey_combo}  (save)")
@@ -741,18 +1075,20 @@ def _cleanup_temp_buffer(config) -> None:
     shutil.rmtree(config.buffer_dir, ignore_errors=True)
 
 
-def _trigger_save_via_ipc(port: int) -> None:
-    """The hotkey callback deliberately goes back out through the IPC client
-    rather than calling save_clip directly, even though hotkey and server
-    live in the same process today -- this is the exact boundary that lets
-    the hotkey listener move into a separate sidecar process later without
-    any change here. See ARCHITECTURE.md's "IPC / hotkey boundary" section.
+def _trigger_command_via_ipc(command: str, port: int) -> None:
+    """The hotkey callbacks deliberately go back out through the IPC client
+    rather than calling save_clip/save_screenshot directly, even though
+    hotkey and server live in the same process today -- this is the exact
+    boundary that lets the hotkey listener move into a separate sidecar
+    process later without any change here. See ARCHITECTURE.md's
+    "IPC / hotkey boundary" section. `command` is a full IPC command line,
+    e.g. "SAVE" or "SAVE 30" for a quick-save binding.
     """
     try:
-        response = ipc_client.send_command("SAVE", port=port)
-        log.info("Hotkey save: %s", response)
+        response = ipc_client.send_command(command, port=port)
+        log.info("Hotkey %s: %s", command, response)
     except ipc_client.IpcClientError as exc:
-        log.warning("Hotkey save failed: %s", exc)
+        log.warning("Hotkey %s failed: %s", command, exc)
 
 
 if __name__ == "__main__":

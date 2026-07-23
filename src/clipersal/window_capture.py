@@ -1,9 +1,12 @@
-"""Single-window enumeration for single-window capture mode.
+"""Single-window enumeration for single-window capture mode, plus the
+active (focused) window's title for the {window} clip-name placeholder.
 
 Mirrors monitors.py's shape and failure philosophy: `list_windows` returns
 an empty list (never raises) when enumeration isn't possible on this
 platform/machine -- the Settings window just hides the window picker when
-there's nothing useful to show.
+there's nothing useful to show. `active_window_title` likewise returns None
+(never raises) when the focused window's title can't be read, and
+concat.render_filename degrades the {window} placeholder to "clip".
 
 Windows are matched by *title* (gdigrab's own `-i title=<title>` capture
 mode has no handle-based alternative in stock ffmpeg), so two windows that
@@ -22,7 +25,8 @@ import subprocess
 import sys
 from dataclasses import dataclass
 
-from clipersal.platform_detect import OS
+from clipersal.platform_detect import OS, LinuxSessionType
+from clipersal.subprocess_utils import NO_WINDOW_KWARGS
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +77,11 @@ if sys.platform == "win32":
     ctypes.windll.user32.GetWindowRect.restype = wintypes.BOOL
     ctypes.windll.user32.IsIconic.argtypes = [wintypes.HWND]
     ctypes.windll.user32.IsIconic.restype = wintypes.BOOL
+    # Same truncation trap for the foreground-window handle read by
+    # active_window_title: restype stays a full-width HWND (a void*), not
+    # the default C int.
+    ctypes.windll.user32.GetForegroundWindow.argtypes = []
+    ctypes.windll.user32.GetForegroundWindow.restype = wintypes.HWND
 
 
 def list_windows(os_: OS) -> list[WindowInfo]:
@@ -81,6 +90,21 @@ def list_windows(os_: OS) -> list[WindowInfo]:
     if os_ == OS.LINUX:
         return _list_linux_windows()
     return []
+
+
+def active_window_title(os_: OS, session_type: LinuxSessionType | None = None) -> str | None:
+    """Title of the window that currently has keyboard focus, or None when
+    it can't be determined -- Wayland (the portal deliberately doesn't
+    expose other apps' titles), an unsupported OS, or any probe failure.
+    Never raises: cli.py feeds this to the {window} filename placeholder on
+    every save, so a probe hiccup must degrade the name to "clip", not fail
+    the save.
+    """
+    if os_ == OS.WINDOWS:
+        return _active_window_title_windows()
+    if os_ == OS.LINUX and session_type == LinuxSessionType.X11:
+        return _active_window_title_x11()
+    return None
 
 
 def _list_windows_windows() -> list[WindowInfo]:
@@ -120,6 +144,27 @@ def _list_windows_windows() -> list[WindowInfo]:
         log.warning("Could not enumerate windows via EnumWindows: %s", exc)
         return []
     return windows
+
+
+def _active_window_title_windows() -> str | None:
+    """The foreground window's title via GetForegroundWindow +
+    GetWindowTextW -- the same Unicode-safe, full-width-handle calls the
+    enumeration path above uses (see the prototype block at the top)."""
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None  # no foreground window (e.g. the desktop has focus)
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return None  # foreground window has no title
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value.strip()
+    except (AttributeError, OSError) as exc:
+        log.warning("Could not read the foreground window title: %s", exc)
+        return None
+    return title or None
 
 
 # wmctrl -lG columns: handle, desktop, x, y, width, height, host, title.
@@ -198,3 +243,56 @@ def _list_linux_windows() -> list[WindowInfo]:
             WindowInfo(handle=handle, title=title, x=int(x), y=int(y), width=int(width), height=int(height))
         )
     return windows
+
+
+# "xprop -root _NET_ACTIVE_WINDOW" prints
+# "_NET_ACTIVE_WINDOW(WINDOW): window id # 0x03a00011", or window id # 0x0
+# when nothing has focus.
+_XPROP_ACTIVE_WINDOW_RE = re.compile(r"window id # (0x[0-9a-fA-F]+)")
+
+# "xprop -id <id> _NET_WM_NAME" prints '_NET_WM_NAME(UTF8_STRING) = "Some
+# Title"' when the property is set, "_NET_WM_NAME: not found." when it
+# isn't.
+_XPROP_WM_NAME_RE = re.compile(r'_NET_WM_NAME\(\S+\) = "(.*)"')
+
+
+def _active_window_title_x11() -> str | None:
+    """The focused window's title via two xprop probes: _NET_ACTIVE_WINDOW
+    on the root window names the focused window's id, then _NET_WM_NAME on
+    that id is the title. Same never-raises, utf-8/replace decoding
+    discipline as _xprop_window_type above.
+    """
+    try:
+        result = subprocess.run(
+            ["xprop", "-root", "_NET_ACTIVE_WINDOW"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_XPROP_TIMEOUT,
+            **NO_WINDOW_KWARGS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("Could not query the active window via xprop: %s", exc)
+        return None
+    match = _XPROP_ACTIVE_WINDOW_RE.search(result.stdout)
+    if not match or match.group(1) == "0x0":
+        return None
+    try:
+        result = subprocess.run(
+            ["xprop", "-id", match.group(1), "_NET_WM_NAME"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_XPROP_TIMEOUT,
+            **NO_WINDOW_KWARGS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("Could not query the active window title via xprop: %s", exc)
+        return None
+    match = _XPROP_WM_NAME_RE.search(result.stdout)
+    if not match:
+        return None
+    title = match.group(1).strip()
+    return title or None

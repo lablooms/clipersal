@@ -41,3 +41,76 @@ def test_is_valid_combo_rejects_unparseable_text() -> None:
 def test_is_valid_combo_rejects_empty_and_whitespace() -> None:
     assert is_valid_combo("") is False
     assert is_valid_combo("   ") is False
+
+
+# ---- HotkeyListener: combo->callback mapping (quick-save / screenshot
+# bindings ride the same GlobalHotKeys instance as the main save combo) ----
+
+
+def _fake_global_hotkeys(monkeypatch, captured):
+    import pynput.keyboard as pynput_keyboard
+
+    class FakeGlobalHotKeys:
+        def __init__(self, mapping):
+            captured["mapping"] = dict(mapping)
+
+        def start(self):
+            captured["started"] = True
+
+        def stop(self):
+            captured["stopped"] = True
+
+    monkeypatch.setattr(pynput_keyboard, "GlobalHotKeys", FakeGlobalHotKeys)
+
+
+def test_single_combo_constructor_binds_exactly_that_combo(monkeypatch) -> None:
+    from clipersal.hotkey import HotkeyListener
+
+    captured = {}
+    _fake_global_hotkeys(monkeypatch, captured)
+    callback = object()
+
+    listener = HotkeyListener("<ctrl>+<alt>+r", callback)
+    listener.start()
+    listener.stop()
+
+    assert captured["mapping"] == {"<ctrl>+<alt>+r": callback}
+    assert captured["started"] is True
+    assert captured["stopped"] is True
+
+
+def test_from_mapping_binds_every_combo_to_its_own_callback(monkeypatch) -> None:
+    from clipersal.hotkey import HotkeyListener
+
+    captured = {}
+    _fake_global_hotkeys(monkeypatch, captured)
+    save_cb = object()
+    quick_cb = object()
+    shot_cb = object()
+
+    listener = HotkeyListener.from_mapping(
+        {"<ctrl>+<alt>+r": save_cb, "<ctrl>+1": quick_cb, "<ctrl>+<f12>": shot_cb}
+    )
+    listener.start()
+
+    assert captured["mapping"] == {
+        "<ctrl>+<alt>+r": save_cb,
+        "<ctrl>+1": quick_cb,
+        "<ctrl>+<f12>": shot_cb,
+    }
+
+
+def test_from_mapping_filters_out_empty_combos(monkeypatch) -> None:
+    # "" is the persisted "disabled" value for the quick-save/screenshot
+    # bindings -- it must never reach pynput's parser.
+    from clipersal.hotkey import HotkeyListener
+
+    captured = {}
+    _fake_global_hotkeys(monkeypatch, captured)
+
+    listener = HotkeyListener.from_mapping(
+        {"<ctrl>+<alt>+r": object(), "": object(), "   ": object()}
+    )
+    listener.start()
+
+    assert list(captured["mapping"]) == ["<ctrl>+<alt>+r"]

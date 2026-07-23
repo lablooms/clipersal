@@ -297,6 +297,68 @@ def test_check_process_health_skips_restart_once_stop_event_set(tmp_path: Path, 
     assert session._process.returncode == 1  # left alone, no orphan ffmpeg
 
 
+# ---- uptime_seconds -----------------------------------------------------------
+
+
+def test_uptime_seconds_none_before_start(tmp_path: Path) -> None:
+    session = _make_session(tmp_path)
+
+    assert session.uptime_seconds() is None
+
+
+def test_uptime_seconds_none_when_process_not_running(tmp_path: Path) -> None:
+    # A dead/crashed process reports None even with a stale timestamp left
+    # over -- is_running() is checked first, by design.
+    session = _make_session(tmp_path)
+    session._process = _FakeProcess(returncode=1)
+    session._started_monotonic = time.monotonic()
+
+    assert session.uptime_seconds() is None
+
+
+def test_uptime_seconds_positive_while_running_and_none_after_stop(tmp_path: Path, monkeypatch) -> None:
+    session = _make_session(tmp_path)
+    session.config.buffer_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("clipersal.capture.subprocess.Popen", lambda *a, **k: _FakeProcess(returncode=None))
+
+    session.start()
+    try:
+        uptime = session.uptime_seconds()
+        assert uptime is not None
+        assert uptime >= 0
+    finally:
+        session.stop()
+
+    assert session.uptime_seconds() is None
+
+
+def test_uptime_seconds_resets_on_crash_restart(tmp_path: Path, monkeypatch) -> None:
+    # _started_monotonic is stamped in _start_process, so an auto-restart
+    # after a crash re-bases uptime on the NEW process ("current ffmpeg
+    # process age"), not on the session's first start.
+    session = _make_session(tmp_path)
+    session.config.buffer_dir.mkdir(parents=True, exist_ok=True)
+    session._process = _FakeProcess(returncode=1)  # simulate a crash
+    session._started_monotonic = 100.0
+    session._ffmpeg_log_file = open(session.config.buffer_dir / "ffmpeg.log", "w", encoding="utf-8")
+
+    restarted = _FakeProcess(returncode=None)
+    monkeypatch.setattr("clipersal.capture.subprocess.Popen", lambda *a, **k: restarted)
+    # The restart budget uses time.time(), not monotonic, so pinning
+    # monotonic here can't disturb the health check's bookkeeping.
+    monotonic_now = [200.0]
+    monkeypatch.setattr("clipersal.capture.time.monotonic", lambda: monotonic_now[0])
+
+    session._check_process_health()
+
+    assert session.is_running()
+    assert session.uptime_seconds() == 0.0  # new process born at monotonic 200
+    monotonic_now[0] = 212.5
+    assert session.uptime_seconds() == 12.5
+
+    session._ffmpeg_log_file.close()
+
+
 def test_build_command_no_audio_sources_is_video_only(tmp_path: Path) -> None:
     session = _make_session(tmp_path)
     cmd = session._build_command()
@@ -706,3 +768,73 @@ def test_wayland_factory_failure_is_contained_by_cleanup_loop(tmp_path: Path, mo
     # The failing re-acquire happens before the log file is opened, so no
     # handle can leak either.
     assert session._ffmpeg_log_file is None
+
+
+# ---- resolution_scale downscale stage ---------------------------------------
+
+
+def _vf_arg(cmd: list[str]) -> str | None:
+    return cmd[cmd.index("-vf") + 1] if "-vf" in cmd else None
+
+
+def test_build_command_native_scale_adds_no_vf_stage(tmp_path: Path) -> None:
+    # The default ("native", what every old config file deserializes to)
+    # must produce the exact pre-resolution-scale command -- with a filter-
+    # less source that means no -vf at all.
+    session = _make_session(tmp_path)
+    assert session.config.resolution_scale == "native"
+
+    cmd = session._build_command()
+
+    assert "-vf" not in cmd
+
+
+def test_build_command_scale_appends_after_the_sources_own_filter(tmp_path: Path) -> None:
+    session = _make_session(tmp_path)
+    session.config.resolution_scale = "1080p"
+    # ddagrab's real fragment -- the scale must come after it, not before.
+    session.setup.video_source = CaptureSource(
+        input_args=["-f", "lavfi", "-i", "ddagrab"], video_filter="hwdownload,format=bgra,format=nv12", kind="ddagrab"
+    )
+
+    cmd = session._build_command()
+
+    assert _vf_arg(cmd) == "hwdownload,format=bgra,format=nv12,scale=-2:1080"
+
+
+def test_build_command_scale_comes_before_vaapi_hwupload(tmp_path: Path) -> None:
+    # VAAPI's encoder fragment is "format=nv12,hwupload": frames are scaled
+    # in software first, then uploaded -- hwupload must stay last.
+    session = _make_session(tmp_path)
+    session.config.resolution_scale = "720p"
+    session.setup.encoder = "h264_vaapi"
+
+    cmd = session._build_command()
+
+    assert _vf_arg(cmd) == "scale=-2:720,format=nv12,hwupload"
+
+
+def test_build_command_scale_applies_on_the_wayland_rawvideo_path(tmp_path: Path) -> None:
+    # The portal marker source carries video_filter=None (its input args are
+    # only known at capture-start), so the scale is simply the first stage.
+    session = _make_session(tmp_path)
+    session.config.resolution_scale = "1080p"
+    session.setup.video_source = CaptureSource(
+        input_args=[], video_filter=None, kind="wayland-portal", portal_source_type="monitor"
+    )
+
+    cmd = session._build_command(video_input_args=build_wayland_input_args(1920, 1080, 30))
+
+    assert _vf_arg(cmd) == "scale=-2:1080"
+
+
+def test_build_command_bogus_scale_value_is_treated_as_native(tmp_path: Path) -> None:
+    # Only reachable via a hand-edited config file (argparse and the
+    # Settings combo both constrain the values) -- degrade quietly rather
+    # than killing capture startup with a KeyError.
+    session = _make_session(tmp_path)
+    session.config.resolution_scale = "4k"
+
+    cmd = session._build_command()
+
+    assert "-vf" not in cmd

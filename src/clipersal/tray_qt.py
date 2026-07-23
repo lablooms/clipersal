@@ -18,17 +18,23 @@ from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
-from clipersal import config_store, ipc_client
+from clipersal import config_store, ipc_client, theme
 from clipersal.tray import open_folder
 
 log = logging.getLogger(__name__)
 
-# Same semantics and hex values as the main window's status badge (see
-# theme.py): green = normal steady recording, warm taupe-grey =
-# paused. A tray icon can't practically pulse for an active save the way
-# the badge does, so that state is main-window-only.
-_RECORDING_COLOR = QColor(76, 175, 80)  # growth green -- matches theme.GOOD, #4CAF50
-_PAUSED_COLOR = QColor(166, 147, 116)  # warm taupe-grey -- matches theme.NEUTRAL, #A69374
+# Same semantics as the main window's status badge (see theme.py): green =
+# normal steady recording, warm taupe-grey = paused. A tray icon can't
+# practically pulse for an active save the way the badge does, so that state
+# is main-window-only. Read through the theme module AT CALL TIME (never a
+# frozen module-level QColor): apply_theme() rewrites the tokens on a live
+# theme switch, and the icon should follow the current palette.
+def _recording_color() -> QColor:
+    return QColor(theme.GOOD)
+
+
+def _paused_color() -> QColor:
+    return QColor(theme.NEUTRAL)
 _ICON_SIZE = 64
 _QUICK_TRIM_SECONDS = 30
 
@@ -47,10 +53,10 @@ def _make_icon(color: QColor) -> QIcon:
 
 
 class TrayIcon(QSystemTrayIcon):
-    # (trim_arg, response-or-None) from the save worker thread -- tray menu
-    # callbacks run on the GUI thread, so the actual IPC send happens off it
-    # and the response comes back through this queued signal (the same
-    # cross-thread rule as signals.py's AppSignals).
+    # (command, trim_arg, response-or-None) from the save/screenshot worker
+    # thread -- tray menu callbacks run on the GUI thread, so the actual IPC
+    # send happens off it and the response comes back through this queued
+    # signal (the same cross-thread rule as signals.py's AppSignals).
     _save_responded = Signal(object)
     # STATUS response-or-None from the re-sync worker -- same worker-thread +
     # queued-signal shape as _save_responded (see _on_menu_about_to_show).
@@ -59,7 +65,7 @@ class TrayIcon(QSystemTrayIcon):
     def __init__(
         self, ipc_port: int, clips_dir_provider: Callable[[], Path], log_path: Path | None = None, parent=None
     ) -> None:
-        super().__init__(_make_icon(_RECORDING_COLOR), parent)
+        super().__init__(_make_icon(_recording_color()), parent)
         self._ipc_port = ipc_port
         # A live provider, not a frozen Path: apply_settings live-mutates
         # config.clips_dir, and "Open clips folder" must open the folder
@@ -78,6 +84,7 @@ class TrayIcon(QSystemTrayIcon):
         self._menu.addSeparator()
         self._menu.addAction("Save now", self._on_save)
         self._menu.addAction(f"Save last {_QUICK_TRIM_SECONDS}s", self._on_save_last_30s)
+        self._menu.addAction("Take screenshot", self._on_screenshot)
         self._menu.addAction("View clips", self._on_view_clips)
         self._menu.addAction("Open clips folder", self._on_open_clips)
         self._pause_action = self._menu.addAction(self._pause_label(), self._on_toggle_pause)
@@ -105,34 +112,42 @@ class TrayIcon(QSystemTrayIcon):
             self._on_show()
 
     def _on_save(self) -> None:
-        self._start_save_worker(None)
+        self._start_save_worker("SAVE", None)
 
     def _on_save_last_30s(self) -> None:
-        self._start_save_worker(str(_QUICK_TRIM_SECONDS))
+        self._start_save_worker("SAVE", str(_QUICK_TRIM_SECONDS))
 
-    def _start_save_worker(self, trim_arg: str | None) -> None:
+    def _on_screenshot(self) -> None:
+        self._start_save_worker("SCREENSHOT", None)
+
+    def _start_save_worker(self, command: str, trim_arg: str | None) -> None:
         # A SAVE's server-side remux can legitimately run tens of seconds (up
         # to concat.py's _CONCAT_TIMEOUT, 60s) -- far past ipc_client's 5s
         # default -- and tray menu callbacks run on the GUI thread, so a
         # synchronous send froze the tray menu for the remux and could report
         # failure after 5s while the save actually completed. Worker thread
         # with a timeout above the server's own; the response returns to the
-        # GUI thread via _save_responded.
-        threading.Thread(target=self._save_worker, args=(trim_arg,), daemon=True).start()
+        # GUI thread via _save_responded. SCREENSHOT shares the machinery:
+        # it's quick itself, but it's serialized behind any in-flight SAVE
+        # server-side (cli.py's save_lock), so it needs the same long leash.
+        threading.Thread(target=self._save_worker, args=(command, trim_arg), daemon=True).start()
 
-    def _save_worker(self, trim_arg: str | None) -> None:
-        response = self._send("SAVE", arg=trim_arg, timeout=ipc_client.SAVE_TIMEOUT)
-        self._save_responded.emit((trim_arg, response))
+    def _save_worker(self, command: str, trim_arg: str | None) -> None:
+        response = self._send(command, arg=trim_arg, timeout=ipc_client.SAVE_TIMEOUT)
+        self._save_responded.emit((command, trim_arg, response))
 
     def _on_save_responded(self, payload: tuple) -> None:
-        trim_arg, response = payload
+        command, trim_arg, response = payload
         if response is None:
             return
         if response.startswith("OK"):
-            title = "Clip saved" if trim_arg is None else f"Last {_QUICK_TRIM_SECONDS}s saved"
+            if command == "SCREENSHOT":
+                title = "Screenshot saved"
+            else:
+                title = "Clip saved" if trim_arg is None else f"Last {_QUICK_TRIM_SECONDS}s saved"
             self.showMessage(title, response[len("OK") :].strip() or "Saved")
         else:
-            self.showMessage("Save failed", response)
+            self.showMessage("Screenshot failed" if command == "SCREENSHOT" else "Save failed", response)
 
     def _on_open_clips(self) -> None:
         open_folder(self._clips_dir_provider())
@@ -195,6 +210,6 @@ class TrayIcon(QSystemTrayIcon):
         self._refresh_status()
 
     def _refresh_status(self) -> None:
-        self.setIcon(_make_icon(_PAUSED_COLOR if self._paused else _RECORDING_COLOR))
+        self.setIcon(_make_icon(_paused_color() if self._paused else _recording_color()))
         self.setToolTip(f"Clipersal - {'Paused' if self._paused else 'Recording'}")
         self._pause_action.setText(self._pause_label())

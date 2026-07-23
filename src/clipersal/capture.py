@@ -35,6 +35,13 @@ _RESTART_WINDOW_SECONDS = 60.0
 
 SEGMENT_GLOB = "seg-*.ts"
 
+# config.resolution_scale value -> the height the video is downscaled to
+# ("native" is deliberately absent: it maps to no scale stage at all, so a
+# default/old config produces the byte-identical pre-resolution-scale
+# command). A hand-edited config with a bogus value reads as native here too
+# -- degrade quietly, never kill capture startup over it.
+_SCALE_HEIGHTS = {"1080p": 1080, "720p": 720}
+
 
 def _format_volume(percent: int) -> str:
     """The ffmpeg `volume` filter value for a percentage slider position.
@@ -162,6 +169,10 @@ class SegmentedCapture:
         self._portal_session = None
         self._frame_pump = None
         self._gst_launch: str | None = None
+        # Monotonic timestamp of the current ffmpeg process's (re)start --
+        # the basis for uptime_seconds(). Monotonic, not wall-clock, so a
+        # system-clock adjustment can't produce a negative or jumping uptime.
+        self._started_monotonic: float | None = None
 
     def start(self) -> None:
         if self.is_running():
@@ -303,6 +314,11 @@ class SegmentedCapture:
                 stderr=subprocess.STDOUT,
                 **NO_WINDOW_KWARGS,
             )
+            # Stamped at process birth, in _start_process rather than
+            # start(), so a crash auto-restart (which re-enters here from
+            # the health check) re-bases uptime on the NEW process -- the
+            # value is "current ffmpeg process age", not "session age".
+            self._started_monotonic = time.monotonic()
             if wayland:
                 pump = wayland_gstreamer.GStreamerFramePump(
                     self._gst_launch, portal_session.pipewire_fd, portal_session.stream.node_id, self._process.stdin
@@ -337,6 +353,7 @@ class SegmentedCapture:
         if self._process is not None:
             self._stop_process()
             self._process = None
+        self._started_monotonic = None
 
         if self._ffmpeg_log_file is not None:
             self._ffmpeg_log_file.close()
@@ -344,6 +361,25 @@ class SegmentedCapture:
 
     def is_running(self) -> bool:
         return self._process is not None and self._process.poll() is None
+
+    def uptime_seconds(self) -> float | None:
+        """Age of the current ffmpeg process in seconds, or None when no
+        process is running (never started, stopped, or crashed-and-gave-up).
+        Feeds the IPC STATS payload's uptime field.
+
+        Read from the IPC handler thread while the cleanup thread may be
+        mid-restart; a plain attribute is safe enough here because CPython
+        reads and writes a single object reference atomically, so the worst
+        case is one read of the previous process generation's timestamp --
+        harmless for a display-value uptime. is_running() is checked first
+        so a dead process with a stale timestamp still reports None.
+        """
+        if not self.is_running():
+            return None
+        started = self._started_monotonic
+        if started is None:
+            return None
+        return time.monotonic() - started
 
     def gave_up_restarting(self) -> bool:
         """True once auto-restart has exhausted its budget (see
@@ -399,11 +435,22 @@ class SegmentedCapture:
         for source in audio_sources:
             cmd += source.input_args
 
-        filter_parts = [
-            part
-            for part in (setup.video_source.video_filter, ffmpeg_utils.encoder_filter_fragment(setup.encoder))
-            if part
-        ]
+        filter_parts = []
+        if setup.video_source.video_filter:
+            filter_parts.append(setup.video_source.video_filter)
+        # The downscale stage sits BETWEEN the source's own fragment (e.g.
+        # ddagrab's hwdownload/format chain) and the encoder's fragment:
+        # VAAPI's "format=nv12,hwupload" must run after the scale (frames
+        # are scaled in software, then uploaded). One -vf chain serves the
+        # direct capture backends and the Wayland rawvideo path alike --
+        # the portal source's marker CaptureSource carries video_filter=None,
+        # so the scale is simply the first stage there.
+        scale_height = _SCALE_HEIGHTS.get(cfg.resolution_scale)
+        if scale_height is not None:
+            filter_parts.append(f"scale=-2:{scale_height}")
+        encoder_fragment = ffmpeg_utils.encoder_filter_fragment(setup.encoder)
+        if encoder_fragment:
+            filter_parts.append(encoder_fragment)
         if filter_parts:
             cmd += ["-vf", ",".join(filter_parts)]
 

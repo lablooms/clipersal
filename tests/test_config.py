@@ -10,7 +10,7 @@ def test_hardcoded_defaults_used_when_nothing_persisted_and_no_cli_flags() -> No
     assert args.buffer_seconds == 60
     assert args.bitrate == "8M"
     assert args.encoder is None
-    assert args.filename_template == "clip-{date}-{time}"
+    assert args.filename_template == "{window}-{date}-{time}"
     assert args.clip_retention_days == 0
     assert args.quality_preset == "custom"
 
@@ -62,6 +62,18 @@ def test_filename_template_and_retention_persisted_and_overridable() -> None:
     assert config.clip_retention_days == 30
 
 
+def test_filename_template_default_is_window_but_a_persisted_template_still_wins() -> None:
+    # The hardcoded default changed to the {window} template, but an
+    # existing user's persisted template keeps applying -- argparse defaults
+    # are seeded from the config file, so only a fresh install sees the new
+    # default.
+    args = build_arg_parser(persisted={}).parse_args([])
+    assert config_from_args(args).filename_template == "{window}-{date}-{time}"
+
+    args = build_arg_parser(persisted={"filename_template": "clip-{date}-{time}"}).parse_args([])
+    assert config_from_args(args).filename_template == "clip-{date}-{time}"
+
+
 def test_launch_on_startup_defaults_false() -> None:
     args = build_arg_parser(persisted={}).parse_args([])
 
@@ -102,32 +114,36 @@ def test_check_for_updates_cli_flag_overrides_persisted() -> None:
     assert config.check_for_updates is False
 
 
-def test_dark_mode_defaults_false() -> None:
-    # False = today's light theme, so an old config file (no dark_mode key)
-    # keeps producing the pre-dark-mode UI -- the Phase 8 default rule.
+def test_theme_mode_defaults_system() -> None:
+    # "system" = follow the OS dark-mode setting -- the new default. An old
+    # config file (no theme_mode key) gets here via the persisted fallback,
+    # and the old boolean's false migrates to the same value (config_store).
     args = build_arg_parser(persisted={}).parse_args([])
     config = config_from_args(args)
 
-    assert config.dark_mode is False
+    assert config.theme_mode == "system"
 
 
-def test_dark_mode_persisted_value_used() -> None:
-    args = build_arg_parser(persisted={"dark_mode": True}).parse_args([])
+def test_theme_mode_persisted_value_used() -> None:
+    args = build_arg_parser(persisted={"theme_mode": "dark"}).parse_args([])
     config = config_from_args(args)
 
-    assert config.dark_mode is True
+    assert config.theme_mode == "dark"
 
 
-def test_dark_mode_cli_flag_overrides_persisted() -> None:
-    args = build_arg_parser(persisted={"dark_mode": False}).parse_args(["--dark-mode"])
+def test_theme_mode_cli_flag_overrides_persisted() -> None:
+    args = build_arg_parser(persisted={"theme_mode": "dark"}).parse_args(["--theme-mode", "light"])
     config = config_from_args(args)
 
-    assert config.dark_mode is True
+    assert config.theme_mode == "light"
 
-    args = build_arg_parser(persisted={"dark_mode": True}).parse_args(["--no-dark-mode"])
+
+def test_dark_mode_flag_is_a_deprecated_alias_for_dark() -> None:
+    # Kept so old launch scripts don't break; --theme-mode is the real flag.
+    args = build_arg_parser(persisted={}).parse_args(["--dark-mode"])
     config = config_from_args(args)
 
-    assert config.dark_mode is False
+    assert config.theme_mode == "dark"
 
 
 def test_quality_preset_persisted_value_used() -> None:
@@ -204,3 +220,125 @@ def test_wrong_typed_persisted_config_does_not_crash_startup_parsing(tmp_path: P
 
     assert args.buffer_seconds == 60
     assert args.clips_dir == Path.home() / "Videos" / "Clipersal"
+
+
+def test_framerate_defaults_to_30_and_persisted_value_seeds_it() -> None:
+    args = build_arg_parser(persisted={}).parse_args([])
+    assert config_from_args(args).framerate == 30
+
+    args = build_arg_parser(persisted={"framerate": 60}).parse_args([])
+    assert config_from_args(args).framerate == 60
+
+
+def test_framerate_cli_flag_overrides_persisted() -> None:
+    args = build_arg_parser(persisted={"framerate": 60}).parse_args(["--framerate", "24"])
+    assert config_from_args(args).framerate == 24
+
+
+def test_resolution_scale_defaults_to_native() -> None:
+    args = build_arg_parser(persisted={}).parse_args([])
+    assert config_from_args(args).resolution_scale == "native"
+
+
+def test_resolution_scale_persisted_value_used() -> None:
+    args = build_arg_parser(persisted={"resolution_scale": "1080p"}).parse_args([])
+    assert config_from_args(args).resolution_scale == "1080p"
+
+
+def test_resolution_scale_cli_flag_overrides_persisted() -> None:
+    args = build_arg_parser(persisted={"resolution_scale": "720p"}).parse_args(["--resolution-scale", "1080p"])
+    assert config_from_args(args).resolution_scale == "1080p"
+
+
+def test_resolution_scale_rejects_unknown_value() -> None:
+    import pytest
+
+    with pytest.raises(SystemExit):
+        build_arg_parser(persisted={}).parse_args(["--resolution-scale", "4k"])
+
+
+def test_quick_save_and_screenshot_hotkeys_default_to_disabled() -> None:
+    args = build_arg_parser(persisted={}).parse_args([])
+    config = config_from_args(args)
+
+    assert config.quick_save_hotkey_1 == ""
+    assert config.quick_save_seconds_1 == 30
+    assert config.quick_save_hotkey_2 == ""
+    assert config.quick_save_seconds_2 == 60
+    assert config.screenshot_hotkey == ""
+
+
+def test_quick_save_and_screenshot_hotkeys_persisted_values_used() -> None:
+    persisted = {
+        "quick_save_hotkey_1": "<ctrl>+1",
+        "quick_save_seconds_1": 15,
+        "quick_save_hotkey_2": "<ctrl>+2",
+        "quick_save_seconds_2": 45,
+        "screenshot_hotkey": "<ctrl>+<f12>",
+    }
+
+    args = build_arg_parser(persisted=persisted).parse_args([])
+    config = config_from_args(args)
+
+    assert config.quick_save_hotkey_1 == "<ctrl>+1"
+    assert config.quick_save_seconds_1 == 15
+    assert config.quick_save_hotkey_2 == "<ctrl>+2"
+    assert config.quick_save_seconds_2 == 45
+    assert config.screenshot_hotkey == "<ctrl>+<f12>"
+
+
+def test_quick_save_and_screenshot_hotkeys_cli_flags_override_persisted() -> None:
+    persisted = {"quick_save_hotkey_1": "<ctrl>+1", "quick_save_seconds_1": 15}
+
+    args = build_arg_parser(persisted=persisted).parse_args(
+        ["--quick-save-hotkey-1", "<ctrl>+9", "--quick-save-seconds-1", "25", "--screenshot-hotkey", "<ctrl>+0"]
+    )
+    config = config_from_args(args)
+
+    assert config.quick_save_hotkey_1 == "<ctrl>+9"
+    assert config.quick_save_seconds_1 == 25
+    assert config.screenshot_hotkey == "<ctrl>+0"
+
+
+# ---- 0.1.4 fields: clips size cap / save sound -----------------------------------
+
+
+def test_wave5_fields_default_to_preexisting_behavior() -> None:
+    args = build_arg_parser(persisted={}).parse_args([])
+    config = config_from_args(args)
+
+    # 0 = unlimited, the toggle off -- an old config file (keys absent)
+    # produces exactly the pre-0.1.4 behavior.
+    assert config.clips_max_gb == 0
+    assert config.save_sound_enabled is False
+
+
+def test_wave5_fields_persisted_values_used() -> None:
+    persisted = {
+        "clips_max_gb": 10,
+        "save_sound_enabled": True,
+    }
+
+    args = build_arg_parser(persisted=persisted).parse_args([])
+    config = config_from_args(args)
+
+    assert config.clips_max_gb == 10
+    assert config.save_sound_enabled is True
+
+
+def test_wave5_fields_cli_flags_override_persisted() -> None:
+    persisted = {
+        "clips_max_gb": 10,
+        "save_sound_enabled": True,
+    }
+
+    args = build_arg_parser(persisted=persisted).parse_args(
+        [
+            "--clips-max-gb", "25",
+            "--no-save-sound-enabled",
+        ]
+    )
+    config = config_from_args(args)
+
+    assert config.clips_max_gb == 25
+    assert config.save_sound_enabled is False

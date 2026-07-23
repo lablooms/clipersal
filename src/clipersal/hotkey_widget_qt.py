@@ -71,11 +71,23 @@ class HotkeyField(QWidget):
     (press-the-combo mode). `.combo()` returns the current combo regardless
     of which mode set it -- the direct equivalent of the CTk version's
     `combo_var.get()`.
+
+    `recording_finished` fires every time the recorder stops -- on accept AND
+    on cancel -- so an autosaving host (the Settings tab) can re-read
+    `.combo()` exactly once per recording instead of polling is_recording().
+    A cancel restores the pre-record text, so a host comparing against its
+    last-saved value sees "nothing changed" and skips the apply.
     """
+
+    recording_finished = Signal()
 
     def __init__(self, initial_combo: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._initial_combo = initial_combo
+        # What the entry said when the current/last recording started -- a
+        # cancel restores THIS (a manually typed edit survives a cancelled
+        # record), not blindly the construction-time combo.
+        self._combo_before_record = initial_combo
         self._listener = None
         self._recording = False
         self._held: set[str] = set()
@@ -107,9 +119,10 @@ class HotkeyField(QWidget):
 
     def cancel_recording(self) -> None:
         """Aborts an in-progress recording from outside the widget -- same as
-        clicking the Cancel button. Settings/wizard Save paths call this when
-        they're invoked mid-record, so the "Press keys..." placeholder (or a
-        half-captured combo) is never read as the combo to persist.
+        clicking the Cancel button: the pre-record text is restored and
+        `recording_finished` fires. The first-run wizard's Save path calls
+        this when it's invoked mid-record, so the "Press keys..." placeholder
+        (or a half-captured combo) is never read as the combo to persist.
         """
         if self._recording:
             self._finish_recording(None)
@@ -148,7 +161,8 @@ class HotkeyField(QWidget):
         if final_combo is not None:
             self.entry.setText(final_combo)
         elif not self.entry.text().strip() or self.entry.text() == "Press keys...":
-            self.entry.setText(self._initial_combo)
+            self.entry.setText(self._combo_before_record)
+        self.recording_finished.emit()
 
     def _on_key_press(self, token: str) -> None:
         if not self._recording:
@@ -181,6 +195,7 @@ class HotkeyField(QWidget):
         self._recording = True
         self._held = set()
         self._captured = set()
+        self._combo_before_record = self.entry.text()
         self.entry.setEnabled(False)
         self.entry.setText("Press keys...")
         self._restyle_record_button(True)

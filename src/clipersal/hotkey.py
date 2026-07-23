@@ -65,9 +65,20 @@ def is_valid_combo(combo: str) -> bool:
 
 class HotkeyListener:
     def __init__(self, combo: str, callback: Callable[[], None]):
-        self._combo = combo
-        self._callback = callback
+        self._mapping: dict[str, Callable[[], None]] = {combo: callback}
         self._hotkeys = None
+
+    @classmethod
+    def from_mapping(cls, mapping: dict[str, Callable[[], None]]) -> HotkeyListener:
+        """Bind several combos at once (the main save combo plus the
+        quick-save / screenshot combos -- see cli.py's rebind_hotkey). Empty
+        combos are dropped here as well as in cli.py's validation, so a
+        disabled ("") binding can never reach pynput's parser.
+        """
+        listener = cls.__new__(cls)
+        listener._mapping = {combo: cb for combo, cb in mapping.items() if combo and combo.strip()}
+        listener._hotkeys = None
+        return listener
 
     def start(self) -> None:
         try:
@@ -78,11 +89,13 @@ class HotkeyListener:
             ) from exc
 
         try:
-            self._hotkeys = keyboard.GlobalHotKeys({self._combo: self._callback})
+            self._hotkeys = keyboard.GlobalHotKeys(dict(self._mapping))
             self._hotkeys.start()
         except Exception as exc:
-            raise HotkeyUnsupportedError(f"Could not bind global hotkey {self._combo!r}: {exc}") from exc
-        log.info("Bound global hotkey %s", self._combo)
+            raise HotkeyUnsupportedError(
+                f"Could not bind global hotkeys {sorted(self._mapping)}: {exc}"
+            ) from exc
+        log.info("Bound global hotkeys %s", ", ".join(sorted(self._mapping)))
 
     def stop(self) -> None:
         if self._hotkeys is not None:

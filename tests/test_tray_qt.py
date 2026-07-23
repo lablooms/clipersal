@@ -45,6 +45,7 @@ def test_menu_has_expected_items() -> None:
         "Open Clipersal",
         "Save now",
         "Save last 30s",
+        "Take screenshot",
         "View clips",
         "Open clips folder",
         "Pause capture",
@@ -52,6 +53,45 @@ def test_menu_has_expected_items() -> None:
         "View logs",
         "Quit",
     ]
+
+
+def test_on_screenshot_sends_screenshot_command_and_shows_the_filename(monkeypatch) -> None:
+    sent = []
+
+    def fake_send(command, arg=None, host="127.0.0.1", port=51525, timeout=5.0):
+        sent.append({"command": command, "arg": arg, "timeout": timeout, "thread": threading.current_thread()})
+        return "OK C:/clips/screenshot-20260722-010203.png"
+
+    monkeypatch.setattr(tray_qt.ipc_client, "send_command", fake_send)
+    tray = TrayIcon(ipc_port=12345, clips_dir_provider=lambda: Path("/tmp/clips"))
+    notified = []
+    monkeypatch.setattr(tray, "showMessage", lambda title, message, *a, **k: notified.append((title, message)))
+
+    tray._on_screenshot()
+
+    assert _drain_until(lambda: len(sent) == 1 and len(notified) == 1)
+    assert sent[0]["command"] == "SCREENSHOT"
+    assert sent[0]["arg"] is None
+    # Serialized behind in-flight saves server-side, so it gets SAVE's long leash.
+    assert sent[0]["timeout"] == tray_qt.ipc_client.SAVE_TIMEOUT
+    assert sent[0]["thread"] is not threading.current_thread()
+    assert notified[0][0] == "Screenshot saved"
+    assert "screenshot-20260722-010203.png" in notified[0][1]
+
+
+def test_on_screenshot_error_response_notifies(monkeypatch) -> None:
+    monkeypatch.setattr(
+        tray_qt.ipc_client, "send_command", lambda *a, **k: "ERROR buffer is empty -- nothing to grab yet"
+    )
+    tray = TrayIcon(ipc_port=12345, clips_dir_provider=lambda: Path("/tmp/clips"))
+    notified = []
+    monkeypatch.setattr(tray, "showMessage", lambda title, message, *a, **k: notified.append((title, message)))
+
+    tray._on_screenshot()
+
+    assert _drain_until(lambda: len(notified) == 1)
+    assert notified[0][0] == "Screenshot failed"
+    assert "buffer is empty" in notified[0][1]
 
 
 def test_pause_label_toggles_after_successful_pause_and_resume() -> None:

@@ -2,4 +2,4 @@
 save-on-demand. "Catch the moment you bloomed."
 """
 
-__version__ = "0.1.2-beta"
+__version__ = "0.1.1-beta"

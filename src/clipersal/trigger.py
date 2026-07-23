@@ -38,7 +38,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"Clipersal {__version__}")
     parser.add_argument(
         "command",
-        choices=["save", "pause", "resume", "status", "show", "settings", "gallery", "logs", "ping", "quit"],
+        choices=[
+            "save", "pause", "resume", "status", "stats", "screenshot",
+            "show", "settings", "gallery", "logs", "ping", "quit",
+        ],
         help="Command to send ('show' opens the main window, 'gallery' opens its Clips tab)",
     )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"IPC port (default: {DEFAULT_PORT})")

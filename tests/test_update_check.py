@@ -430,3 +430,62 @@ def test_check_for_update_once_never_raises_when_cache_path_unwritable(tmp_path:
         repo="lablooms/clipersal", current_version="0.1.0", cache_path=bad_path, fetch=fetch
     )
     assert result is None
+
+
+# ---- force (Settings "Check now") ----------------------------------------------
+
+
+def test_check_for_update_once_force_bypasses_throttle(tmp_path: Path) -> None:
+    # A check ran 60s ago -- throttled for the next 24h -- but force=True
+    # (the Settings tab's "Check now") must hit the network anyway.
+    cache_path = tmp_path / "cache.json"
+    update_check.save_cache({"last_checked": 1000.0}, cache_path)
+    calls = []
+
+    def fetch(url: str) -> bytes:
+        calls.append(url)
+        return b'[{"tag_name": "v0.2.0", "html_url": "https://example.invalid/v0.2.0"}]'
+
+    result = update_check.check_for_update_once(
+        repo="lablooms/clipersal", current_version="0.1.0", now=1000.0 + 60, cache_path=cache_path,
+        fetch=fetch, force=True,
+    )
+
+    assert len(calls) == 1
+    assert result == ("v0.2.0", "https://example.invalid/v0.2.0")
+
+
+def test_check_for_update_once_force_still_writes_the_cache(tmp_path: Path) -> None:
+    # Bypassing the throttle must not bypass the bookkeeping: a forced check
+    # stamps last_checked like any completed check, so the next NON-forced
+    # call throttles against it.
+    cache_path = tmp_path / "cache.json"
+    update_check.save_cache({"last_checked": 1000.0}, cache_path)
+
+    def fetch(url: str) -> bytes:
+        return b'[{"tag_name": "v0.2.0", "html_url": "https://example.invalid/v0.2.0"}]'
+
+    update_check.check_for_update_once(
+        repo="lablooms/clipersal", current_version="0.1.0", now=2000.0, cache_path=cache_path,
+        fetch=fetch, force=True,
+    )
+
+    assert update_check.load_cache(cache_path)["last_checked"] == 2000.0
+
+
+def test_check_for_update_once_force_failure_keeps_old_last_checked(tmp_path: Path) -> None:
+    # The failed-fetch rule applies to forced checks too: no stamp, so the
+    # next attempt retries instead of being throttled by a phantom check.
+    cache_path = tmp_path / "cache.json"
+    update_check.save_cache({"last_checked": 1000.0}, cache_path)
+
+    def failing_fetch(url: str) -> bytes:
+        raise OSError("network down")
+
+    result = update_check.check_for_update_once(
+        repo="lablooms/clipersal", current_version="0.1.0", now=2000.0, cache_path=cache_path,
+        fetch=failing_fetch, force=True,
+    )
+
+    assert result is None
+    assert update_check.load_cache(cache_path)["last_checked"] == 1000.0
