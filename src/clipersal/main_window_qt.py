@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
 )
 
 from clipersal import (
+    DISPLAY_VERSION,
     __version__,
     brand,
     ipc_client,
@@ -350,7 +351,7 @@ class MainWindow(QWidget):
         name_label = QLabel("Clipersal", sidebar)
         name_label.setFont(_qfont(size=theme.FONT_H2))
         name_col.addWidget(name_label)
-        version_label = QLabel(f"v{__version__}", sidebar)
+        version_label = QLabel(f"v{DISPLAY_VERSION}", sidebar)
         version_label.setObjectName("hint")
         name_col.addWidget(version_label)
         brand_row.addStretch()

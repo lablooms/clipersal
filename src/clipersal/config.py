@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from clipersal import __version__, config_store
+from clipersal import DISPLAY_VERSION, config_store
 from clipersal.hotkey import DEFAULT_COMBO as _DEFAULT_HOTKEY_COMBO
 from clipersal.ipc import DEFAULT_PORT as _DEFAULT_IPC_PORT
 
@@ -118,7 +118,7 @@ def build_arg_parser(persisted: dict[str, Any] | None = None) -> argparse.Argume
     parser.add_argument(
         "--version",
         action="version",
-        version=f"Clipersal {__version__}",
+        version=f"Clipersal {DISPLAY_VERSION}",
     )
     parser.add_argument(
         "--buffer-seconds",

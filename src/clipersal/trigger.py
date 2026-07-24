@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from clipersal import __version__
+from clipersal import DISPLAY_VERSION
 from clipersal.ipc import DEFAULT_PORT
 from clipersal.ipc_client import IpcClientError, send_command
 
@@ -35,7 +35,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "caveat in ARCHITECTURE.md."
         ),
     )
-    parser.add_argument("--version", action="version", version=f"Clipersal {__version__}")
+    parser.add_argument("--version", action="version", version=f"Clipersal {DISPLAY_VERSION}")
     parser.add_argument(
         "command",
         choices=[

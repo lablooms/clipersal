@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (
 )
 
 from clipersal import (
+    DISPLAY_VERSION,
     __version__,
     autostart,
     config_store,
@@ -1035,7 +1036,7 @@ class SettingsFrame(QWidget):
         tagline_label.setObjectName("hint")
         about_layout.addWidget(tagline_label)
 
-        self.about_version_label = QLabel(f"Version {__version__}", card)
+        self.about_version_label = QLabel(f"Version {DISPLAY_VERSION}", card)
         self.about_version_label.setObjectName("hint")
         about_layout.addWidget(self.about_version_label)
         # The license change itself lands separately -- this is just the label.

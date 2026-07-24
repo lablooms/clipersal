@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QFileDialog, QLabel, QMessageBox, QPushButton
 
-from clipersal import __version__, settings_window_qt
+from clipersal import DISPLAY_VERSION, settings_window_qt
 from clipersal.config import Config, _default_clips_dir
 from clipersal.ffmpeg_utils import AudioSource
 from clipersal.hotkey import DEFAULT_COMBO
@@ -1237,7 +1237,7 @@ def test_every_tab_page_scrolls(tmp_path: Path) -> None:
 
 def test_about_tab_shows_version_license_and_github_link(tmp_path: Path) -> None:
     frame = _build(tmp_path)
-    assert __version__ in frame.about_version_label.text()
+    assert DISPLAY_VERSION in frame.about_version_label.text()
     label_texts = [label.text() for label in _tab_page(frame, "About").findChildren(QLabel)]
     assert any("GPL-3.0" in text for text in label_texts)
     assert any("github.com/lablooms/clipersal" in text for text in label_texts)

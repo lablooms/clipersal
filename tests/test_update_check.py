@@ -499,3 +499,14 @@ def test_is_newer_compares_lab_series_tails_numerically() -> None:
     assert update_check.is_newer("0.1.1-lab.1", "0.1.0-lab.9") is True  # numeric core wins first
     assert update_check.is_newer("0.1.0", "0.1.0-lab.1") is True  # stable still outranks prerelease
     assert update_check.is_newer("0.1.0-lab.1", "0.1.0") is False
+
+
+def test_is_newer_mixes_pep440_local_and_dash_lab_spellings() -> None:
+    # The installed app reports the PEP 440 form (0.1.0+lab.1); the GitHub
+    # release tag uses the dash form (0.1.0-lab.2). They must compare as the
+    # same lab series.
+    assert update_check.is_newer("0.1.0-lab.2", "0.1.0+lab.1") is True
+    assert update_check.is_newer("0.1.0+lab.2", "0.1.0-lab.1") is True
+    assert update_check.is_newer("0.1.0-lab.1", "0.1.0+lab.1") is False
+    assert update_check.is_newer("0.1.0", "0.1.0+lab.1") is True  # stable outranks lab
+    assert update_check.is_newer("0.1.0+lab.1", "0.1.0") is False

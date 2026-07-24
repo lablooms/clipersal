@@ -97,23 +97,26 @@ def _parse_version(text: str) -> tuple[int, ...] | None:
 
 
 def _is_prerelease(text: str) -> bool:
-    """True for a version carrying a "-suffix" pre-release marker ("0.1.0-beta").
-    A "+build" suffix alone doesn't count -- semver: build metadata plays no
-    role in precedence.
+    """True for a version carrying a pre-release marker -- either the semver
+    dash form ("0.1.0-beta") or PEP 440's local-version "+tail" form
+    ("0.1.0+lab.1"). Clipersal's own releases use the "+lab.N" series (the
+    dash spelling isn't PEP-440-legal for a package, so the lab series lives
+    in the local segment), and an update check that ignored it would never
+    fire for lab.2.
     """
     text = text.strip()
     if text[:1] in ("v", "V"):
         text = text[1:]
-    return "-" in text.split("+", maxsplit=1)[0]
+    return bool(re.search(r"[-+]", text))
 
 
 def _prerelease_tail(text: str) -> str:
-    """"0.1.0-lab.1" -> "lab.1"; "0.1.0" -> ""."""
+    """"0.1.0-lab.1" -> "lab.1"; "0.1.0+lab.1" -> "lab.1"; "0.1.0" -> ""."""
     text = text.strip()
     if text[:1] in ("v", "V"):
         text = text[1:]
-    _head, sep, tail = text.split("+", maxsplit=1)[0].partition("-")
-    return tail if sep else ""
+    parts = re.split(r"[-+]", text, maxsplit=1)
+    return parts[1] if len(parts) > 1 else ""
 
 
 def _compare_prerelease_tails(a: str, b: str) -> int:

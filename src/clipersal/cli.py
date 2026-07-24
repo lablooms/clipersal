@@ -25,6 +25,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from clipersal import (
+    DISPLAY_VERSION,
     __version__,
     autostart,
     capture,
@@ -1086,7 +1087,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             tray_icon = None
 
-    print(f"Clipersal {__version__} -- catch the moment you bloomed.")
+    print(f"Clipersal {DISPLAY_VERSION} -- catch the moment you bloomed.")
     print(f"  buffer:    {config.buffer_seconds}s  ->  {config.buffer_dir}")
     print(f"  clips dir: {config.clips_dir}")
     print(f"  encoder:   {setup.encoder}  (video source: {setup.video_source.kind})")
