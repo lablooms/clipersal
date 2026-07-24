@@ -489,3 +489,13 @@ def test_check_for_update_once_force_failure_keeps_old_last_checked(tmp_path: Pa
 
     assert result is None
     assert update_check.load_cache(cache_path)["last_checked"] == 1000.0
+
+
+def test_is_newer_compares_lab_series_tails_numerically() -> None:
+    assert update_check.is_newer("0.1.0-lab.2", "0.1.0-lab.1") is True
+    assert update_check.is_newer("0.1.0-lab.1", "0.1.0-lab.2") is False
+    assert update_check.is_newer("0.1.0-lab.10", "0.1.0-lab.2") is True  # numeric, not lexical
+    assert update_check.is_newer("0.1.0-lab.1", "0.1.0-lab.1") is False
+    assert update_check.is_newer("0.1.1-lab.1", "0.1.0-lab.9") is True  # numeric core wins first
+    assert update_check.is_newer("0.1.0", "0.1.0-lab.1") is True  # stable still outranks prerelease
+    assert update_check.is_newer("0.1.0-lab.1", "0.1.0") is False

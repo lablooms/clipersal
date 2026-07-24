@@ -107,13 +107,45 @@ def _is_prerelease(text: str) -> bool:
     return "-" in text.split("+", maxsplit=1)[0]
 
 
+def _prerelease_tail(text: str) -> str:
+    """"0.1.0-lab.1" -> "lab.1"; "0.1.0" -> ""."""
+    text = text.strip()
+    if text[:1] in ("v", "V"):
+        text = text[1:]
+    _head, sep, tail = text.split("+", maxsplit=1)[0].partition("-")
+    return tail if sep else ""
+
+
+def _compare_prerelease_tails(a: str, b: str) -> int:
+    """Semver 11.4 identifier comparison for two prerelease tails ("lab.2"
+    vs "lab.1"): dot-separated identifiers, numeric ones compare numerically
+    and rank BELOW alphanumeric ones, alphanumeric compare lexically, and a
+    longer tail outranks a shorter one it prefixes. Returns 1/0/-1. Needed
+    for the Lablooms "-lab.N" series -- without it two same-numeric lab
+    releases compare equal and the update banner never fires for lab.2.
+    """
+    if a == b:
+        return 0
+    a_parts, b_parts = a.split("."), b.split(".")
+    for x, y in zip(a_parts, b_parts):
+        if x == y:
+            continue
+        x_num, y_num = x.isdigit(), y.isdigit()
+        if x_num and y_num:
+            return 1 if int(x) > int(y) else -1
+        if x_num != y_num:
+            return -1 if x_num else 1
+        return 1 if x > y else -1
+    return (len(a_parts) > len(b_parts)) - (len(a_parts) < len(b_parts))
+
+
 def is_newer(candidate: str, current: str) -> bool:
     """False (never True, never raises) if either string is unparseable --
     "cannot determine" must never be treated as "yes, show the banner".
-    Numeric tuples compare first; when they're equal, one semver rule is kept:
-    a stable release outranks the same numeric pre-release ("0.1.0" >
-    "0.1.0-beta"), so a beta install does hear about its own stable promotion.
-    Two pre-releases of the same numeric version still compare equal.
+    Numeric tuples compare first; when they're equal, the semver prerelease
+    rules apply: a stable release outranks the same numeric pre-release
+    ("0.1.0" > "0.1.0-beta"), and two pre-releases compare by their tails
+    ("0.1.0-lab.2" > "0.1.0-lab.1").
     """
     candidate_parts = _parse_version(candidate)
     current_parts = _parse_version(current)
@@ -124,6 +156,10 @@ def is_newer(candidate: str, current: str) -> bool:
     current_padded = current_parts + (0,) * (width - len(current_parts))
     if candidate_padded != current_padded:
         return candidate_padded > current_padded
+    if _is_prerelease(candidate) and _is_prerelease(current):
+        return _compare_prerelease_tails(
+            _prerelease_tail(candidate), _prerelease_tail(current)
+        ) > 0
     return not _is_prerelease(candidate) and _is_prerelease(current)
 
 
