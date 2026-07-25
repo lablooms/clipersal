@@ -209,8 +209,11 @@ in `clips_dir/.thumbnails`.
 
 **Double-click a clip to play it in-app** (or single-click a recent clip on Home) — a
 real player with seek, volume, and
-0.5×–2× speed, plus a built-in trim export (mark start/end from the playhead, export
-a lossless stream-copy cut; the menu's **Trim…** opens the same player). From the
+0.5×–2× speed, plus a built-in trim editor (mark start/end from the playhead or type
+the times directly — the seek bar highlights the range and shows frame previews of
+both marks — then export
+a lossless stream-copy cut; the menu's **Trim…** opens the same player focused on
+trimming). From the
 right-click menu you can also **Export as GIF…**
 (start/duration/frame rate/width — great for sharing moments) and **Compress…**
 (re-encode to a smaller file with optional 720p/480p downscale). The original clip is

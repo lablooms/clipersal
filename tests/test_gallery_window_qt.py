@@ -859,11 +859,12 @@ class _FakePlayerDialog:
 
     instances = []
 
-    def __init__(self, clip_path, ffmpeg_path=None, parent=None, autoplay=True):
+    def __init__(self, clip_path, ffmpeg_path=None, parent=None, autoplay=True, focus_trim=False):
         self.clip_path = clip_path
         self.ffmpeg_path = ffmpeg_path
         self.parent_widget = parent
         self.autoplay = autoplay
+        self.focus_trim = focus_trim
         self.trim_exported = _FakeSignal()
         self.destroyed = _FakeSignal()
         self.delete_on_close = False
@@ -969,6 +970,8 @@ def test_context_menu_trim_action_opens_the_in_app_player(tmp_path: Path, fake_p
     # Trim opens PAUSED (autoplay=False): a moving playhead makes marks
     # impossible to land, and autoplay made Trim feel like "just a player".
     assert fake_player.instances[0].autoplay is False
+    # ... and trim-FOCUSED: the dialog retitles and accent-frames its card.
+    assert fake_player.instances[0].focus_trim is True
 
 
 def test_play_actions_open_the_player_with_autoplay(tmp_path: Path, fake_player) -> None:
@@ -980,6 +983,7 @@ def test_play_actions_open_the_player_with_autoplay(tmp_path: Path, fake_player)
     next(a for a in _menu_actions(menu) if a.text() == "Play").trigger()
 
     assert fake_player.instances[0].autoplay is True
+    assert fake_player.instances[0].focus_trim is False
 
 
 # ---- row layout: Play + heart + "⋯" ----------------------------------------------

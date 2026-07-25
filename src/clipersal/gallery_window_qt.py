@@ -164,8 +164,8 @@ def _format_size(num_bytes: int) -> str:
 
 def _format_duration(seconds: float) -> str:
     """M:SS for the row meta line -- whole seconds are plenty next to the
-    saved-at date (the player's tenth-precision _format_clock_tenths is a
-    different, editing-oriented language)."""
+    saved-at date (the player's tenth-precision trim fields are a different,
+    editing-oriented language)."""
     total_seconds = max(0, int(round(seconds)))
     minutes, secs = divmod(total_seconds, 60)
     return f"{minutes}:{secs:02d}"
@@ -1474,20 +1474,22 @@ class GalleryFrame(QWidget):
 
     # ---- play in-app (0.1.4) ---------------------------------------------------
 
-    def _play_clip(self, clip_path: Path, autoplay: bool = True) -> None:
+    def _play_clip(self, clip_path: Path, autoplay: bool = True, focus_trim: bool = False) -> None:
         """Row Play button / double-click / context-menu "Play" and "Trim...":
         the in-app player when QtMultimedia is importable, the OS default
         player otherwise. Construction + the fallback live in
         player_qt.play_clip, shared with the main window's recent-clips
         strip; this method only keeps the modal-less dialog referenced.
-        `autoplay=False` (the Trim... action) opens paused so the playhead
-        holds still for marking start/end."""
+        `autoplay=False` + `focus_trim=True` (the Trim... action) opens
+        paused -- a moving playhead makes marks impossible to land -- and
+        accent-frames the trim card so the dialog reads as an editor."""
         dialog = player_qt.play_clip(
             self,
             clip_path,
             self._ffmpeg_path,
             on_trim_exported=self._on_player_trim_exported,
             autoplay=autoplay,
+            focus_trim=focus_trim,
         )
         if dialog is not None:
             self._players.append(dialog)
@@ -1732,7 +1734,7 @@ class GalleryFrame(QWidget):
         rename_action = menu.addAction("Rename…")
         rename_action.triggered.connect(lambda: self._do_rename(clip_path))
         trim_action = menu.addAction("Trim…")
-        trim_action.triggered.connect(lambda: self._play_clip(clip_path, autoplay=False))
+        trim_action.triggered.connect(lambda: self._play_clip(clip_path, autoplay=False, focus_trim=True))
         gif_action = menu.addAction("Export as GIF…")
         gif_action.triggered.connect(lambda: self._do_export_gif(clip_path))
         compress_action = menu.addAction("Compress…")

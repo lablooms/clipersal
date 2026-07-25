@@ -20,7 +20,7 @@
 ; none of that.
 
 #define MyAppName "Clipersal"
-#define MyAppVersion "0.1.0-lab.1"
+#define MyAppVersion "0.1.0-lab.2"
 #define MyAppPublisher "Lablooms"
 #define MyAppURL "https://github.com/lablooms/clipersal"
 #define MyAppExeName "Clipersal.exe"
@@ -33,7 +33,7 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-VersionInfoVersion=0.1.0.1
+VersionInfoVersion=0.1.0.2
 DefaultDirName={autopf}\Lablooms\Clipersal
 DefaultGroupName=Clipersal
 UninstallDisplayIcon={app}\{#MyAppExeName}

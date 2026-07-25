@@ -887,11 +887,12 @@ class _FakePlayerDialog:
 
     instances = []
 
-    def __init__(self, clip_path, ffmpeg_path=None, parent=None, autoplay=True):
+    def __init__(self, clip_path, ffmpeg_path=None, parent=None, autoplay=True, focus_trim=False):
         self.clip_path = clip_path
         self.ffmpeg_path = ffmpeg_path
         self.parent_widget = parent
         self.autoplay = autoplay
+        self.focus_trim = focus_trim
         self.trim_exported = _FakeSignal()
         self.destroyed = _FakeSignal()
         self.delete_on_close = False

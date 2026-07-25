@@ -230,6 +230,11 @@ def build_stylesheet() -> str:
     QFrame#card:hover {{
         border: 1px solid {accent};
     }}
+    /* A trim-focused player open (the gallery's Trim... action) pins the
+       accent edge on its trim card so it reads as an editor, not a player. */
+    QFrame#card[trimFocus="true"] {{
+        border: 1px solid {accent};
+    }}
 
     QLabel#cardTitle {{
         color: {text_muted};

@@ -6,6 +6,27 @@ full design rationale behind each entry.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project
 does not yet follow strict semantic versioning (still pre-1.0).
 
+## [0.1.0-lab.2] — 2026-07-25
+
+### Added
+
+- **The player is a real editor now**: the in-app player's trim section grows
+  the full editing experience — a **range-highlighted seek bar** (the selected
+  region paints in accent with markers at both marks), **editable start/end
+  time fields** (type exact times or step them, synced both ways with the
+  playhead marks), **frame previews** at both cut points (grabbed off the UI
+  thread, debounced), a **Clear** button for the marks, and the existing
+  one-click stream-copy export. "Trim…" opens this view paused and emphasized
+  (accent-bordered trim card, "Trim —" window title); play actions are
+  untouched.
+
+### Fixed
+
+- Opening the in-app player can never silently eat a click again: if the
+  QtMultimedia backend fails to construct the dialog on some machine, the
+  gallery falls back to the OS default player (and logs why) instead of doing
+  nothing.
+
 ## [0.1.0-lab.1] — 2026-07-23
 
 First public Lablooms release ("-lab" is the studio's pre-release series — like

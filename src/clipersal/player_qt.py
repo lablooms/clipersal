@@ -1,7 +1,17 @@
 """In-app clip player (0.1.4): a modal-less dialog that plays a saved clip
-with play/pause, seek, volume, and speed controls, plus a small trim card
-that exports the marked range through concat.trim_clip (stream copy, the
+with play/pause, seek, volume, and speed controls, plus a trim card that
+exports the marked range through concat.trim_clip (stream copy, the
 original clip is never touched).
+
+The trim card is a small editor, not just two buttons: Set start/Set end
+capture the playhead, the StepperDoubleSpinBox fields next to them are
+directly editable (both directions stay in sync), the seek slider (a
+RangeSlider) paints the marked range highlighted on the groove, a Clear
+button resets both marks, and frame previews of the two marks are grabbed
+by _PreviewWorker off the GUI thread (300 ms debounce, hidden quietly
+when ffmpeg is missing or a grab fails). `focus_trim=True` (the gallery's
+Trim... action) retitles the window and gives the card a one-time accent
+border so a trim-focused open reads as an editor, not a plain player.
 
 QtMultimedia is an OPTIONAL import here: the PyInstaller spec excluded it
 until now (the packaging re-inclusion is a separate change), and a Linux
@@ -10,10 +20,14 @@ clipersal.player_qt` always safe; PlayerDialog refuses to construct when the
 import failed, and every caller (the gallery) must check
 multimedia_available() first and fall back to tray.open_file() -- the OS
 default player, which was the pre-0.1.4 behavior for every open action.
+play_clip() additionally guards the construction itself: a present-but-
+broken backend can raise from the PlayerDialog constructor, and that must
+fall back to the OS player too, never silently eat the user's click.
 
-The trim export's _TrimWorker is a GUI-thread QObject whose blocking method
-runs on a daemon thread and delivers its result through a queued Signal, so
-the remux never freezes the dialog. The dialog is shown modal-less (show(),
+The trim export's _TrimWorker and the previews' _PreviewWorker are
+GUI-thread QObjects whose blocking methods run on daemon threads and
+deliver results through queued Signals, so neither the remux nor a frame
+grab ever freezes the dialog. The dialog is shown modal-less (show(),
 WA_DeleteOnClose by the caller), so several players can be open at once.
 
 `play_clip()` is the shared open-a-clip entry point (in-app player, or the
@@ -24,10 +38,13 @@ context menu) and the main window's recent-clips strip both go through it.
 from __future__ import annotations
 
 import logging
+import shutil
+import tempfile
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QUrl, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
@@ -35,12 +52,14 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QSlider,
+    QStyle,
+    QStyleOptionSlider,
     QVBoxLayout,
     QWidget,
 )
 
-from clipersal import concat
-from clipersal.qt_widgets import SegmentedControl
+from clipersal import concat, theme, thumbnails
+from clipersal.qt_widgets import SegmentedControl, StepperDoubleSpinBox
 from clipersal.tray import open_file
 
 try:
@@ -71,6 +90,7 @@ def play_clip(
     ffmpeg_path: str | None = None,
     on_trim_exported=None,
     autoplay: bool = True,
+    focus_trim: bool = False,
 ) -> "PlayerDialog | None":
     """Open `clip_path` in the in-app player, or in the OS's default player
     when QtMultimedia is unavailable (the pre-0.1.4 behavior for every open
@@ -84,11 +104,22 @@ def play_clip(
     until `destroyed` fires. Returns None when the fallback path ran.
     `on_trim_exported`, when given, is connected to `trim_exported` (the
     gallery refreshes itself and re-emits clips_changed there).
+    `focus_trim=True` (the gallery's Trim... action) opens the dialog as a
+    trim editor: paused, retitled, trim card accent-framed.
     """
     if not multimedia_available():
         open_file(clip_path)
         return None
-    dialog = PlayerDialog(clip_path, ffmpeg_path, parent_widget, autoplay=autoplay)
+    try:
+        dialog = PlayerDialog(clip_path, ffmpeg_path, parent_widget, autoplay=autoplay, focus_trim=focus_trim)
+    except Exception:  # noqa: BLE001 -- a present-but-broken backend can raise here
+        # The import guard only proves QtMultimedia IMPORTED; the backend can
+        # still blow up constructing the player. Falling back to the OS
+        # player keeps the click from vanishing into nothing (the "player
+        # disappeared" report).
+        log.warning("In-app player failed to open %s -- falling back to the OS player", clip_path, exc_info=True)
+        open_file(clip_path)
+        return None
     dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
     if on_trim_exported is not None:
         dialog.trim_exported.connect(on_trim_exported)
@@ -103,12 +134,55 @@ def _format_clock(seconds: float) -> str:
     return f"{minutes}:{secs:02d}"
 
 
-def _format_clock_tenths(seconds: float) -> str:
-    """M:SS.s -- the captured trim marks (the playhead moves in ms, so whole
-    seconds would read as if nothing happened between two nearby captures)."""
-    total_tenths = max(0, int(round(seconds * 10)))
-    minutes, tenths = divmod(total_tenths, 600)
-    return f"{minutes}:{tenths // 10:02d}.{tenths % 10}"
+class RangeSlider(QSlider):
+    """Seek slider that paints the trim range highlighted on its groove: an
+    ACCENT band between the two marks plus a 3px marker line at each mark.
+    `range_start_ms`/`range_end_ms` are None while a mark is unset; the band
+    is only painted once both exist. Horizontal-only (the seek bar's
+    orientation) -- the value->pixel mapping assumes the groove runs left to
+    right. Painting reads theme.ACCENT at call time, so a live theme switch
+    recolors the band on the next repaint like every other widget.
+    """
+
+    def __init__(self, orientation: Qt.Orientation, parent: QWidget | None = None) -> None:
+        super().__init__(orientation, parent)
+        self.range_start_ms: int | None = None
+        self.range_end_ms: int | None = None
+
+    def set_range(self, start_ms: int | None, end_ms: int | None) -> None:
+        self.range_start_ms = start_ms
+        self.range_end_ms = end_ms
+        self.update()  # repaint even when the playhead itself didn't move
+
+    def clear_range(self) -> None:
+        self.set_range(None, None)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 -- Qt's naming
+        super().paintEvent(event)
+        start, end = self.range_start_ms, self.range_end_ms
+        if start is None or end is None or self.maximum() <= self.minimum():
+            return
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        groove = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider, option, QStyle.SubControl.SC_SliderGroove, self
+        )
+        if groove.isNull() or groove.width() <= 0:
+            return
+        # sliderPositionFromValue clamps out-of-range marks into the groove's
+        # span, so a mark past a shrunk slider range paints at the edge.
+        x_start = groove.x() + QStyle.sliderPositionFromValue(self.minimum(), self.maximum(), start, groove.width())
+        x_end = groove.x() + QStyle.sliderPositionFromValue(self.minimum(), self.maximum(), end, groove.width())
+        if x_end < x_start:  # start > end is a range error, but the band shouldn't paint inverted
+            x_start, x_end = x_end, x_start
+        accent = QColor(theme.ACCENT)
+        band = QColor(accent)
+        band.setAlphaF(0.4)
+        painter = QPainter(self)
+        painter.fillRect(x_start, groove.y(), x_end - x_start + 1, groove.height(), band)
+        painter.fillRect(x_start - 1, groove.y(), 3, groove.height(), accent)
+        painter.fillRect(x_end - 1, groove.y(), 3, groove.height(), accent)
+        painter.end()
 
 
 class _TrimWorker(QObject):
@@ -147,11 +221,52 @@ class _TrimWorker(QObject):
             self.trim_finished.emit(output, None)
 
 
+_PREVIEW_WIDTH = 120
+_PREVIEW_HEIGHT = 68
+# Grabbed wider than the label so the downscale to 120px stays sharp on
+# high-DPI displays; the label re-scales to its own size keeping aspect.
+_PREVIEW_GRAB_WIDTH = 240
+_PREVIEW_DEBOUNCE_MS = 300
+# The trim fields' maximum before durationChanged reports the real duration
+# (an unparseable file may never fire it): a generous 24 h ceiling so the
+# fields stay editable, tightened to the clip's length once it's known.
+_UNKNOWN_DURATION_FIELD_MAX = 86400.0
+
+
+class _PreviewWorker(QObject):
+    """The frame previews' background half -- the same shape as _TrimWorker:
+    constructed on the GUI thread, `grab()` runs on a daemon thread
+    (thumbnails.grab_frame_at spawns an ffmpeg subprocess), and the result
+    comes back through the queued preview_ready signal. The generation
+    counter round-trips with every emission so the dialog can drop grabs
+    that a newer mark change already superseded (the "cancel/replace" of a
+    moving playhead -- the clip path itself is fixed for the dialog's
+    lifetime). Exactly one grab runs per mark per generation.
+    """
+
+    preview_ready = Signal(int, str, object)  # generation, "start" | "end", target Path | None
+
+    def __init__(self, ffmpeg_path: str, clip_path: Path, work_dir: Path) -> None:
+        super().__init__()
+        self._ffmpeg_path = ffmpeg_path
+        self._clip_path = clip_path
+        self._work_dir = work_dir
+
+    def grab(self, generation: int, which: str, offset_seconds: float) -> None:
+        target = self._work_dir / f"trim-preview-{which}.jpg"
+        path = thumbnails.grab_frame_at(
+            self._ffmpeg_path, self._clip_path, offset_seconds, target, size=_PREVIEW_GRAB_WIDTH
+        )
+        self.preview_ready.emit(generation, which, path)
+
+
 class PlayerDialog(QDialog):
     """Modal-less clip player. The widgets a test (or the gallery) needs are
     public attributes, the same convention as the gallery's dialogs:
-    play_pause_button, seek_slider, time_label, volume_slider, speed_control,
-    set_start_button, set_end_button, export_button.
+    play_pause_button, seek_slider (a RangeSlider), time_label,
+    volume_slider, speed_control, set_start_button, start_field,
+    set_end_button, end_field, clear_button, start_preview, end_preview,
+    result_label, export_button, trim_card.
 
     `trim_exported` carries the Path of a successfully exported trimmed copy;
     the gallery connects it to refresh() so the new clip shows up.
@@ -165,6 +280,7 @@ class PlayerDialog(QDialog):
         ffmpeg_path: str | None = None,
         parent: QWidget | None = None,
         autoplay: bool = True,
+        focus_trim: bool = False,
     ) -> None:
         if not _MULTIMEDIA_OK:
             raise RuntimeError(
@@ -178,8 +294,13 @@ class PlayerDialog(QDialog):
         self._trim_start: float | None = None
         self._trim_end: float | None = None
         self._trimming = False
+        self._preview_worker: _PreviewWorker | None = None
+        self._preview_dir: Path | None = None
+        self._preview_generation = 0
 
-        self.setWindowTitle(clip_path.name)
+        # A trim-focused open (the gallery's Trim... action) retitles the
+        # window so it reads as an editor before anything else registers.
+        self.setWindowTitle(f"Trim — {clip_path.name}" if focus_trim else clip_path.name)
         self.setMinimumSize(720, 480)
 
         layout = QVBoxLayout(self)
@@ -208,7 +329,7 @@ class PlayerDialog(QDialog):
         self.play_pause_button.clicked.connect(self._toggle_play)
         controls.addWidget(self.play_pause_button)
 
-        self.seek_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.seek_slider = RangeSlider(Qt.Orientation.Horizontal, self)
         self.seek_slider.setRange(0, 0)
         self.seek_slider.sliderReleased.connect(self._on_slider_released)
         controls.addWidget(self.seek_slider, 1)
@@ -240,14 +361,20 @@ class PlayerDialog(QDialog):
         layout.addWidget(self._playback_hint)
 
         # --- trim card --------------------------------------------------------
-        trim_card = QFrame(self)
-        trim_card.setObjectName("card")
-        trim_layout = QVBoxLayout(trim_card)
+        self.trim_card = QFrame(self)
+        self.trim_card.setObjectName("card")
+        if focus_trim:
+            # One-time accent border (the QFrame#card[trimFocus="true"] QSS
+            # rule) so a Trim... open reads as an editor, not a plain player.
+            # Set before show(), so the global stylesheet picks it up on the
+            # first polish -- no unpolish/polish dance needed.
+            self.trim_card.setProperty("trimFocus", True)
+        trim_layout = QVBoxLayout(self.trim_card)
         trim_layout.setContentsMargins(12, 12, 12, 12)
         trim_layout.setSpacing(8)
-        layout.addWidget(trim_card)
+        layout.addWidget(self.trim_card)
 
-        trim_title = QLabel("TRIM", trim_card)
+        trim_title = QLabel("TRIM", self.trim_card)
         # A card section title -- the #cardTitle style (literal caps; Qt QSS
         # has no text-transform), same convention as the settings cards.
         trim_title.setObjectName("cardTitle")
@@ -256,31 +383,75 @@ class PlayerDialog(QDialog):
         marks_row = QHBoxLayout()
         marks_row.setSpacing(8)
         trim_layout.addLayout(marks_row)
-        self.set_start_button = QPushButton("Set start", trim_card)
+        self.set_start_button = QPushButton("Set start", self.trim_card)
         self.set_start_button.clicked.connect(self._on_set_start)
         marks_row.addWidget(self.set_start_button)
-        self.start_value_label = QLabel("--", trim_card)
-        marks_row.addWidget(self.start_value_label)
+        # The fields are directly editable AND follow the Set buttons -- both
+        # directions converge on _apply_mark_edit. The initial maximum is
+        # generous because durationChanged may not have fired yet (the
+        # playhead a Set button captures always fits); it tightens to the
+        # real duration when that signal arrives. 0.1s precision matches
+        # what the old M:SS.s mark readout showed.
+        self.start_field = StepperDoubleSpinBox(self.trim_card)
+        self.start_field.setDecimals(1)
+        self.start_field.setSingleStep(0.1)
+        self.start_field.setSuffix(" s")
+        self.start_field.setRange(0.0, _UNKNOWN_DURATION_FIELD_MAX)
+        self.start_field.setFixedWidth(90)
+        self.start_field.valueChanged.connect(self._on_start_field_edited)
+        marks_row.addWidget(self.start_field)
         marks_row.addSpacing(12)
-        self.set_end_button = QPushButton("Set end", trim_card)
+        self.set_end_button = QPushButton("Set end", self.trim_card)
         self.set_end_button.clicked.connect(self._on_set_end)
         marks_row.addWidget(self.set_end_button)
-        self.end_value_label = QLabel("--", trim_card)
-        marks_row.addWidget(self.end_value_label)
+        self.end_field = StepperDoubleSpinBox(self.trim_card)
+        self.end_field.setDecimals(1)
+        self.end_field.setSingleStep(0.1)
+        self.end_field.setSuffix(" s")
+        self.end_field.setRange(0.0, _UNKNOWN_DURATION_FIELD_MAX)
+        self.end_field.setFixedWidth(90)
+        self.end_field.valueChanged.connect(self._on_end_field_edited)
+        marks_row.addWidget(self.end_field)
+        marks_row.addSpacing(12)
+        self.clear_button = QPushButton("Clear", self.trim_card)
+        self.clear_button.setToolTip("Reset both trim marks")
+        self.clear_button.clicked.connect(self._on_clear_marks)
+        marks_row.addWidget(self.clear_button)
         marks_row.addStretch()
-        self.result_label = QLabel("Result: --", trim_card)
+        self.result_label = QLabel("Result: --", self.trim_card)
         self.result_label.setObjectName("hint")
         marks_row.addWidget(self.result_label)
+
+        previews_row = QHBoxLayout()
+        previews_row.setSpacing(8)
+        trim_layout.addLayout(previews_row)
+        # Frame previews of the two marks, grabbed off the GUI thread by
+        # _PreviewWorker. Hidden until a grab lands (and hidden again when a
+        # mark clears or a grab fails) -- no ffmpeg means they simply never
+        # appear, which is the quiet-degradation house rule.
+        self.start_preview = QLabel(self.trim_card)
+        self.start_preview.setObjectName("thumbPlaceholder")
+        self.start_preview.setFixedSize(_PREVIEW_WIDTH, _PREVIEW_HEIGHT)
+        self.start_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.start_preview.hide()
+        previews_row.addWidget(self.start_preview)
+        self.end_preview = QLabel(self.trim_card)
+        self.end_preview.setObjectName("thumbPlaceholder")
+        self.end_preview.setFixedSize(_PREVIEW_WIDTH, _PREVIEW_HEIGHT)
+        self.end_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.end_preview.hide()
+        previews_row.addWidget(self.end_preview)
+        previews_row.addStretch()
 
         export_row = QHBoxLayout()
         export_row.setSpacing(8)
         trim_layout.addLayout(export_row)
-        self.export_button = QPushButton("Export trim", trim_card)
+        self.export_button = QPushButton("Export trim", self.trim_card)
         self.export_button.setObjectName("primary")
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._start_trim_export)
         export_row.addWidget(self.export_button)
-        self._trim_status_label = QLabel("", trim_card)
+        self._trim_status_label = QLabel("", self.trim_card)
         self._trim_status_label.setObjectName("statusLabel")
         self._trim_status_label.setWordWrap(True)
         export_row.addWidget(self._trim_status_label, 1)
@@ -295,6 +466,13 @@ class PlayerDialog(QDialog):
 
         self._worker = _TrimWorker(ffmpeg_path or "", clip_path, clip_path.parent)
         self._worker.trim_finished.connect(self._on_trim_finished)
+
+        # Preview grabs are debounced: dragging the playhead across Set
+        # start/end must not spawn an ffmpeg subprocess per captured mark.
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(_PREVIEW_DEBOUNCE_MS)
+        self._preview_timer.timeout.connect(self._refresh_previews)
 
         self._refresh_trim_state()
         # Watching is the point of opening the dialog for play -- start
@@ -331,6 +509,13 @@ class PlayerDialog(QDialog):
         self.seek_slider.blockSignals(True)  # a range change can re-emit valueChanged
         self.seek_slider.setRange(0, duration_ms)
         self.seek_slider.blockSignals(False)
+        if duration_ms > 0:
+            # Tighten the trim fields to the real duration. A clamped field
+            # emits valueChanged, which routes through the same edit handler
+            # as typing -- the mark follows the field, keeping them in sync.
+            duration_seconds = duration_ms / 1000.0
+            self.start_field.setMaximum(duration_seconds)
+            self.end_field.setMaximum(duration_seconds)
         self._update_time_label(self._player.position())
 
     def _update_time_label(self, position_ms: int) -> None:
@@ -370,19 +555,122 @@ class PlayerDialog(QDialog):
         # Stop before the video widget dies with the dialog; Escape triggers
         # this too (QDialog's default Escape -> reject() -> close path).
         self._player.stop()
+        # In-flight preview grabs are dropped via the generation bump; their
+        # work dir goes away best-effort (a still-writing ffmpeg keeps its
+        # file on Windows -- ignore_errors leaves it for the OS temp sweep).
+        self._preview_timer.stop()
+        self._preview_generation += 1
+        if self._preview_dir is not None:
+            shutil.rmtree(self._preview_dir, ignore_errors=True)
+            self._preview_dir = None
         super().closeEvent(event)
 
     # ---- trim card -------------------------------------------------------------
 
     def _on_set_start(self) -> None:
-        self._trim_start = self._player.position() / 1000.0
-        self.start_value_label.setText(_format_clock_tenths(self._trim_start))
-        self._refresh_trim_state()
+        self._set_trim_start(self._player.position() / 1000.0)
 
     def _on_set_end(self) -> None:
-        self._trim_end = self._player.position() / 1000.0
-        self.end_value_label.setText(_format_clock_tenths(self._trim_end))
+        self._set_trim_end(self._player.position() / 1000.0)
+
+    def _on_clear_marks(self) -> None:
+        self._trim_start = None
+        self._trim_end = None
+        for field in (self.start_field, self.end_field):
+            field.blockSignals(True)  # resetting the display isn't an edit
+            field.setValue(0.0)
+            field.blockSignals(False)
+        self.seek_slider.clear_range()
         self._refresh_trim_state()
+        self._schedule_preview_refresh()
+
+    def _on_start_field_edited(self, value: float) -> None:
+        self._apply_mark_edit("start", value)
+
+    def _on_end_field_edited(self, value: float) -> None:
+        self._apply_mark_edit("end", value)
+
+    def _apply_mark_edit(self, which: str, value: float) -> None:
+        # The field already holds `value` (it emitted the change), so only
+        # the mark, the slider band, and the export gating need to follow.
+        if which == "start":
+            self._trim_start = value
+        else:
+            self._trim_end = value
+        self._sync_range_slider()
+        self._refresh_trim_state()
+        self._schedule_preview_refresh()
+
+    def _set_trim_start(self, seconds: float) -> None:
+        self._set_trim_mark("start", seconds)
+
+    def _set_trim_end(self, seconds: float) -> None:
+        self._set_trim_mark("end", seconds)
+
+    def _set_trim_mark(self, which: str, seconds: float) -> None:
+        field = self.start_field if which == "start" else self.end_field
+        field.blockSignals(True)  # the field syncs to the mark, not vice versa
+        field.setValue(seconds)
+        field.blockSignals(False)
+        # The mark takes the field's (precision-rounded, clamped) value so
+        # what the user reads is exactly what gets exported.
+        self._apply_mark_edit(which, field.value())
+
+    def _sync_range_slider(self) -> None:
+        start_ms = int(round(self._trim_start * 1000)) if self._trim_start is not None else None
+        end_ms = int(round(self._trim_end * 1000)) if self._trim_end is not None else None
+        self.seek_slider.set_range(start_ms, end_ms)
+
+    def _schedule_preview_refresh(self) -> None:
+        if self._ffmpeg_path is None:
+            return  # previews silently stay hidden without ffmpeg
+        self._preview_timer.start()  # single-shot: restarts the 300 ms settle window
+
+    def _ensure_preview_worker(self) -> _PreviewWorker | None:
+        if self._ffmpeg_path is None:
+            return None
+        if self._preview_worker is None:
+            # Lazily created so a plain Play open never touches the temp dir.
+            self._preview_dir = Path(tempfile.mkdtemp(prefix="clipersal-trim-preview-"))
+            self._preview_worker = _PreviewWorker(self._ffmpeg_path, self._clip_path, self._preview_dir)
+            self._preview_worker.preview_ready.connect(self._on_preview_ready)
+        return self._preview_worker
+
+    def _refresh_previews(self) -> None:
+        """Grab the frame at each set mark on daemon threads. Marks that are
+        unset hide their preview immediately; the generation bump strands any
+        grab an older mark change still has in flight (its result arrives
+        with a stale generation and is dropped in _on_preview_ready)."""
+        worker = self._ensure_preview_worker()
+        if worker is None:
+            return
+        self._preview_generation += 1
+        generation = self._preview_generation
+        for which, mark in (("start", self._trim_start), ("end", self._trim_end)):
+            if mark is None:
+                self._preview_label(which).hide()
+                continue
+            threading.Thread(target=worker.grab, args=(generation, which, mark), daemon=True).start()
+
+    def _preview_label(self, which: str) -> QLabel:
+        return self.start_preview if which == "start" else self.end_preview
+
+    def _on_preview_ready(self, generation: int, which: str, path: Path | None) -> None:
+        if generation != self._preview_generation:
+            return  # superseded by a newer mark change while ffmpeg ran
+        label = self._preview_label(which)
+        pixmap = QPixmap(str(path)) if path is not None else QPixmap()
+        if pixmap.isNull():  # grab failed or produced garbage -- hide quietly
+            label.hide()
+            return
+        label.setPixmap(
+            pixmap.scaled(
+                label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        label.show()
 
     def _refresh_trim_state(self) -> None:
         start, end = self._trim_start, self._trim_end

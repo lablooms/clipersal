@@ -18,7 +18,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6.QtMultimedia")
 
 from PySide6.QtCore import QEvent, Qt
-from PySide6.QtGui import QCloseEvent, QKeyEvent
+from PySide6.QtGui import QCloseEvent, QKeyEvent, QPixmap
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtWidgets import QApplication, QDialog
 
@@ -156,13 +156,13 @@ def test_export_disabled_until_both_marks_set(dialog: PlayerDialog, monkeypatch)
 
     monkeypatch.setattr(dialog._player, "position", lambda: 5000)
     dialog._on_set_start()
-    assert dialog.start_value_label.text() == "0:05.0"
+    assert dialog.start_field.value() == 5.0
     assert dialog.export_button.isEnabled() is False
     assert dialog.result_label.text() == "Result: --"
 
     monkeypatch.setattr(dialog._player, "position", lambda: 9000)
     dialog._on_set_end()
-    assert dialog.end_value_label.text() == "0:09.0"
+    assert dialog.end_field.value() == 9.0
     assert dialog.export_button.isEnabled() is True
     assert dialog.result_label.text() == "Result: 0:04"
 
@@ -231,3 +231,228 @@ def test_autoplay_false_opens_paused(clip_path: Path) -> None:
 
     assert dialog._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState
     assert dialog.play_pause_button.text() == "Play"
+
+
+# ---- range slider ---------------------------------------------------------------
+
+
+def test_range_slider_set_and_clear_range() -> None:
+    slider = player_qt.RangeSlider(Qt.Orientation.Horizontal)
+    slider.setRange(0, 10000)
+    assert slider.range_start_ms is None
+    assert slider.range_end_ms is None
+
+    slider.set_range(1000, 5000)
+    assert slider.range_start_ms == 1000
+    assert slider.range_end_ms == 5000
+
+    slider.clear_range()
+    assert slider.range_start_ms is None
+    assert slider.range_end_ms is None
+
+
+def test_range_slider_paints_without_crashing_offscreen() -> None:
+    # No pixel assertions -- just that the highlighted paint path (and the
+    # cleared one) survive a real repaint under the offscreen platform.
+    slider = player_qt.RangeSlider(Qt.Orientation.Horizontal)
+    slider.setRange(0, 10000)
+    slider.resize(240, 30)
+    slider.show()
+
+    slider.set_range(1000, 5000)
+    assert not slider.grab().isNull()
+    # Inverted marks (a range error) must not paint an inverted band either.
+    slider.set_range(5000, 1000)
+    assert not slider.grab().isNull()
+    slider.clear_range()
+    assert not slider.grab().isNull()
+
+
+# ---- trim card: fields / slider / clear ------------------------------------------
+
+
+def test_set_buttons_sync_fields_and_slider_range(dialog: PlayerDialog, monkeypatch) -> None:
+    _set_marks(dialog, monkeypatch, 5.0, 9.0)
+
+    assert dialog.start_field.value() == 5.0
+    assert dialog.end_field.value() == 9.0
+    assert dialog.seek_slider.range_start_ms == 5000
+    assert dialog.seek_slider.range_end_ms == 9000
+
+
+def test_editing_a_field_moves_the_mark_and_slider(dialog: PlayerDialog) -> None:
+    dialog.start_field.setValue(2.5)
+    assert dialog._trim_start == 2.5
+    assert dialog.seek_slider.range_start_ms == 2500
+    assert dialog.export_button.isEnabled() is False  # end still unset
+
+    dialog.end_field.setValue(7.5)
+    assert dialog._trim_end == 7.5
+    assert dialog.seek_slider.range_end_ms == 7500
+    assert dialog.export_button.isEnabled() is True
+    assert dialog.result_label.text() == "Result: 0:05"
+
+
+def test_field_edits_and_set_buttons_stay_in_sync(dialog: PlayerDialog, monkeypatch) -> None:
+    # Set start captures the playhead into the field; editing the field then
+    # moves the same mark -- one source of truth in both directions.
+    monkeypatch.setattr(dialog._player, "position", lambda: 4000)
+    dialog.set_start_button.click()
+    assert dialog.start_field.value() == 4.0
+
+    dialog.start_field.setValue(6.0)
+    assert dialog._trim_start == 6.0
+    monkeypatch.setattr(dialog._player, "position", lambda: 8000)
+    dialog.set_end_button.click()
+    assert dialog.end_field.value() == 8.0
+    assert dialog._trim_end == 8.0
+    assert dialog.export_button.isEnabled() is True
+
+
+def test_export_disabled_when_fields_make_start_pass_end(dialog: PlayerDialog) -> None:
+    dialog.start_field.setValue(9.0)
+    dialog.end_field.setValue(3.0)
+
+    assert dialog.export_button.isEnabled() is False
+    assert "before" in dialog.result_label.text()
+
+
+def test_clear_button_resets_marks_fields_and_slider(dialog: PlayerDialog, monkeypatch) -> None:
+    _set_marks(dialog, monkeypatch, 1.0, 4.0)
+    assert dialog.export_button.isEnabled() is True
+
+    dialog.clear_button.click()
+
+    assert dialog._trim_start is None
+    assert dialog._trim_end is None
+    assert dialog.start_field.value() == 0.0
+    assert dialog.end_field.value() == 0.0
+    assert dialog.seek_slider.range_start_ms is None
+    assert dialog.seek_slider.range_end_ms is None
+    assert dialog.export_button.isEnabled() is False
+    assert dialog.result_label.text() == "Result: --"
+
+
+def test_duration_tightens_the_field_ranges(dialog: PlayerDialog) -> None:
+    dialog._on_duration_changed(65000)
+
+    assert dialog.start_field.maximum() == 65.0
+    assert dialog.end_field.maximum() == 65.0
+
+
+# ---- trim card: frame previews ----------------------------------------------------
+
+
+def _write_frame(path: Path) -> Path:
+    pixmap = QPixmap(16, 16)
+    pixmap.fill(Qt.GlobalColor.red)
+    assert pixmap.save(str(path), "JPG")
+    return path
+
+
+def test_previews_show_the_grabbed_frames(dialog: PlayerDialog, monkeypatch) -> None:
+    grabs = []
+
+    def fake_grab(ffmpeg_path, clip, offset, target, size=320):
+        grabs.append(offset)
+        return _write_frame(target)
+
+    monkeypatch.setattr(player_qt.thumbnails, "grab_frame_at", fake_grab)
+    _set_marks(dialog, monkeypatch, 1.0, 4.0)
+    # Fire directly -- the 300 ms debounce timer needs a running event loop,
+    # which these tests deliberately never start.
+    dialog._refresh_previews()
+
+    _process_events(lambda: not dialog.start_preview.isHidden() and not dialog.end_preview.isHidden())
+    assert sorted(grabs) == [1.0, 4.0]
+    assert not dialog.start_preview.pixmap().isNull()
+    assert not dialog.end_preview.pixmap().isNull()
+
+
+def test_previews_stay_hidden_when_the_grab_fails(dialog: PlayerDialog, monkeypatch) -> None:
+    monkeypatch.setattr(player_qt.thumbnails, "grab_frame_at", lambda *args, **kwargs: None)
+    _set_marks(dialog, monkeypatch, 1.0, 4.0)
+    delivered = []
+    dialog._ensure_preview_worker().preview_ready.connect(lambda *args: delivered.append(args))
+
+    dialog._refresh_previews()
+
+    _process_events(lambda: len(delivered) >= 2)
+    assert dialog.start_preview.isHidden()
+    assert dialog.end_preview.isHidden()
+
+
+def test_stale_preview_results_are_dropped(dialog: PlayerDialog, clip_path: Path) -> None:
+    dialog._preview_generation = 5
+
+    dialog._on_preview_ready(4, "start", clip_path)  # an older generation's grab
+
+    assert dialog.start_preview.isHidden()
+    assert dialog.start_preview.pixmap().isNull()
+
+
+def test_clearing_a_mark_hides_its_preview(dialog: PlayerDialog, monkeypatch) -> None:
+    monkeypatch.setattr(
+        player_qt.thumbnails, "grab_frame_at", lambda ffmpeg, clip, offset, target, size=320: _write_frame(target)
+    )
+    _set_marks(dialog, monkeypatch, 1.0, 4.0)
+    dialog._refresh_previews()
+    _process_events(lambda: not dialog.start_preview.isHidden() and not dialog.end_preview.isHidden())
+
+    dialog.clear_button.click()
+    dialog._refresh_previews()  # both marks are None now
+
+    assert dialog.start_preview.isHidden()
+    assert dialog.end_preview.isHidden()
+
+
+# ---- focus_trim --------------------------------------------------------------------
+
+
+def test_focus_trim_retitles_and_accent_marks_the_card(clip_path: Path) -> None:
+    dialog = PlayerDialog(clip_path, "ffmpeg", autoplay=False, focus_trim=True)
+
+    assert dialog.windowTitle() == f"Trim — {clip_path.name}"
+    assert dialog.trim_card.property("trimFocus") is True
+
+
+def test_plain_open_keeps_the_clip_title_and_unmarked_card(dialog: PlayerDialog, clip_path: Path) -> None:
+    assert dialog.windowTitle() == clip_path.name
+    assert not dialog.trim_card.property("trimFocus")
+
+
+# ---- play_clip hardening -------------------------------------------------------------
+
+
+def test_play_clip_falls_back_to_open_file_when_the_ctor_raises(clip_path: Path, monkeypatch) -> None:
+    def exploding_ctor(*args, **kwargs):
+        raise RuntimeError("backend exploded")
+
+    opened = []
+    monkeypatch.setattr(player_qt, "PlayerDialog", exploding_ctor)
+    monkeypatch.setattr(player_qt, "open_file", lambda path: opened.append(path))
+
+    assert player_qt.play_clip(None, clip_path, "ffmpeg") is None
+    assert opened == [clip_path]
+
+
+def test_play_clip_passes_autoplay_and_focus_trim_through(clip_path: Path, monkeypatch) -> None:
+    captured = {}
+
+    class _FakeDialog:
+        def __init__(self, clip, ffmpeg_path, parent, autoplay=True, focus_trim=False):
+            captured["autoplay"] = autoplay
+            captured["focus_trim"] = focus_trim
+
+        def setAttribute(self, attribute) -> None:
+            pass
+
+        def show(self) -> None:
+            pass
+
+    monkeypatch.setattr(player_qt, "PlayerDialog", _FakeDialog)
+
+    dialog = player_qt.play_clip(None, clip_path, "ffmpeg", autoplay=False, focus_trim=True)
+
+    assert isinstance(dialog, _FakeDialog)
+    assert captured == {"autoplay": False, "focus_trim": True}
