@@ -8,5 +8,5 @@ save-on-demand. "Catch the moment you bloomed."
 # downstream label is the local-version segment: "0.1.0+lab.1". Humans read the
 # dash spelling instead (release tags, installer, UI), so display surfaces use
 # DISPLAY_VERSION.
-__version__ = "0.1.0+lab.2"
+__version__ = "0.1.0+lab.3"
 DISPLAY_VERSION = __version__.replace("+", "-")

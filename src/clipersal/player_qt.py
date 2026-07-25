@@ -108,6 +108,14 @@ def play_clip(
     trim editor: paused, retitled, trim card accent-framed.
     """
     if not multimedia_available():
+        # This branch used to be silent: a packaged build that can't import
+        # QtMultimedia (e.g. the QtNetwork exclusion that broke shiboken's
+        # QtMultimedia import in 0.1.0-lab.1/lab.2) made every Play/Trim click
+        # open the OS player with no trace in the log.
+        log.warning(
+            "QtMultimedia is unavailable -- opening %s with the OS default player instead",
+            clip_path,
+        )
         open_file(clip_path)
         return None
     try:

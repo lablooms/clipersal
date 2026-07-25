@@ -31,6 +31,12 @@ icon_path = str(repo_root / "assets" / "icon.ico")
 # QtMultimedia / QtMultimediaWidgets are deliberately NOT excluded:
 # player_qt.py's in-app clip player (QMediaPlayer + QVideoWidget) needs them
 # in the frozen build -- the size cost is accepted, see ARCHITECTURE.md.
+# QtNetwork is NOT excluded either, for the same player: importing
+# PySide6.QtMultimedia makes shiboken import PySide6.QtNetwork too (the
+# QMediaPlayer API references network classes), so excluding it broke the
+# in-app player in the frozen build with "libshiboken: could not import
+# module 'PySide6.QtNetwork'" -- the gallery silently fell back to the OS
+# player for every Play/Trim click.
 QT_EXCLUDES = [
     "PySide6.QtQml",
     "PySide6.QtQuick",
@@ -39,7 +45,6 @@ QT_EXCLUDES = [
     "PySide6.QtWebEngineCore",
     "PySide6.QtWebEngineWidgets",
     "PySide6.QtWebEngineQuick",
-    "PySide6.QtNetwork",
     "PySide6.QtSql",
     "PySide6.QtTest",
     "PySide6.QtPdf",

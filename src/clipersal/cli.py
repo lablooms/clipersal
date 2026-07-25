@@ -256,6 +256,19 @@ def main(argv: list[str] | None = None) -> int:
     theme.apply_theme(_effective_dark(config, os_))
     app = _ensure_qapplication()
 
+    # One line that makes every "the player doesn't work" support case
+    # diagnosable from the log alone (the QtNetwork-exclusion incident was
+    # invisible until a frozen-build probe reproduced it).
+    try:
+        from clipersal import player_qt
+
+        log.info(
+            "In-app player backend: %s",
+            "available" if player_qt.multimedia_available() else "unavailable (Play/Trim opens the OS player)",
+        )
+    except Exception:  # noqa: BLE001 -- never let a diagnostic line break startup
+        pass
+
     if _another_instance_running(config.ipc_port):
         _show_already_running_message(config.ipc_port)
         return 0

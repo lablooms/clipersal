@@ -6,6 +6,22 @@ full design rationale behind each entry.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project
 does not yet follow strict semantic versioning (still pre-1.0).
 
+## [0.1.0-lab.3] - 2026-07-26
+
+### Fixed
+
+- **The in-app player/editor actually works in the packaged builds now.** The
+  PyInstaller spec excluded `PySide6.QtNetwork` to save size, but importing
+  `PySide6.QtMultimedia` makes shiboken import `PySide6.QtNetwork` too (the
+  QMediaPlayer API references network classes), so every Play/Trim click in the
+  installed app silently fell back to the OS default player. Reproduced with a
+  frozen-build probe (`libshiboken: could not import module
+  'PySide6.QtNetwork'`); the exclusion is removed and the same probe now
+  passes.
+- **Player fallback paths now leave a trace**: the startup log records whether
+  the in-app player backend is available, and the gallery logs a warning
+  whenever it has to open a clip with the OS player instead of in-app.
+
 ## [0.1.0-lab.2] - 2026-07-25
 
 ### Added
