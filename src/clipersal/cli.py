@@ -1165,7 +1165,7 @@ def _cleanup_temp_buffer(config) -> None:
     shutil.rmtree(config.buffer_dir, ignore_errors=True)
 
 
-def _trigger_command_via_ipc(command: str, port: int) -> None:
+def _trigger_command_via_ipc(command: str, port: int):
     """The hotkey callbacks deliberately go back out through the IPC client
     rather than calling save_clip/save_screenshot directly, even though
     hotkey and server live in the same process today -- this is the exact
@@ -1173,18 +1173,32 @@ def _trigger_command_via_ipc(command: str, port: int) -> None:
     process later without any change here. See ARCHITECTURE.md's
     "IPC / hotkey boundary" section. `command` is a full IPC command line,
     e.g. "SAVE" or "SAVE 30" for a quick-save binding.
+
+    The send runs on a daemon thread and this returns the thread handle (so
+    tests can join it). It MUST NOT block the caller: pynput invokes hotkey
+    callbacks inside the OS low-level keyboard hook dispatch, and a blocking
+    call there stalls keyboard delivery system-wide -- a synchronous save
+    (tens of seconds for a big remux) froze the user's game until it
+    finished. Fire-and-forget keeps the hook thread free; the result only
+    ever goes to the log anyway.
     """
-    try:
-        # SAVE/SCREENSHOT get the same long leash the main window and tray
-        # give them: the server-side remux can legitimately run tens of
-        # seconds (see ipc_client.SAVE_TIMEOUT), and the 5s default reported
-        # a slow-but-successful save as a failure in the log.
-        command_word = command.split(maxsplit=1)[0]
-        timeout = ipc_client.SAVE_TIMEOUT if command_word in ("SAVE", "SCREENSHOT") else 5.0
-        response = ipc_client.send_command(command, port=port, timeout=timeout)
-        log.info("Hotkey %s: %s", command, response)
-    except ipc_client.IpcClientError as exc:
-        log.warning("Hotkey %s failed: %s", command, exc)
+
+    def _send() -> None:
+        try:
+            # SAVE/SCREENSHOT get the same long leash the main window and tray
+            # give them: the server-side remux can legitimately run tens of
+            # seconds (see ipc_client.SAVE_TIMEOUT), and the 5s default reported
+            # a slow-but-successful save as a failure in the log.
+            command_word = command.split(maxsplit=1)[0]
+            timeout = ipc_client.SAVE_TIMEOUT if command_word in ("SAVE", "SCREENSHOT") else 5.0
+            response = ipc_client.send_command(command, port=port, timeout=timeout)
+            log.info("Hotkey %s: %s", command, response)
+        except ipc_client.IpcClientError as exc:
+            log.warning("Hotkey %s failed: %s", command, exc)
+
+    thread = threading.Thread(target=_send, daemon=True, name=f"hotkey-{command.split(maxsplit=1)[0]}")
+    thread.start()
+    return thread
 
 
 if __name__ == "__main__":

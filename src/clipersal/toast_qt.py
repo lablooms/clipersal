@@ -170,6 +170,10 @@ class SaveToast(QWidget):
         # (below) is opaque and rounded, so the rounded corners actually show
         # against the desktop instead of leaving square artifacts.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        # Never steal keyboard focus from whatever the user is doing -- a
+        # save toast popping over a fullscreen game must not yank activation
+        # away from it (that read as "the game became uninteractable").
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         # close() (auto-dismiss or click) only HIDES a parented widget --
         # without this, every save leaves a permanent hidden child (animation
         # group, thumbnail fetcher and all) on the persistent MainWindow.

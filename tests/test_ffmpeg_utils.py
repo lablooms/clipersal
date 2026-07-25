@@ -355,3 +355,48 @@ def test_windows_gdigrab_source_carries_the_configured_framerate(monkeypatch) ->
 
     assert source.kind == "gdigrab"
     assert source.input_args == ["-f", "gdigrab", "-framerate", "60", "-i", "desktop"]
+
+
+def _fake_filters_run(output: str):
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=output, stderr="")
+
+    return fake_run
+
+
+def test_list_filters_parses_ffmpeg7_layout(monkeypatch) -> None:
+    listing = (
+        "Filters:\n"
+        "  T.. = Timeline support\n"
+        "  .S. = Slice threading\n"
+        "  ------\n"
+        " TSC ddagrab            V->V       Grab Windows Desktop images\n"
+        " .. scale               V->V       Scale the input video size.\n"
+        " T.C amix               N->N       Audio mixing.\n"
+    )
+    monkeypatch.setattr("clipersal.ffmpeg_utils.subprocess.run", _fake_filters_run(listing))
+
+    assert list_filters("ffmpeg") == {"ddagrab", "scale", "amix"}
+
+
+def test_list_filters_parses_ffmpeg8_layout(monkeypatch) -> None:
+    # ffmpeg 8 changed the listing: two flag columns and a "|" in the arrow,
+    # which the old three-column regex parsed as almost nothing (ddagrab
+    # silently disabled, every capture forced onto gdigrab).
+    listing = (
+        "Filters:\n"
+        "  T.. = Timeline support\n"
+        "  .S. = Slice threading\n"
+        "  A = Audio input/output\n"
+        "  V = Video input/output\n"
+        "  N = Dynamic number and/or type of input/output\n"
+        "  | = Source or sink filter\n"
+        "  ------\n"
+        " .. ddagrab           |->V       Grab Windows Desktop images using Desktop Duplication API\n"
+        " .. scale             V->V       Scale the input video size.\n"
+        " .. aformat           A->A       Convert the input audio to one of the specified formats.\n"
+        " .. amix              N->N       Audio mixing.\n"
+    )
+    monkeypatch.setattr("clipersal.ffmpeg_utils.subprocess.run", _fake_filters_run(listing))
+
+    assert list_filters("ffmpeg") == {"ddagrab", "scale", "aformat", "amix"}

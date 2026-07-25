@@ -52,6 +52,7 @@ from clipersal import (
     DISPLAY_VERSION,
     __version__,
     brand,
+    clip_metadata,
     ipc_client,
     player_qt,
     theme,
@@ -206,6 +207,10 @@ class MainWindow(QWidget):
         # Last capture state reported by the STATUS/STATS poll -- drives the
         # pause button's label/action, the crash banner, and the title.
         self._capture_state = "RECORDING"
+        # Favorite-count cache behind the stats line's "N ♥": re-read from the
+        # sidecar by _refresh_favorite_count (clip-set changes, Home tab
+        # selection), never on the 1.5s poll itself.
+        self._favorite_count = 0
         # The crash-report prompt currently on screen (non-modal), if any. It
         # is shown once per crash episode by the edge detection in
         # _apply_capture_state, so the poll timer is never blocked by it.
@@ -281,6 +286,11 @@ class MainWindow(QWidget):
             button.setChecked(True)
         if name == "clips":
             self._tabs["clips"].refresh()
+        elif name == "home":
+            # The "N ♥" count must be right when the user actually looks at
+            # Home -- a gallery heart toggle doesn't emit clips_changed, so
+            # the cache would otherwise wait for the next save or edit.
+            self._refresh_favorite_count()
 
     def select_settings_subtab(self, name: str) -> None:
         """Select the Settings tab AND its `name`d sub-tab (e.g. "logs") --
@@ -478,62 +488,64 @@ class MainWindow(QWidget):
         self._disk_dismiss_button.clicked.connect(self._on_dismiss_disk_banner)
         disk_row.addWidget(self._disk_dismiss_button)
 
+        # Compact status card: ONE row -- dot, state word, a single elided
+        # stats line fed by the STATS poll, and the two actions on the right.
+        # The old tall card (big display word + buffer/clips-dir meta line +
+        # a second stats line) read as a dashboard; the clips-dir path now
+        # lives only in Settings, and the buffer/segment detail collapsed
+        # into the one compact line.
         status_card = QFrame(frame)
         status_card.setObjectName("card")
         layout.addWidget(status_card)
-        status_row = QHBoxLayout(status_card)
-        status_row.setContentsMargins(20, 18, 20, 18)
+        status_col = QVBoxLayout(status_card)
+        status_col.setContentsMargins(16, 12, 16, 12)
+        status_col.setSpacing(4)
+        status_row = QHBoxLayout()
+        status_row.setSpacing(10)
+        status_col.addLayout(status_row)
 
         # Read the status colors through the theme module at call time, never
         # a by-value `from theme import GOOD`: apply_theme() rewrites the
         # module attributes on a theme switch, and a by-value import would
         # keep handing the dot the OLD palette's hex strings forever.
-        self._status_dot = StatusDot(size=36, dot_diameter=14, color=theme.GOOD, parent=status_card)
+        self._status_dot = StatusDot(size=24, color=theme.GOOD, parent=status_card)
         status_row.addWidget(self._status_dot)
 
-        status_text_col = QVBoxLayout()
-        status_row.addLayout(status_text_col, 1)
         self._status_label = QLabel("Recording", status_card)
-        self._status_label.setFont(_qfont(size=theme.FONT_H2))
-        status_text_col.addWidget(self._status_label)
-        # The meta line is two labels, not one elided string: middle-eliding
-        # the WHOLE "Buffer: 60s · <clips_dir>" line used to chop into the
-        # buffer text itself ("60…ight\clips"). The fixed prefix keeps the
-        # buffer part always intact; only the clips_dir part elides (middle,
-        # so both the drive root and the folder name stay visible).
-        meta_row = QHBoxLayout()
-        meta_row.setSpacing(0)  # the prefix carries its own trailing separator
-        status_text_col.addLayout(meta_row)
-        self._status_meta_prefix_label = QLabel("", status_card)
-        self._status_meta_prefix_label.setObjectName("hint")
-        self._status_meta_prefix_label.setFont(_qfont(size=theme.FONT_MONO, weight="normal", mono=True))
-        meta_row.addWidget(self._status_meta_prefix_label)
-        self._status_meta_label = ElidedLabel("", status_card, Qt.TextElideMode.ElideMiddle)
-        self._status_meta_label.setObjectName("hint")
-        self._status_meta_label.setFont(_qfont(size=theme.FONT_MONO, weight="normal", mono=True))
-        meta_row.addWidget(self._status_meta_label, 1)
-        self._show_default_status_meta()
-        # Second meta line, fed by the STATS poll: uptime, buffer fill,
-        # encoder, free disk. Empty until the first successful poll -- and
-        # left alone by on_save_failed/on_save_completed, which own line 1.
-        self._status_stats_label = ElidedLabel("", status_card)
+        self._status_label.setFont(_qfont(size=theme.FONT_BODY))
+        status_row.addWidget(self._status_label)
+        # The single stats line, fed by the STATS poll: uptime, buffer fill,
+        # encoder, free disk, clip + favorite counts. Middle-elided (the
+        # ElidedLabel's Ignored policy is what lets the row shrink to the
+        # window minimum without squeezing the buttons into clipped text).
+        # Empty until the first successful poll.
+        self._status_stats_label = ElidedLabel("", status_card, Qt.TextElideMode.ElideMiddle)
         self._status_stats_label.setObjectName("hint")
         self._status_stats_label.setFont(_qfont(size=theme.FONT_MONO, weight="normal", mono=True))
-        status_text_col.addWidget(self._status_stats_label)
+        status_row.addWidget(self._status_stats_label, 1)
 
-        actions = QHBoxLayout()
-        status_row.addLayout(actions)
-        self._pause_button = QPushButton("Pause capture", status_card)
-        self._pause_button.clicked.connect(self._on_toggle_pause)
-        actions.addWidget(self._pause_button)
         # Deliberately just Pause + Save now: the 15/30/60s quick-saves live
         # on the tray menu, the quick-save hotkeys, and `clipersal-trigger
         # save --trim N` -- six buttons made the card read as a toolbar and
-        # squeezed the meta line into truncation.
+        # squeezed the text line into truncation.
+        self._pause_button = QPushButton("Pause capture", status_card)
+        self._pause_button.setFixedHeight(30)
+        self._pause_button.clicked.connect(self._on_toggle_pause)
+        status_row.addWidget(self._pause_button)
         self._save_now_button = QPushButton("Save now", status_card)
         self._save_now_button.setObjectName("primary")
+        self._save_now_button.setFixedHeight(30)
         self._save_now_button.clicked.connect(lambda: self._on_save())
-        actions.addWidget(self._save_now_button)
+        status_row.addWidget(self._save_now_button)
+
+        # Save-failure line: hidden until a save actually fails. It gets its
+        # own row rather than the stats line because it must PERSIST -- the
+        # poll-fed stats line would overwrite it a second later. Cleared by
+        # the next successful save (see on_save_completed).
+        self._save_error_label = ElidedLabel("", status_card)
+        self._save_error_label.setObjectName("saveError")
+        self._save_error_label.setVisible(False)
+        status_col.addWidget(self._save_error_label)
 
         recent_header = QHBoxLayout()
         layout.addLayout(recent_header)
@@ -576,6 +588,7 @@ class MainWindow(QWidget):
         # Read the provider once per refresh: the folder can't meaningfully
         # change mid-pass, and a Settings change is picked up on the next one.
         clips_dir = self._clips_dir_provider()
+        self._refresh_favorite_count()
         # clips_newest_first, not a bare glob+stat sort: a clip deleted
         # mid-listing (retention sweep on the IPC thread, external delete)
         # must be skipped, not crash the refresh -- see gallery_window_qt.
@@ -610,6 +623,17 @@ class MainWindow(QWidget):
         worker.ready.connect(self._apply_recent_thumbnail)
         self._recent_worker = worker
         threading.Thread(target=worker.run, daemon=True).start()
+
+    def _refresh_favorite_count(self) -> None:
+        """Re-read the sidecar's favorites into the stats line's "N ♥" cache.
+        The read is one tiny JSON, but doing it on every 1.5s stats poll
+        would still be pointless disk churn -- so it runs exactly where the
+        favorite set can change or become visible: clip-set-change refreshes
+        (saves, gallery edits, the manual Refresh button) and Home tab
+        selection (a gallery heart toggle doesn't emit clips_changed).
+        clip_metadata never raises, so this can't break the refresh caller.
+        """
+        self._favorite_count = len(clip_metadata.favorites(self._clips_dir_provider()))
 
     def _apply_recent_thumbnail(self, clip_path: Path, thumbnail_path: Path | None) -> None:
         label = self._recent_thumb_labels.get(clip_path)
@@ -691,16 +715,6 @@ class MainWindow(QWidget):
         if response is None or response.startswith("ERROR"):
             log.warning("%s from the main window failed: %s", command, response or "IPC unreachable")
 
-    def _default_status_meta(self) -> str:
-        return f"Buffer: {self._config.buffer_seconds}s   ·   {self._clips_dir_provider()}"
-
-    def _show_default_status_meta(self) -> None:
-        """The default meta line, split across its two labels (see
-        _build_home_tab): the fixed prefix carries the buffer length, the
-        middle-elided label carries only the clips_dir path."""
-        self._status_meta_prefix_label.setText(f"Buffer: {self._config.buffer_seconds}s   ·   ")
-        self._status_meta_label.setText(str(self._clips_dir_provider()))
-
     def _on_save(self, trim_arg: str | None = None) -> None:
         # A SAVE's server-side remux can legitimately run tens of seconds (up
         # to concat.py's _CONCAT_TIMEOUT, 60s) -- far past ipc_client's 5s
@@ -777,7 +791,9 @@ class MainWindow(QWidget):
         self._capture_state = state
         if state == "CRASHED":
             self._set_status_dot(theme.LIVE)
-            self._status_label.setText("Capture stopped -- see Settings→Logs")
+            # Just the state word -- the crash banner right below the card
+            # carries the explanation and the restart/logs actions.
+            self._status_label.setText("Capture stopped")
             self._pause_button.setText("Resume capture")
             self.setWindowTitle("Clipersal — Capture stopped")
         elif state == "PAUSED":
@@ -882,16 +898,20 @@ class MainWindow(QWidget):
         return f"{hours}:{minutes:02d}:{secs:02d}"
 
     def _format_stats_line(self, stats: dict[str, str]) -> str:
-        """The status card's second meta line. Every field degrades
-        independently -- a missing/unparseable value is simply omitted, so
-        the line never shows a bare "None" (STATS degrades failed probes to
-        empty strings server-side; the STATUS fallback has no stats at all).
+        """The status card's single compact stats line, e.g.:
+        "up 1:02:05 · buffer ~40/60s · h264_qsv · 4.1 GB free · 12 clips · 3 ♥".
+        Every field degrades independently -- a missing/unparseable value is
+        simply omitted, so the line never shows a bare "None" (STATS degrades
+        failed probes to empty strings server-side; the STATUS fallback has
+        no stats at all). The favorite count is the one non-STATS field: it
+        comes from the local _favorite_count cache (see
+        _refresh_favorite_count), so it's always available.
         """
         parts: list[str] = []
         uptime = stats.get("uptime", "")
         if uptime:
             try:
-                parts.append(f"Up {self._format_uptime(float(uptime))}")
+                parts.append(f"up {self._format_uptime(float(uptime))}")
             except ValueError:
                 pass
         segments = self._parse_int(stats.get("segments"))
@@ -900,18 +920,18 @@ class MainWindow(QWidget):
             # The newest segment is still being written, so fill is an
             # estimate: segments x segment length, capped at the buffer size.
             fill = min(segments * self._config.segment_seconds, buffer_seconds)
-            fill_text = f"Buffer fill ~{fill}s/{buffer_seconds}s ({segments} segments"
-            buffer_bytes = self._parse_int(stats.get("buffer_bytes"))
-            if buffer_bytes is not None:
-                fill_text += f", {buffer_bytes / (1 << 20):.0f} MB"
-            parts.append(fill_text + ")")
+            parts.append(f"buffer ~{fill}/{buffer_seconds}s")
         encoder = stats.get("encoder", "")
         if encoder:
             parts.append(encoder)
         free_bytes = self._parse_int(stats.get("clips_free_bytes"))
         if free_bytes is not None:
             parts.append(f"{free_bytes / (1 << 30):.1f} GB free")
-        return "   ·   ".join(parts)
+        clips_count = self._parse_int(stats.get("clips_count"))
+        if clips_count is not None:
+            parts.append(f"{clips_count} clip{'s' if clips_count != 1 else ''}")
+        parts.append(f"{self._favorite_count} ♥")
+        return " · ".join(parts)
 
     def _update_disk_banner(self, stats: dict[str, str]) -> None:
         free_bytes = self._parse_int(stats.get("clips_free_bytes"))
@@ -958,9 +978,9 @@ class MainWindow(QWidget):
         """
         self._pulsing = True
         self._status_label.setText("Saving…")
-        # A successful save also clears any earlier save-failure note from the
-        # status card's meta line.
-        self._show_default_status_meta()
+        # A successful save also clears any earlier save-failure note.
+        self._save_error_label.setText("")
+        self._save_error_label.setVisible(False)
         self._run_pulse()
         self._refresh_recent_clips()
         if self._active_tab == "clips":
@@ -968,18 +988,16 @@ class MainWindow(QWidget):
 
     def on_save_failed(self, detail: str) -> None:
         """Connected (by cli.py) to AppSignals.save_failed. The failure goes
-        on the status card's meta line rather than _status_label: the meta
-        line is persistent, whereas _poll_status would overwrite _status_label
-        again a second later. Cleared by the next successful save (see
-        on_save_completed).
+        on its own line under the status row rather than the stats line: the
+        stats line is poll-fed and would overwrite the failure a second
+        later, whereas the failure must persist. Cleared by the next
+        successful save (see on_save_completed).
         """
         summary = detail.strip().splitlines()[0] if detail.strip() else "unknown error"
         if len(summary) > 120:
             summary = summary[:117] + "..."
-        # The failure takes over the whole meta line (prefix included) --
-        # "Buffer: 60s · Save failed ..." would read as nonsense.
-        self._status_meta_prefix_label.setText("")
-        self._status_meta_label.setText(f"Save failed -- {summary}")
+        self._save_error_label.setText(f"Save failed -- {summary}")
+        self._save_error_label.setVisible(True)
 
     def show_update_banner(self, version: str, url: str) -> None:
         """Connected (by cli.py) to AppSignals.update_available."""

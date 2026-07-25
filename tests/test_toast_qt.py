@@ -75,6 +75,15 @@ def test_save_toast_is_deleted_on_close(tmp_path: Path) -> None:
     assert toast.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose) is True
 
 
+def test_save_toast_never_steals_keyboard_focus(tmp_path: Path) -> None:
+    from PySide6.QtCore import Qt
+
+    # A save toast popping over a fullscreen game must not yank activation
+    # away from it (that read as "the game became uninteractable").
+    toast = _make_toast(tmp_path)
+    assert toast.testAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating) is True
+
+
 def test_save_toast_final_geometry_within_available_screen_geometry(tmp_path: Path) -> None:
     from PySide6.QtGui import QGuiApplication
 

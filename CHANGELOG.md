@@ -6,6 +6,30 @@ full design rationale behind each entry.
 The format loosely follows [Keep a Changelog](https://keepachangelog.com/); this project
 does not yet follow strict semantic versioning (still pre-1.0).
 
+## [0.1.0-lab.4] - 2026-07-26
+
+### Added
+
+- **A compact Home status card**: one row now carries the state, a single
+  elided stats line (`up 0:12:33 · buffer ~42/60s · h264_qsv · 4.1 GB free ·
+  3 clips · 2 ♥`), and the action buttons — including new clip and favorite
+  counts instead of the old two-line readout.
+
+### Fixed
+
+- **Capture is GPU-side again on ffmpeg 8**: ffmpeg 8 changed the `-filters`
+  listing layout, and the parser still expected the old one, so `ddagrab`
+  (Desktop Duplication) was never detected and every capture fell back to
+  CPU-heavy gdigrab. The parser reads both layouts now — a big performance
+  win, especially at 60 fps.
+- **Saves no longer stall keyboard input system-wide**: hotkey-triggered
+  saves/screenshots ran synchronously inside the OS keyboard-hook callback,
+  and a slow remux (tens of seconds) blocked key delivery to every app,
+  including your game. The trigger now fires on a daemon thread and returns
+  immediately.
+- **The save toast no longer steals focus**: popping over a fullscreen game
+  it used to yank activation away from it.
+
 ## [0.1.0-lab.3] - 2026-07-26
 
 ### Fixed

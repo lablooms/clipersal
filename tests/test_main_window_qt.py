@@ -220,26 +220,43 @@ def test_poll_status_crashed(tmp_path: Path) -> None:
     try:
         win = _make_window(tmp_path, ipc_port=server.port)
         win._poll_status()
-        assert win._status_label.text() == "Capture stopped -- see Settings→Logs"
+        assert win._status_label.text() == "Capture stopped"
         assert win._pause_button.text() == "Resume capture"
         assert win.windowTitle() == "Clipersal — Capture stopped"
     finally:
         server.stop()
 
 
-def test_poll_status_stats_drives_the_second_meta_line(tmp_path: Path) -> None:
+def test_poll_status_stats_drives_the_compact_stats_line(tmp_path: Path) -> None:
     server = _stats_server()
     try:
         win = _make_window(tmp_path, ipc_port=server.port)
         win._poll_status()
         line = win._status_stats_label.text()
         # uptime 3725s -> 1:02:05; fill = 20 segments x 2s segment_seconds.
-        assert "Up 1:02:05" in line
-        assert "Buffer fill ~40s/60s (20 segments, 40 MB)" in line
+        assert "up 1:02:05" in line
+        assert "buffer ~40/60s" in line
         assert "libx264" in line
         assert "10.0 GB free" in line
-        # Line 1 (buffer + clips dir) is untouched by the poll.
-        assert win._status_meta_prefix_label.text() + win._status_meta_label.text() == win._default_status_meta()
+        # clips_count from STATS, favorites from the local sidecar cache.
+        assert "3 clips" in line
+        assert "0 ♥" in line
+        # The old verbose labels/detail are gone from the compact line.
+        assert "segments" not in line
+        assert "MB" not in line
+        assert str(tmp_path / "clips") not in line
+    finally:
+        server.stop()
+
+
+def test_poll_status_stats_line_singular_clip(tmp_path: Path) -> None:
+    server = _stats_server(clips_count="1")
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        win._poll_status()
+        line = win._status_stats_label.text()
+        assert "1 clip ·" in line
+        assert "1 clips" not in line
     finally:
         server.stop()
 
@@ -249,23 +266,99 @@ def test_poll_status_stats_fill_is_capped_at_buffer_seconds(tmp_path: Path) -> N
     try:
         win = _make_window(tmp_path, ipc_port=server.port)
         win._poll_status()
-        assert "Buffer fill ~60s/60s (50 segments" in win._status_stats_label.text()
+        assert "buffer ~60/60s" in win._status_stats_label.text()
     finally:
         server.stop()
 
 
 def test_poll_status_stats_omits_missing_fields_without_none(tmp_path: Path) -> None:
-    server = _stats_server(uptime="", segments="", buffer_bytes="", encoder="", clips_free_bytes="")
+    server = _stats_server(uptime="", segments="", buffer_bytes="", encoder="", clips_free_bytes="", clips_count="")
     try:
         win = _make_window(tmp_path, ipc_port=server.port)
         win._poll_status()
         line = win._status_stats_label.text()
         assert "None" not in line
-        # Only the state was known -- every stat field degraded away.
-        assert line == ""
+        # Every STATS field degraded away; only the always-known local
+        # favorite count remains.
+        assert line == "0 ♥"
         assert win._status_label.text() == "Recording"
     finally:
         server.stop()
+
+
+# ---- favorites count on the stats line ---------------------------------------
+
+
+def test_stats_line_shows_the_favorite_count(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        main_window_qt.clip_metadata, "favorites", lambda clips_dir: {"a.mp4", "b.mp4"}
+    )
+    server = _stats_server()
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        win._poll_status()
+        line = win._status_stats_label.text()
+        assert "3 clips" in line  # from STATS' clips_count
+        assert "2 ♥" in line  # from the sidecar via the favorites cache
+    finally:
+        server.stop()
+
+
+def test_favorite_count_is_cached_not_read_on_every_poll(tmp_path: Path, monkeypatch) -> None:
+    reads = []
+    monkeypatch.setattr(
+        main_window_qt.clip_metadata, "favorites", lambda clips_dir: reads.append(clips_dir) or set()
+    )
+    server = _stats_server()
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        reads_after_build = len(reads)
+        assert reads_after_build >= 1  # primed at construction
+
+        win._poll_status()
+        win._poll_status()
+        assert len(reads) == reads_after_build  # the 1.5s poll never hits disk
+        assert "0 ♥" in win._status_stats_label.text()
+    finally:
+        server.stop()
+
+
+def test_favorite_count_refreshes_with_the_recent_clips(tmp_path: Path, monkeypatch) -> None:
+    favs = {"value": set()}
+    monkeypatch.setattr(main_window_qt.clip_metadata, "favorites", lambda clips_dir: favs["value"])
+    win = _make_window(tmp_path)
+    assert win._favorite_count == 0
+
+    favs["value"] = {"a.mp4", "b.mp4", "c.mp4"}
+    win._refresh_recent_clips()
+    assert win._favorite_count == 3
+
+
+def test_gallery_clips_changed_refreshes_the_favorite_count(tmp_path: Path, monkeypatch) -> None:
+    favs = {"value": set()}
+    monkeypatch.setattr(main_window_qt.clip_metadata, "favorites", lambda clips_dir: favs["value"])
+    win = _make_window(tmp_path)
+    assert win._favorite_count == 0
+
+    favs["value"] = {"a.mp4"}
+    win._tabs["clips"].clips_changed.emit()
+    assert win._favorite_count == 1
+
+
+def test_selecting_home_tab_refreshes_the_favorite_count(tmp_path: Path, monkeypatch) -> None:
+    # A gallery heart toggle does NOT emit clips_changed, so the count would
+    # go stale until the next save/edit -- selecting Home re-reads it so the
+    # number is right when the user actually looks at it.
+    favs = {"value": set()}
+    monkeypatch.setattr(main_window_qt.clip_metadata, "favorites", lambda clips_dir: favs["value"])
+    win = _make_window(tmp_path)
+    assert win._favorite_count == 0
+
+    favs["value"] = {"a.mp4", "b.mp4"}
+    win.select_tab("clips")
+    assert win._favorite_count == 0  # leaving Home doesn't re-read
+    win.select_tab("home")
+    assert win._favorite_count == 2
 
 
 def test_poll_status_pause_label_flips_with_stats_state(tmp_path: Path) -> None:
@@ -707,7 +800,26 @@ def test_home_actions_row_has_only_pause_and_save_now(tmp_path: Path) -> None:
     assert win._save_now_button.objectName() == "primary"
 
 
-def test_failed_save_is_shown_in_status_meta(tmp_path: Path, monkeypatch) -> None:
+def test_status_card_is_a_single_compact_row(tmp_path: Path) -> None:
+    # The compact redesign: small dot, BODY-sized (not display-sized) state
+    # word, one poll-fed stats line, 30px actions on the same row.
+    win = _make_window(tmp_path)
+    assert win._status_dot.width() == 24
+    assert win._status_label.font().pointSize() == main_window_qt.theme.FONT_BODY
+    assert win._status_label.font().bold() is True
+    assert win._pause_button.minimumHeight() == 30
+    assert win._pause_button.maximumHeight() == 30
+    assert win._save_now_button.minimumHeight() == 30
+    assert win._save_now_button.maximumHeight() == 30
+    # The old meta line (buffer + clips-dir path) is gone entirely.
+    assert not hasattr(win, "_status_meta_label")
+    assert not hasattr(win, "_status_meta_prefix_label")
+    # The save-failure line exists but stays hidden until a save fails.
+    assert win._save_error_label.isHidden() is True
+    assert win._save_error_label.objectName() == "saveError"
+
+
+def test_failed_save_is_shown_on_the_save_error_line(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         main_window_qt.ipc_client,
         "send_command",
@@ -717,48 +829,66 @@ def test_failed_save_is_shown_in_status_meta(tmp_path: Path, monkeypatch) -> Non
     win = _make_window(tmp_path, app_signals=signals)
     # Mirrors cli.py's wiring of AppSignals.save_failed.
     signals.save_failed.connect(win.on_save_failed)
-    default_meta = win._status_meta_label.text()
+    assert win._save_error_label.isHidden() is True
 
     win._save_now_button.click()
 
-    assert _wait_for(lambda: win._status_meta_label.text() != default_meta)
-    text = win._status_meta_label.text()
+    assert _wait_for(lambda: win._save_error_label.text() != "")
+    text = win._save_error_label.text()
     assert "Save failed" in text
     assert "Not enough has been captured" in text
-    # The failure takes over the whole meta line, prefix included.
-    assert win._status_meta_prefix_label.text() == ""
+    assert win._save_error_label.isHidden() is False
+    # The poll-fed stats line keeps its own content -- the failure must not
+    # live there, or the next poll would erase it.
+    assert win._status_stats_label.text() == ""
 
 
-def test_save_completed_restores_status_meta_after_failure(tmp_path: Path) -> None:
+def test_save_completed_clears_the_save_error_line(tmp_path: Path) -> None:
     win = _make_window(tmp_path)
-    default_meta = win._status_meta_label.text()
-    default_prefix = win._status_meta_prefix_label.text()
 
     win.on_save_failed("boom")
-    assert "Save failed" in win._status_meta_label.text()
+    assert "Save failed" in win._save_error_label.text()
+    assert win._save_error_label.isHidden() is False
 
     win.on_save_completed()
-    assert win._status_meta_label.text() == default_meta
-    assert win._status_meta_prefix_label.text() == default_prefix
+    assert win._save_error_label.text() == ""
+    assert win._save_error_label.isHidden() is True
 
 
-def test_status_meta_elides_only_the_clips_dir_middle(tmp_path: Path) -> None:
-    # The old single middle-elided label chopped into the buffer text itself
-    # ("60…ight\clips"). Now the "Buffer: Ns ·" prefix is a fixed label and
-    # only the clips_dir label elides -- middle, keeping the path's both ends.
-    from PySide6.QtWidgets import QLabel
+def test_status_row_elides_the_stats_line_and_keeps_button_text_at_narrow_width(tmp_path: Path) -> None:
+    # The full window can never get this narrow (its own content minimum is
+    # ~1064px offscreen), so probe the row directly: reparent the status card
+    # into a 700px-wide host. The stats line must elide (its Ignored policy
+    # absorbs the shrink) while the buttons keep their full text width
+    # instead of being clipped.
+    from PySide6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
 
-    win = _make_window(tmp_path)
-    assert win._status_meta_prefix_label.text() == f"Buffer: {win._config.buffer_seconds}s   ·   "
-    full_path = str(tmp_path / "clips")
-    assert win._status_meta_label.text() == full_path
+    server = _stats_server(clips_count="123")
+    try:
+        win = _make_window(tmp_path, ipc_port=server.port)
+        win._poll_status()
+        full_line = win._status_stats_label.text()
+        assert "buffer ~40/60s" in full_line
 
-    win._status_meta_label.resize(60, 20)  # far narrower than the path
-    displayed = QLabel.text(win._status_meta_label)  # the elided on-screen text
+        assert win._status_stats_label.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Ignored
+        assert win._status_stats_label.minimumWidth() == 0
 
-    assert displayed != full_path
-    assert "…" in displayed
-    assert win._status_meta_prefix_label.text().startswith("Buffer:")  # never elided
+        card = win._status_dot.parentWidget()
+        host = QWidget()
+        host_layout = QVBoxLayout(host)
+        host_layout.setContentsMargins(0, 0, 0, 0)
+        host_layout.addWidget(card)
+        host.resize(700, 80)
+        host.show()
+        QApplication.sendPostedEvents()
+
+        assert card.width() <= 700
+        assert QLabel.text(win._status_stats_label) != full_line
+        assert "…" in QLabel.text(win._status_stats_label)
+        assert win._pause_button.width() >= win._pause_button.sizeHint().width()
+        assert win._save_now_button.width() >= win._save_now_button.sizeHint().width()
+    finally:
+        server.stop()
 
 
 # ---- save-completed slot ----------------------------------------------------
@@ -828,7 +958,7 @@ def test_refresh_recent_clips_skips_a_clip_that_vanishes_mid_listing(tmp_path: P
     assert list(win._recent_thumb_labels.keys()) == [survivor]
 
 
-def test_recent_clips_and_status_meta_follow_live_clips_dir_provider(tmp_path: Path) -> None:
+def test_recent_clips_follow_the_live_clips_dir_provider(tmp_path: Path) -> None:
     dir_a = tmp_path / "clips-a"
     dir_b = tmp_path / "clips-b"
     dir_b.mkdir(parents=True)
@@ -837,7 +967,6 @@ def test_recent_clips_and_status_meta_follow_live_clips_dir_provider(tmp_path: P
     current = {"clips_dir": dir_a}
 
     win = _make_window(tmp_path, clips_dir_provider=lambda: current["clips_dir"])
-    assert str(dir_a) in win._default_status_meta()
 
     # A Settings clips-folder change must be picked up live -- the window
     # holds a provider, not a Path frozen at construction (which used to show
@@ -845,7 +974,6 @@ def test_recent_clips_and_status_meta_follow_live_clips_dir_provider(tmp_path: P
     current["clips_dir"] = dir_b
     win._refresh_recent_clips()
     assert list(win._recent_thumb_labels.keys()) == [clip_b]
-    assert str(dir_b) in win._default_status_meta()
 
 
 def test_apply_recent_thumbnail_sets_pixmap(tmp_path: Path) -> None:

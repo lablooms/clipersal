@@ -1533,10 +1533,14 @@ def test_trigger_command_via_ipc_gives_save_commands_the_save_timeout(monkeypatc
         lambda command, port, timeout=5.0: sent.append((command, timeout)) or "OK done",
     )
 
-    cli._trigger_command_via_ipc("SAVE", 51525)
-    cli._trigger_command_via_ipc("SAVE 30", 51525)
-    cli._trigger_command_via_ipc("SCREENSHOT", 51525)
-    cli._trigger_command_via_ipc("STATUS", 51525)
+    threads = [
+        cli._trigger_command_via_ipc("SAVE", 51525),
+        cli._trigger_command_via_ipc("SAVE 30", 51525),
+        cli._trigger_command_via_ipc("SCREENSHOT", 51525),
+        cli._trigger_command_via_ipc("STATUS", 51525),
+    ]
+    for thread in threads:
+        thread.join(timeout=5)
 
     assert sent == [
         ("SAVE", cli.ipc_client.SAVE_TIMEOUT),
@@ -1544,6 +1548,32 @@ def test_trigger_command_via_ipc_gives_save_commands_the_save_timeout(monkeypatc
         ("SCREENSHOT", cli.ipc_client.SAVE_TIMEOUT),
         ("STATUS", 5.0),
     ]
+
+
+def test_trigger_command_via_ipc_does_not_block_the_hook_thread(monkeypatch) -> None:
+    # pynput invokes hotkey callbacks inside the OS keyboard-hook dispatch;
+    # a synchronous slow save there stalled keyboard input system-wide (the
+    # user's game froze until the remux finished). The trigger must return
+    # immediately and do the waiting on its own daemon thread.
+    import threading as _threading
+    import time as _time
+
+    release = _threading.Event()
+
+    def slow_send(command, port, timeout=5.0):
+        release.wait(5)
+        return "OK done"
+
+    monkeypatch.setattr(cli.ipc_client, "send_command", slow_send)
+
+    started = _time.monotonic()
+    thread = cli._trigger_command_via_ipc("SAVE", 51525)
+    elapsed = _time.monotonic() - started
+    release.set()
+
+    assert elapsed < 1.0  # returned immediately even though the send blocks
+    thread.join(timeout=5)
+    assert not thread.is_alive()
 
 
 def test_save_handler_runs_size_cap_with_just_saved_clip_protected(monkeypatch, tmp_path) -> None:

@@ -106,10 +106,10 @@ just hides it back to the tray rather than quitting; use the tray's **Quit** (or
 `clipersal-trigger quit`) to actually exit. If you disable the tray (`--no-tray`), closing
 the window quits instead, since there'd be no way to bring it back.
 
-**Home** shows a status card (recording/paused, buffer length, clips folder) with
-**Pause capture**/**Resume capture** (the button follows the real state) and **Save
-now** buttons, a live stats line (uptime, buffer fill,
-buffer size on disk, active encoder, free disk space), plus a strip of your most
+**Home** shows a compact status card (colored dot + recording/paused state + a live
+stats line: uptime, buffer fill, active encoder, free disk space, clip and favorite
+counts) with **Pause capture**/**Resume capture** (the button follows the real state)
+and **Save now** on the same row, plus a strip of your most
 recent clips with thumbnails; click one to play it in the built-in player, or use
 the strip's **Refresh** button to re-read the folder. If ffmpeg's auto-restart budget
 runs out, a banner offers one-click **Restart capture**; another banner warns when the

@@ -142,7 +142,13 @@ def list_filters(ffmpeg_path: str) -> set[str]:
         return set()
     names = set()
     for line in result.stdout.splitlines():
-        match = re.match(r"\s*[T.][S.][C.]\s+(\S+)", line)
+        # Two listing formats exist in the wild: ffmpeg <= 7 prints
+        # " TSC ddagrab            V->V       ..." (three flag columns), while
+        # ffmpeg 8 prints " .. ddagrab           |->V       ..." (two columns,
+        # and the arrow gained a "|" side). The old regex anchored on three
+        # columns and parsed almost nothing from ffmpeg 8, which silently
+        # disabled ddagrab there and forced every capture onto gdigrab.
+        match = re.match(r"\s*[A-Z.]{2,3}\s+(\S+)\s+\S*->\S*", line)
         if match:
             names.add(match.group(1))
     return names

@@ -114,10 +114,11 @@ MONO_FONT = ("Cascadia Code", "Consolas", "Courier New")
 #   H2 (14)        -- card/section titles: the #cardTitle style (settings
 #                     cards, the Home "RECENT CLIPS" section, the player's
 #                     "TRIM" card) and the banner/toast titles
-#                     (#crashTitle/#bannerTitle/#toastTitle); also the Home
-#                     status word ("Recording") and the sidebar wordmark.
+#                     (#crashTitle/#bannerTitle/#toastTitle); also the
+#                     sidebar wordmark.
 #   BODY (12)      -- everything interactive or read as prose: buttons,
-#                     combos, inputs, menu items, tab labels, field labels.
+#                     combos, inputs, menu items, tab labels, field labels,
+#                     the Home status word ("Recording", bold).
 #                     This is the QApplication default font (cli.py installs
 #                     it), so plain widgets need no setFont call at all.
 #   HINT (11)      -- secondary text: hints, meta lines, footers, empty
@@ -283,6 +284,12 @@ def build_stylesheet() -> str:
         color: {accent};
         font-size: {FONT_H2}pt;
         font-weight: bold;
+    }}
+    /* The Home status card's save-failure line: hint-sized, but in LIVE so
+       an actual failure can't pass for another muted meta line. */
+    QLabel#saveError {{
+        color: {live};
+        font-size: {FONT_HINT}pt;
     }}
 
     #sidebar {{
